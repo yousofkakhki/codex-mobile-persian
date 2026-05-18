@@ -1,7 +1,7 @@
 ### Startup profiler request dedupe
 
 #### Feature/Change Name
-Startup thread-list and skills-list refreshes reuse fresh in-memory results, and the profiler distinguishes pinned-thread summary hydration from duplicate full thread reads.
+Startup thread-list and skills-list refresh paths avoid duplicate profiler diagnostics.
 
 #### Prerequisites/Setup
 1. Start local Vite: `pnpm run dev --host 127.0.0.1 --port 4173`.
@@ -19,6 +19,7 @@ Startup thread-list and skills-list refreshes reuse fresh in-memory results, and
 #### Expected Results
 - Startup event bursts do not issue duplicate first-page `thread/list` requests.
 - Startup event bursts do not issue duplicate same-cwd `skills/list` requests.
+- Home startup does not clear a remembered selected thread through the full selected-thread load path.
 - Pinned-thread summaries may appear as `thread/read:*:summary` rows, but they do not trigger duplicate full-read warnings.
 - Light and dark themes both complete thread loading.
 
