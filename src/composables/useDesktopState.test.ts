@@ -843,6 +843,26 @@ describe('live error overlay', () => {
   })
 })
 
+describe('startup refresh coalescing', () => {
+  it('clears selected thread without refreshing models, messages, or skills', async () => {
+    installTestWindow({
+      'codex-web-local.selected-thread-id.v1': 'previous-thread',
+    })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+
+    const state = useDesktopState()
+    const result = await state.selectThread('')
+
+    expect(result).toBe('ok')
+    expect(state.selectedThreadId.value).toBe('')
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(gatewayMocks.getAvailableModelIds).not.toHaveBeenCalled()
+    expect(gatewayMocks.getSkillsList).not.toHaveBeenCalled()
+  })
+})
+
 describe('provider model selection', () => {
   it('does not overwrite a model chosen while catalog refresh is pending', async () => {
     installTestWindow()
