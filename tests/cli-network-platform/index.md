@@ -11,6 +11,7 @@ Return to the [manual test index](../../tests.md).
 | [Missing Codex CLI chat error](missing-codex-cli-chat-error.md) |
 | [Startup avoids duplicate setup probes](startup-avoids-duplicate-setup-probes.md) |
 | [CLI password output redaction](cli-password-output-redaction.md) |
+| [CLI password file](cli-password-file.md) |
 | [npx run dev compatibility shim](npx-run-dev-compatibility-shim.md) |
 | [Termux install without native PTY build](termux-install-without-native-pty-build.md) |
 | [Feature: Tailscale CIDRs bypass password and Cloudflare tunnel is opt-in](tailscale-cidrs-bypass-password-and-cloudflare-tunnel-is-opt-in.md) |

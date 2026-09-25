@@ -257,12 +257,20 @@ type PasswordResolution = {
   generated: boolean
 }
 
-function resolvePassword(input: string | boolean): PasswordResolution {
+async function resolvePassword(input: string | boolean, passwordFile?: string): Promise<PasswordResolution> {
   if (input === false) {
     return { password: undefined, generated: false }
   }
   if (typeof input === 'string') {
     return { password: input, generated: false }
+  }
+  const trimmedPasswordFile = passwordFile?.trim()
+  if (trimmedPasswordFile) {
+    const password = (await readFile(resolve(trimmedPasswordFile), 'utf8')).trim()
+    if (!password) {
+      throw new Error(`Password file is empty: ${trimmedPasswordFile}`)
+    }
+    return { password, generated: false }
   }
   return { password: generatePassword(), generated: true }
 }
@@ -496,6 +504,7 @@ async function addProjectOnly(projectPath: string): Promise<void> {
 async function startServer(options: {
   port: string
   password: string | boolean
+  passwordFile?: string
   tunnel: boolean
   open: boolean
   login: boolean
@@ -529,7 +538,7 @@ async function startServer(options: {
     console.log('\nCodex is not logged in. You can log in later via settings or run `codexui login`.\n')
   }
   const requestedPort = parseInt(options.port, 10)
-  const passwordResolution = resolvePassword(options.password)
+  const passwordResolution = await resolvePassword(options.password, options.passwordFile)
   const password = passwordResolution.password
   const generatedPasswordPath = password && passwordResolution.generated
     ? await persistGeneratedPassword(password)
@@ -631,6 +640,7 @@ program
   .option('--open-project <path>', 'open project directory on launch (Codex desktop parity)')
   .option('-p, --port <port>', 'port to listen on', '5900')
   .option('--password <pass>', 'set a specific password')
+  .option('--password-file <path>', 'read the specific password from a protected file')
   .option('--no-password', 'disable password protection')
   .option('--tunnel', 'start cloudflared tunnel (default is auto by Tailscale detection)', true)
   .option('--no-tunnel', 'disable cloudflared tunnel startup')
@@ -647,6 +657,7 @@ program
     opts: {
       port: string
       password: string | boolean
+      passwordFile?: string
       tunnel: boolean
       open: boolean
       login: boolean
