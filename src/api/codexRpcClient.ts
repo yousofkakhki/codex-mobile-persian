@@ -1,5 +1,13 @@
 import type { RpcEnvelope, RpcMethodCatalog } from '../types/codex'
 import { CodexApiError, extractErrorMessage } from './codexErrors'
+import {
+  byteLength,
+  recordRpcNotification,
+  recordRpcRequestFinished,
+  recordRpcRequestStarted,
+  recordRpcStreamBytes,
+  setRpcConnectionState,
+} from './codexRpcTelemetry'
 
 type RpcRequestBody = {
   method: string
@@ -29,54 +37,77 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 export async function rpcCall<T>(method: string, params?: unknown): Promise<T> {
   const body: RpcRequestBody = { method, params: params ?? null }
+  const requestBody = JSON.stringify(body)
+  const startedAtMs = typeof performance !== 'undefined' ? performance.now() : Date.now()
+  let responseBytes = 0
+  let telemetryFinished = false
 
-  let response: Response
+  const finishTelemetry = (failed: boolean): void => {
+    if (telemetryFinished) return
+    telemetryFinished = true
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now()
+    recordRpcRequestFinished({
+      bytesReceived: responseBytes,
+      latencyMs: Math.max(0, nowMs - startedAtMs),
+      failed,
+    })
+  }
+
+  recordRpcRequestStarted(byteLength(requestBody))
+
   try {
-    response = await fetch('/codex-api/rpc', {
+    const response = await fetch('/codex-api/rpc', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(body),
+      body: requestBody,
     })
+
+    let payload: unknown = null
+    let rawText: string | null = null
+    try {
+      rawText = await response.text()
+      responseBytes = byteLength(rawText)
+      payload = JSON.parse(rawText)
+    } catch {
+      payload = null
+    }
+
+    if (!response.ok) {
+      finishTelemetry(true)
+      const detail = extractErrorMessage(payload, '') || rawText?.slice(0, 500) || ''
+      const prefix = `RPC ${method} failed with HTTP ${response.status}`
+      throw new CodexApiError(
+        detail ? `${prefix}: ${detail}` : prefix,
+        {
+          code: 'http_error',
+          method,
+          status: response.status,
+        },
+      )
+    }
+
+    const envelope = payload as RpcEnvelope<T> | null
+    if (!envelope || typeof envelope !== 'object' || !('result' in envelope)) {
+      finishTelemetry(true)
+      throw new CodexApiError(`RPC ${method} returned malformed envelope`, {
+        code: 'invalid_response',
+        method,
+        status: response.status,
+      })
+    }
+
+    finishTelemetry(false)
+    return envelope.result
   } catch (error) {
+    finishTelemetry(true)
+    if (error instanceof CodexApiError) throw error
     throw new CodexApiError(
       error instanceof Error ? error.message : `RPC ${method} failed before request was sent`,
       { code: 'network_error', method },
     )
   }
-
-  let payload: unknown = null
-  let rawText: string | null = null
-  try {
-    rawText = await response.text()
-    payload = JSON.parse(rawText)
-  } catch {
-    payload = null
-  }
-
-  if (!response.ok) {
-    const detail = extractErrorMessage(payload, '') || rawText?.slice(0, 500) || ''
-    const prefix = `RPC ${method} failed with HTTP ${response.status}`
-    throw new CodexApiError(
-      detail ? `${prefix}: ${detail}` : prefix,
-      {
-        code: 'http_error',
-        method,
-        status: response.status,
-      },
-    )
-  }
-
-  const envelope = payload as RpcEnvelope<T> | null
-  if (!envelope || typeof envelope !== 'object' || !('result' in envelope)) {
-    throw new CodexApiError(`RPC ${method} returned malformed envelope`, {
-      code: 'invalid_response',
-      method,
-      status: response.status,
-    })
-  }
-  return envelope.result
 }
 
 export async function fetchRpcMethodCatalog(): Promise<string[]> {
@@ -174,6 +205,7 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
   const scheduleReconnect = (attach: () => void, attempt: number) => {
     if (closed || reconnectTimer !== null) return
     const delayMs = Math.min(1000 * (2 ** attempt), 10000)
+    setRpcConnectionState('reconnecting')
     reconnectTimer = window.setTimeout(() => {
       reconnectTimer = null
       if (closed) return
@@ -181,30 +213,41 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
     }, delayMs)
   }
 
-  const handleNotificationPayload = (payload: unknown) => {
+  const handleNotificationPayload = (payload: unknown): void => {
     const notification = toNotification(payload)
     if (notification) {
       onNotification(notification)
     }
   }
 
+  const handleNotificationText = (rawText: string): void => {
+    recordRpcStreamBytes(byteLength(rawText))
+    recordRpcNotification()
+    try {
+      handleNotificationPayload(JSON.parse(rawText) as unknown)
+    } catch {
+      // Ignore malformed event payloads and keep stream alive.
+    }
+  }
+
   const attachSse = (attempt = 0) => {
     if (typeof EventSource === 'undefined' || closed) return
     cleanup?.()
+    setRpcConnectionState(attempt > 0 ? 'reconnecting' : 'connecting')
     const source = new EventSource('/codex-api/events')
     let isConnectionClosed = false
 
     source.onmessage = (event) => {
-      try {
-        handleNotificationPayload(JSON.parse(event.data) as unknown)
-      } catch {
-        // Ignore malformed event payloads and keep stream alive.
-      }
+      handleNotificationText(String(event.data ?? ''))
     }
 
     source.addEventListener('ready', (event: MessageEvent<string>) => {
+      const rawText = event.data ?? ''
+      recordRpcStreamBytes(byteLength(rawText))
+      recordRpcNotification()
+      setRpcConnectionState('connected')
       try {
-        const parsed = event.data ? JSON.parse(event.data) as unknown : { ok: true }
+        const parsed = rawText ? JSON.parse(rawText) as unknown : { ok: true }
         emitReadyNotification(onNotification, parsed)
       } catch {
         emitReadyNotification(onNotification)
@@ -233,6 +276,7 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
     }
 
     cleanup?.()
+    setRpcConnectionState(attempt > 0 ? 'reconnecting' : 'connecting')
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const socket = new WebSocket(`${protocol}//${window.location.host}/codex-api/ws`)
     let didOpen = false
@@ -246,6 +290,7 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
 
     socket.onopen = () => {
       didOpen = true
+      setRpcConnectionState('connected')
       clearReconnectTimer()
       if (fallbackTimer !== null) {
         window.clearTimeout(fallbackTimer)
@@ -254,11 +299,7 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
     }
 
     socket.onmessage = (event) => {
-      try {
-        handleNotificationPayload(JSON.parse(String(event.data)) as unknown)
-      } catch {
-        // Ignore malformed event payloads and keep stream alive.
-      }
+      handleNotificationText(typeof event.data === 'string' ? event.data : String(event.data))
     }
 
     socket.onerror = () => {
@@ -290,6 +331,7 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
     }
   }
 
+  setRpcConnectionState('connecting')
   if (typeof WebSocket !== 'undefined') {
     attachWebSocket()
   } else {
@@ -300,6 +342,7 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
     closed = true
     clearReconnectTimer()
     cleanup?.()
+    setRpcConnectionState('offline')
   }
 }
 

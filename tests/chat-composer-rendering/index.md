@@ -42,3 +42,4 @@ Return to the [manual test index](../../tests.md).
 | [First user message is visible immediately in new chats](first-user-message-is-visible-immediately-in-new-chats.md) |
 | [New chat live thinking and stop controls](new-chat-live-thinking-and-stop-controls.md) |
 | [Bold URL trailing punctuation parsing](bold-url-trailing-punctuation-parsing.md) |
+| [RPC telemetry, token usage, and Persian message layout](rpc-telemetry-token-usage-and-persian-layout.md) |

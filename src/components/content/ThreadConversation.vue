@@ -262,7 +262,7 @@
                 </a>
               </div>
 
-              <article v-if="message.text.length > 0" class="message-card" :data-role="message.role">
+              <article v-if="message.text.length > 0" class="message-card" :data-role="message.role" dir="auto">
                 <div v-if="message.isAutomationRun" class="automation-message-label">
                   <span>Sent via automation</span>
                   <code v-if="message.automationDisplayName">{{ message.automationDisplayName }}</code>
@@ -497,7 +497,7 @@
                               v-for="(cell, cellIndex) in block.headers"
                               :key="`th-${blockIndex}-${cellIndex}`"
                               class="message-table-head-cell"
-                              :style="{ textAlign: block.alignments[cellIndex] ?? 'left' }"
+                              :style="{ textAlign: block.alignments[cellIndex] ?? 'start' }"
                             >
                               <template v-for="(segment, segmentIndex) in getInlineSegments(cell)" :key="`th-seg-${blockIndex}-${cellIndex}-${segmentIndex}`">
                                 <span v-if="segment.kind === 'text'">{{ segment.value }}</span>
@@ -535,7 +535,7 @@
                               v-for="(cell, cellIndex) in row"
                               :key="`td-${blockIndex}-${rowIndex}-${cellIndex}`"
                               class="message-table-cell"
-                              :style="{ textAlign: block.alignments[cellIndex] ?? 'left' }"
+                              :style="{ textAlign: block.alignments[cellIndex] ?? 'start' }"
                             >
                               <template v-for="(segment, segmentIndex) in getInlineSegments(cell)" :key="`td-seg-${blockIndex}-${rowIndex}-${cellIndex}-${segmentIndex}`">
                                 <span v-if="segment.kind === 'text'">{{ segment.value }}</span>
@@ -5129,6 +5129,77 @@ onBeforeUnmount(() => {
 .message-card[data-role='assistant'],
 .message-card[data-role='system'] {
   @apply px-0 py-0 bg-transparent border-none rounded-none;
+}
+
+/* Keep prose direction-aware while isolating technical tokens in LTR. */
+.message-card,
+.plan-card {
+  text-align: start;
+}
+
+.message-card :deep(.message-list),
+.plan-card-markdown :deep(.message-list) {
+  padding-left: 0;
+  padding-right: 0;
+  padding-inline-start: 1.25rem;
+}
+
+.message-card :deep(.message-list-item),
+.plan-card-markdown :deep(.message-list-item) {
+  padding-left: 0;
+  padding-right: 0;
+  padding-inline-start: 0.25rem;
+}
+
+.message-card :deep(.message-task-list),
+.plan-card-markdown :deep(.message-task-list) {
+  padding-inline-start: 0;
+}
+
+.message-card :deep(.message-blockquote),
+.plan-card-markdown :deep(.message-blockquote) {
+  border-left: 0;
+  border-right: 0;
+  border-inline-start: 4px solid rgb(203 213 225);
+  padding-left: 0;
+  padding-right: 0;
+  padding-inline-start: 1rem;
+  border-radius: 0;
+  border-start-end-radius: 0.5rem;
+  border-end-end-radius: 0.5rem;
+}
+
+.message-card :deep(.message-table-head-cell),
+.message-card :deep(.message-table-cell),
+.plan-card-markdown :deep(.message-table-head-cell),
+.plan-card-markdown :deep(.message-table-cell) {
+  border-left: 0;
+  border-right: 0;
+  border-inline-start: 1px solid rgb(226 232 240);
+}
+
+.message-card :deep(.message-table-head-cell:first-child),
+.message-card :deep(.message-table-cell:first-child),
+.plan-card-markdown :deep(.message-table-head-cell:first-child),
+.plan-card-markdown :deep(.message-table-cell:first-child) {
+  border-inline-start: 0;
+}
+
+.message-card :deep(.message-inline-code),
+.message-card :deep(.message-file-link),
+.plan-card-markdown :deep(.message-inline-code),
+.plan-card-markdown :deep(.message-file-link) {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.message-card :deep(.message-code-block),
+.message-card :deep(.message-code-pre),
+.plan-card-markdown :deep(.message-code-block),
+.plan-card-markdown :deep(.message-code-pre) {
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: isolate;
 }
 
 :global(.dark) .message-file-chip {

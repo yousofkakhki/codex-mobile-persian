@@ -23,6 +23,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getThreadDetail: vi.fn(),
   getThreadGroupsPage: vi.fn(),
   getThreadQueueState: vi.fn(),
+  getThreadSummary: vi.fn(),
   getThreadTitleCache: vi.fn(),
   getWorkspaceRootsState: vi.fn(),
   generateThreadTitle: vi.fn(),
@@ -615,6 +616,53 @@ describe('startup request deduplication', () => {
     } finally {
       nowSpy.mockRestore()
     }
+  })
+})
+
+describe('fork sidebar retention', () => {
+  it('keeps a fork visible while the server thread list catches up', async () => {
+    installTestWindow()
+    const nowSpy = vi.spyOn(Date, 'now')
+    let now = 1000
+    nowSpy.mockImplementation(() => now)
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'project', threads: [thread('source-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.forkThread.mockResolvedValue({ threadId: 'forked-thread', model: 'gpt-5.6-luna' })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      turnIndexByTurnId: {},
+      hasMoreOlder: false,
+    })
+
+    try {
+      const state = useDesktopState()
+      await state.refreshAll({ includeSelectedThreadMessages: false })
+      now += 5000
+
+      await expect(state.forkThreadById('source-thread')).resolves.toBe('forked-thread')
+
+      expect(state.projectGroups.value.flatMap((group) => group.threads).map((row) => row.id)).toContain('forked-thread')
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
+  it('recovers a selected fork that thread/list omits after reconnect', async () => {
+    installTestWindow({
+      'codex-web-local.selected-thread-id.v1': 'forked-thread',
+    })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getThreadSummary.mockResolvedValue(thread('forked-thread', '/tmp/project'))
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+
+    expect(state.projectGroups.value.flatMap((group) => group.threads).map((row) => row.id)).toContain('forked-thread')
+    expect(window.localStorage.getItem('codex-web-local.optimistic-forks.v1')).toContain('forked-thread')
   })
 })
 

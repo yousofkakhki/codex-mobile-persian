@@ -21,6 +21,7 @@ import {
   rollbackThread,
   getThreadGroupsPage,
   getThreadQueueState,
+  getThreadSummary,
   getWorkspaceRootsState,
   setCodexSpeedMode,
   setThreadQueueState,
@@ -61,6 +62,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
+import { isReasoningEffortSupported, normalizeModelIdForProvider } from '../utils/modelCapabilities.js'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -81,6 +83,7 @@ const SELECTED_MODEL_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.selected-model-by
 const LEGACY_SELECTED_MODEL_STORAGE_KEY = 'codex-web-local.selected-model-id.v1'
 const PROJECT_ORDER_STORAGE_KEY = 'codex-web-local.project-order.v1'
 const PROJECT_DISPLAY_NAME_STORAGE_KEY = 'codex-web-local.project-display-name.v1'
+const OPTIMISTIC_FORK_STORAGE_KEY = 'codex-web-local.optimistic-forks.v1'
 const COLLABORATION_MODE_STORAGE_KEY = 'codex-web-local.collaboration-mode-by-context.v1'
 const LEGACY_COLLABORATION_MODE_STORAGE_KEY = 'codex-web-local.collaboration-mode.v1'
 const NEW_THREAD_COLLABORATION_MODE_CONTEXT = '__new-thread__'
@@ -92,7 +95,7 @@ const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const RECENT_THREAD_LIST_LOAD_REUSE_MS = 2000
 const RECENT_SKILLS_LOAD_REUSE_MS = 2000
-const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
 const OPENCODE_ZEN_DEFAULT_MODEL = 'muse-spark-1.3-contributor-free'
@@ -485,6 +488,60 @@ function saveSelectedThreadId(threadId: string): void {
     return
   }
   window.localStorage.setItem(SELECTED_THREAD_STORAGE_KEY, threadId)
+}
+
+function loadOptimisticForkThreads(): Record<string, UiThread> {
+  if (typeof window === 'undefined') return {}
+
+  try {
+    const raw = window.localStorage.getItem(OPTIMISTIC_FORK_STORAGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+
+    const next: Record<string, UiThread> = {}
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+      const record = value as Record<string, unknown>
+      const id = typeof record.id === 'string' && record.id.trim().length > 0 ? record.id.trim() : key.trim()
+      const cwd = typeof record.cwd === 'string' ? normalizePathForUi(record.cwd) : ''
+      const title = typeof record.title === 'string' && record.title.trim().length > 0
+        ? record.title.trim()
+        : 'Forked chat'
+      const createdAtIso = typeof record.createdAtIso === 'string' ? record.createdAtIso : ''
+      const updatedAtIso = typeof record.updatedAtIso === 'string' ? record.updatedAtIso : ''
+      if (!id || !createdAtIso || !updatedAtIso) continue
+
+      next[id] = {
+        id,
+        title,
+        projectName: toProjectName(cwd),
+        cwd,
+        hasWorktree: record.hasWorktree === true,
+        createdAtIso,
+        updatedAtIso,
+        preview: typeof record.preview === 'string' ? record.preview : title,
+        unread: false,
+        inProgress: false,
+      }
+    }
+    return next
+  } catch {
+    return {}
+  }
+}
+
+function saveOptimisticForkThreads(threads: Record<string, UiThread>): void {
+  if (typeof window === 'undefined') return
+  try {
+    if (Object.keys(threads).length === 0) {
+      window.localStorage.removeItem(OPTIMISTIC_FORK_STORAGE_KEY)
+    } else {
+      window.localStorage.setItem(OPTIMISTIC_FORK_STORAGE_KEY, JSON.stringify(threads))
+    }
+  } catch {
+    // Keep the in-memory fork visible when localStorage is unavailable.
+  }
 }
 
 function loadProjectOrder(): string[] {
@@ -1035,13 +1092,16 @@ function mergeIncomingWithLocalInProgressThreads(
   previous: UiProjectGroup[],
   incoming: UiProjectGroup[],
   inProgressById: Record<string, boolean>,
+  additionalRetainedById: Record<string, boolean> = {},
 ): UiProjectGroup[] {
   const incomingThreadIds = new Set(flattenThreads(incoming).map((thread) => thread.id))
-  const localInProgressThreads = flattenThreads(previous).filter(
-    (thread) => inProgressById[thread.id] === true && !incomingThreadIds.has(thread.id),
+  const localRetainedThreads = flattenThreads(previous).filter(
+    (thread) =>
+      !incomingThreadIds.has(thread.id) &&
+      (inProgressById[thread.id] === true || additionalRetainedById[thread.id] === true),
   )
 
-  if (localInProgressThreads.length === 0) {
+  if (localRetainedThreads.length === 0) {
     return incoming
   }
 
@@ -1051,7 +1111,7 @@ function mergeIncomingWithLocalInProgressThreads(
     threads: [...group.threads],
   }))
 
-  for (const thread of localInProgressThreads) {
+  for (const thread of localRetainedThreads) {
     const existingGroup = incomingByProjectName.get(thread.projectName)
     if (existingGroup) {
       const mergedGroupIndex = merged.findIndex((group) => group.projectName === thread.projectName)
@@ -1071,6 +1131,32 @@ function mergeIncomingWithLocalInProgressThreads(
   }
 
   return merged
+}
+
+function addMissingThreadsToGroups(groups: UiProjectGroup[], threads: UiThread[]): UiProjectGroup[] {
+  if (threads.length === 0) return groups
+
+  const nextGroups = groups.map((group) => ({
+    projectName: group.projectName,
+    threads: [...group.threads],
+  }))
+  const groupsByProjectName = new Map(nextGroups.map((group) => [group.projectName, group]))
+  const existingThreadIds = new Set(flattenThreads(nextGroups).map((thread) => thread.id))
+
+  for (const thread of threads) {
+    if (existingThreadIds.has(thread.id)) continue
+    const existingGroup = groupsByProjectName.get(thread.projectName)
+    if (existingGroup) {
+      existingGroup.threads.unshift(thread)
+    } else {
+      const nextGroup = { projectName: thread.projectName, threads: [thread] }
+      nextGroups.unshift(nextGroup)
+      groupsByProjectName.set(thread.projectName, nextGroup)
+    }
+    existingThreadIds.add(thread.id)
+  }
+
+  return nextGroups
 }
 
 function toProjectNameFromWorkspaceRoot(value: string): string {
@@ -1457,6 +1543,11 @@ export function useDesktopState() {
   const activeTurnIdByThreadId = ref<Record<string, string>>({})
   const interruptBlockedUntilPersistedByThreadId = ref<Record<string, boolean>>({})
   const threadListedByServerById = ref<Record<string, boolean>>({})
+  // Codex can lag or omit forked sessions from thread/list; archive is the explicit removal signal.
+  const optimisticForkThreadById = ref<Record<string, UiThread>>(loadOptimisticForkThreads())
+  const optimisticForkById = ref<Record<string, boolean>>(
+    Object.fromEntries(Object.keys(optimisticForkThreadById.value).map((threadId) => [threadId, true])),
+  )
   const persistedUserMessageByThreadId = ref<Record<string, boolean>>({})
   const pendingServerRequestsByThreadId = ref<Record<string, UiServerRequest[]>>({})
   const pendingTurnRequestByThreadId = ref<Record<string, PendingTurnRequest>>({})
@@ -1640,14 +1731,17 @@ export function useDesktopState() {
   function readModelIdForThread(threadId: string): string {
     const contextId = toThreadContextId(threadId)
     if (contextId === NEW_THREAD_COLLABORATION_MODE_CONTEXT) {
-      const normalizedProviderId = normalizeProviderContextId(activeProviderId.value)
-      const providerContextId = toProviderModelContextId(normalizedProviderId)
+      const providerId = readProviderIdForThread(threadId)
+      const providerContextId = toProviderModelContextId(providerId)
       const providerModelId = providerContextId
         ? normalizeStoredModelId(selectedModelIdByContext.value[providerContextId])
         : ''
-      if (providerModelId) return providerModelId
+      if (providerModelId) return normalizeModelIdForProvider(providerModelId, providerId)
     }
-    return readSelectedModel(selectedModelIdByContext.value, threadId).trim()
+    return normalizeModelIdForProvider(
+      readSelectedModel(selectedModelIdByContext.value, threadId),
+      readProviderIdForThread(threadId),
+    )
   }
 
   function readProviderIdForThread(threadId: string): string {
@@ -1683,6 +1777,7 @@ export function useDesktopState() {
       saveSelectedThreadId(nextThreadId)
     }
     selectedModelId.value = readProviderCompatibleSelectedModel(readModelIdForThread(nextThreadId))
+    ensureSelectedReasoningEffortSupportsModel(selectedModelId.value)
     selectedCollaborationMode.value = readSelectedCollaborationMode(
       selectedCollaborationModeByContext.value,
       nextThreadId,
@@ -1692,9 +1787,9 @@ export function useDesktopState() {
   }
 
   function setSelectedModelIdForThread(threadId: string, modelId: string): void {
-    const normalizedModelId = modelId.trim()
     const contextId = toThreadContextId(threadId)
-    const normalizedProviderId = normalizeProviderContextId(activeProviderId.value)
+    const normalizedProviderId = readProviderIdForThread(threadId)
+    const normalizedModelId = normalizeModelIdForProvider(modelId, normalizedProviderId)
     const providerContextId =
       contextId === NEW_THREAD_COLLABORATION_MODE_CONTEXT
         ? toProviderModelContextId(normalizedProviderId)
@@ -1717,6 +1812,7 @@ export function useDesktopState() {
     if (threadId.trim() === selectedThreadId.value) {
       selectedModelId.value = readModelIdForThread(selectedThreadId.value)
       ensureAvailableModelIds(selectedModelId.value)
+      ensureSelectedReasoningEffortSupportsModel(selectedModelId.value)
     } else {
       ensureAvailableModelIds(normalizedModelId)
     }
@@ -1731,7 +1827,7 @@ export function useDesktopState() {
     const normalizedThreadId = threadId.trim()
     if (!normalizedThreadId) return
 
-    const normalizedModelId = modelId.trim()
+    const normalizedModelId = normalizeModelIdForProvider(modelId, readProviderIdForThread(normalizedThreadId))
     if (normalizedModelId) {
       const nextModelMap = cloneStringKeyedRecord(selectedModelIdByContext.value)
       nextModelMap[normalizedThreadId] = normalizedModelId
@@ -1742,6 +1838,7 @@ export function useDesktopState() {
     ensureAvailableModelIds(normalizedModelId)
     if (selectedThreadId.value === normalizedThreadId) {
       selectedModelId.value = readModelIdForThread(selectedThreadId.value)
+      ensureSelectedReasoningEffortSupportsModel(selectedModelId.value)
     }
     saveSelectedModelMap(selectedModelIdByContext.value)
   }
@@ -1762,7 +1859,7 @@ export function useDesktopState() {
   }
 
   function resolveThreadModelForProvider(threadId: string, modelId: string, providerId: string): string {
-    const normalizedModelId = modelId.trim()
+    const normalizedModelId = normalizeModelIdForProvider(modelId, providerId)
     const normalizedProviderId = normalizeProviderContextId(providerId)
     if (normalizedProviderId !== 'opencode-zen') {
       return normalizedModelId
@@ -1931,7 +2028,17 @@ export function useDesktopState() {
     if (effort && !REASONING_EFFORT_OPTIONS.includes(effort)) {
       return
     }
+    const selectedModel = readModelIdForThread(selectedThreadId.value) || selectedModelId.value
+    if (!isReasoningEffortSupported(selectedModel, effort)) {
+      return
+    }
     selectedReasoningEffort.value = effort
+  }
+
+  function ensureSelectedReasoningEffortSupportsModel(modelId: string): void {
+    if (!isReasoningEffortSupported(modelId, selectedReasoningEffort.value)) {
+      selectedReasoningEffort.value = 'medium'
+    }
   }
 
   async function updateSelectedSpeedMode(mode: SpeedMode): Promise<void> {
@@ -2054,11 +2161,15 @@ export function useDesktopState() {
         saveSelectedModelMap(selectedModelIdByContext.value)
       }
 
+      const activeModelId = readModelIdForThread(refreshThreadId) || normalizedConfiguredModelId
       if (
         currentConfig.reasoningEffort &&
-        REASONING_EFFORT_OPTIONS.includes(currentConfig.reasoningEffort as ReasoningEffort)
+        REASONING_EFFORT_OPTIONS.includes(currentConfig.reasoningEffort as ReasoningEffort) &&
+        isReasoningEffortSupported(activeModelId, currentConfig.reasoningEffort as ReasoningEffort)
       ) {
         selectedReasoningEffort.value = currentConfig.reasoningEffort as ReasoningEffort
+      } else {
+        ensureSelectedReasoningEffortSupportsModel(activeModelId)
       }
       selectedSpeedMode.value = currentConfig.speedMode
     } catch (unknownError) {
@@ -2190,10 +2301,16 @@ export function useDesktopState() {
     projectGroups.value = mergeThreadGroups(projectGroups.value, flaggedGroups)
   }
 
-  function insertOptimisticThread(threadId: string, cwd: string, firstMessageText: string): void {
+  function insertOptimisticThread(
+    threadId: string,
+    cwd: string,
+    firstMessageText: string,
+    options: { retainUntilServerListed?: boolean } = {},
+  ): void {
     const nowIso = new Date().toISOString()
     const normalizedCwd = normalizePathForUi(cwd)
     const projectName = toProjectName(normalizedCwd)
+
     const nextThread: UiThread = {
       id: threadId,
       title: toOptimisticThreadTitle(firstMessageText),
@@ -2205,6 +2322,18 @@ export function useDesktopState() {
       preview: firstMessageText,
       unread: false,
       inProgress: false,
+    }
+
+    if (options.retainUntilServerListed === true) {
+      optimisticForkById.value = {
+        ...optimisticForkById.value,
+        [threadId]: true,
+      }
+      optimisticForkThreadById.value = {
+        ...optimisticForkThreadById.value,
+        [threadId]: nextThread,
+      }
+      saveOptimisticForkThreads(optimisticForkThreadById.value)
     }
 
     const existingGroupIndex = sourceGroups.value.findIndex((group) => group.projectName === projectName)
@@ -4154,7 +4283,17 @@ export function useDesktopState() {
   }
 
   function applyThreadGroups(groups: UiProjectGroup[], rootsState: WorkspaceRootsState | null): void {
-    const visibleGroups = filterGroupsByWorkspaceRoots(groups, rootsState)
+    const sourceGroupsWithPersistedForks = addMissingThreadsToGroups(
+      sourceGroups.value,
+      Object.values(optimisticForkThreadById.value),
+    )
+    const groupsWithLocallyRetainedThreads = mergeIncomingWithLocalInProgressThreads(
+      sourceGroupsWithPersistedForks,
+      groups,
+      {},
+      optimisticForkById.value,
+    )
+    const visibleGroups = filterGroupsByWorkspaceRoots(groupsWithLocallyRetainedThreads, rootsState)
     const hasWorkspaceRootsState = Boolean(
       rootsState && (rootsState.order.length > 0 || rootsState.projectOrder.length > 0 || (rootsState.remoteProjects ?? []).length > 0),
     )
@@ -4228,6 +4367,9 @@ export function useDesktopState() {
     loadedThreadListGroups = removeThreadFromGroups(loadedThreadListGroups, threadId)
     sourceGroups.value = removeThreadFromGroups(sourceGroups.value, threadId)
     inProgressById.value = omitKey(inProgressById.value, threadId)
+    optimisticForkById.value = omitKey(optimisticForkById.value, threadId)
+    optimisticForkThreadById.value = omitKey(optimisticForkThreadById.value, threadId)
+    saveOptimisticForkThreads(optimisticForkThreadById.value)
     applyThreadFlags()
   }
 
@@ -4309,6 +4451,19 @@ export function useDesktopState() {
     }
   }
 
+  async function recoverSelectedThreadIfMissing(): Promise<void> {
+    const threadId = selectedThreadId.value.trim()
+    if (!threadId || flattenThreads(sourceGroups.value).some((thread) => thread.id === threadId)) return
+
+    try {
+      const recoveredThread = await getThreadSummary(threadId)
+      if (recoveredThread.id !== threadId) return
+      insertOptimisticThread(threadId, recoveredThread.cwd, recoveredThread.title, { retainUntilServerListed: true })
+    } catch {
+      // A missing selected thread may be archived or deleted; leave normal selection handling unchanged.
+    }
+  }
+
   async function loadThreads(options: { force?: boolean } = {}) {
     if (loadThreadsPromise) {
       await loadThreadsPromise
@@ -4346,6 +4501,7 @@ export function useDesktopState() {
       await hydrateWorkspaceRootsStateIfNeeded(groups, rootsState)
 
       applyThreadGroups(loadedThreadListGroups, rootsState)
+      await recoverSelectedThreadIfMissing()
       hasLoadedThreads.value = true
       lastThreadListLoadAt = Date.now()
       if (!hasLoadedAllThreadPages) {
@@ -4704,6 +4860,17 @@ export function useDesktopState() {
     try {
       await renameThread(threadId, normalizedName)
       threadTitleById.value = { ...threadTitleById.value, [threadId]: normalizedName }
+      if (optimisticForkThreadById.value[threadId]) {
+        optimisticForkThreadById.value = {
+          ...optimisticForkThreadById.value,
+          [threadId]: {
+            ...optimisticForkThreadById.value[threadId],
+            title: normalizedName,
+            preview: normalizedName,
+          },
+        }
+        saveOptimisticForkThreads(optimisticForkThreadById.value)
+      }
       applyThreadFlags()
       void persistThreadTitle(threadId, normalizedName)
     } catch (unknownError) {
@@ -4726,7 +4893,7 @@ export function useDesktopState() {
       const nextThreadId = forkedThread.threadId.trim()
       if (!nextThreadId) return ''
 
-      insertOptimisticThread(nextThreadId, sourceCwd, sourceTitle)
+      insertOptimisticThread(nextThreadId, sourceCwd, sourceTitle, { retainUntilServerListed: true })
       setThreadModelId(nextThreadId, forkedThread.model)
       resumedThreadById.value = {
         ...resumedThreadById.value,
@@ -4780,7 +4947,7 @@ export function useDesktopState() {
 
       const forkedCwd = forked.cwd.trim() || sourceThread?.cwd?.trim() || ''
       const forkedThreadTitle = toForkedThreadTitle(sourceThread?.title || sourceThread?.preview || 'Untitled thread')
-      insertOptimisticThread(forkedThreadId, forkedCwd, forkedThreadTitle)
+      insertOptimisticThread(forkedThreadId, forkedCwd, forkedThreadTitle, { retainUntilServerListed: true })
       setThreadModelId(forkedThreadId, forked.model)
       setPersistedMessagesForThread(forkedThreadId, forked.messages)
       loadedMessagesByThreadId.value = {
@@ -5058,7 +5225,13 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[] = [],
     collaborationModeOverride?: CollaborationModeKind,
   ): Promise<void> {
-    const reasoningEffort = selectedReasoningEffort.value
+    const requestedReasoningEffort = selectedReasoningEffort.value
+    let reasoningEffort = isReasoningEffortSupported(
+      readModelIdForThread(threadId),
+      requestedReasoningEffort,
+    )
+      ? requestedReasoningEffort
+      : ''
     const collaborationMode = collaborationModeOverride === 'plan' ? 'plan' : collaborationModeOverride === 'default'
       ? 'default'
       : selectedCollaborationMode.value
@@ -5101,6 +5274,21 @@ export function useDesktopState() {
         }
       }
       const modelId = readModelIdForThread(threadId)
+      const nextReasoningEffort = isReasoningEffortSupported(modelId, requestedReasoningEffort)
+        ? requestedReasoningEffort
+        : ''
+      if (nextReasoningEffort !== reasoningEffort) {
+        reasoningEffort = nextReasoningEffort
+        setPendingTurnRequest(threadId, {
+          text: normalizedText,
+          imageUrls: [...normalizedImageUrls],
+          skills: normalizedSkills,
+          fileAttachments: normalizedFileAttachments,
+          effort: reasoningEffort,
+          collaborationMode,
+          fallbackRetried: false,
+        })
+      }
 
       let startedTurnId = ''
       try {
@@ -5117,12 +5305,15 @@ export function useDesktopState() {
       } catch (unknownError) {
         if (modelId && modelId !== MODEL_FALLBACK_ID && isUnsupportedChatGptModelError(unknownError)) {
           await applyFallbackModelSelection(threadId)
+          const fallbackReasoningEffort = isReasoningEffortSupported(MODEL_FALLBACK_ID, requestedReasoningEffort)
+            ? requestedReasoningEffort
+            : ''
           setPendingTurnRequest(threadId, {
             text: normalizedText,
             imageUrls: [...normalizedImageUrls],
             skills: normalizedSkills,
             fileAttachments: normalizedFileAttachments,
-            effort: reasoningEffort,
+            effort: fallbackReasoningEffort,
             collaborationMode,
             fallbackRetried: true,
           })
@@ -5131,7 +5322,7 @@ export function useDesktopState() {
             nextText,
             normalizedImageUrls,
             MODEL_FALLBACK_ID,
-            reasoningEffort || undefined,
+            fallbackReasoningEffort || undefined,
             skills.length > 0 ? skills : undefined,
             fileAttachments,
             collaborationMode,

@@ -172,6 +172,54 @@
         </button>
       </div>
 
+      <section class="thread-composer-live-stats" :class="{ 'is-expanded': isRuntimeStatsExpanded }" aria-label="Live runtime statistics">
+        <div class="thread-composer-live-stats-summary">
+          <span class="thread-composer-live-stats-connection" :class="`is-${rpcTelemetry.connectionState}`" :title="runtimeConnectionLabel">
+            <span class="thread-composer-live-stats-dot" aria-hidden="true" />
+            <span>{{ runtimeConnectionLabel }}</span>
+          </span>
+          <span class="thread-composer-live-stats-metric" title="Download rate">down {{ formatDataRate(rpcTelemetry.downloadRateBytesPerSecond) }}</span>
+          <span class="thread-composer-live-stats-metric" title="Upload rate">up {{ formatDataRate(rpcTelemetry.uploadRateBytesPerSecond) }}</span>
+          <span class="thread-composer-live-stats-metric" title="Current context tokens">{{ runtimeTokenSummary }}</span>
+          <span v-if="contextUsageSummaryText" class="thread-composer-live-stats-metric thread-composer-live-stats-context" :title="contextUsageTooltipText">{{ contextUsageSummaryText }}</span>
+          <button
+            class="thread-composer-live-stats-toggle"
+            type="button"
+            :aria-expanded="isRuntimeStatsExpanded"
+            aria-controls="thread-composer-live-stats-details"
+            @click="isRuntimeStatsExpanded = !isRuntimeStatsExpanded"
+          >
+            {{ isRuntimeStatsExpanded ? 'Hide stats' : 'Stats' }}
+          </button>
+        </div>
+        <div v-if="isRuntimeStatsExpanded" id="thread-composer-live-stats-details" class="thread-composer-live-stats-details">
+          <div class="thread-composer-live-stats-row">
+            <span>Transfer</span>
+            <strong>{{ formatDataRate(rpcTelemetry.transferRateBytesPerSecond) }} | {{ formatDataSize(rpcTelemetry.bytesReceived) }} down / {{ formatDataSize(rpcTelemetry.bytesSent) }} up total</strong>
+          </div>
+          <div class="thread-composer-live-stats-row">
+            <span>Tokens</span>
+            <strong>{{ runtimeTokenDetail }}</strong>
+          </div>
+          <div class="thread-composer-live-stats-row">
+            <span>Turn</span>
+            <strong>{{ runtimeTurnSummary }}</strong>
+          </div>
+          <div class="thread-composer-live-stats-row">
+            <span>Requests</span>
+            <strong>{{ rpcTelemetry.activeRequests }} active | {{ rpcTelemetry.totalRequests }} total | {{ rpcTelemetry.failedRequests }} failed</strong>
+          </div>
+          <div class="thread-composer-live-stats-row">
+            <span>Last latency</span>
+            <strong>{{ formatLatency(rpcTelemetry.lastRequestLatencyMs) }}</strong>
+          </div>
+          <div class="thread-composer-live-stats-row">
+            <span>Stream events</span>
+            <strong>{{ rpcTelemetry.notificationsReceived.toLocaleString() }}</strong>
+          </div>
+        </div>
+      </section>
+
       <div
         class="thread-composer-controls"
         :class="{ 'thread-composer-controls--recording': isDictationRecording }"
@@ -453,6 +501,12 @@ import type {
 import { useDictation } from '../../composables/useDictation'
 import { useMobile } from '../../composables/useMobile'
 import { useUiLanguage } from '../../composables/useUiLanguage'
+import { useRpcTelemetry } from '../../composables/useRpcTelemetry'
+import {
+  getFastModeCreditMultiplier,
+  isFastModeSupported as supportsFastMode,
+  isUltraReasoningModel,
+} from '../../utils/modelCapabilities'
 import {
   createComposerPrompt,
   getComposerPrompts,
@@ -548,6 +602,7 @@ const emit = defineEmits<{
   'edit-goal': []
 }>()
 const { t } = useUiLanguage()
+const { rpcTelemetry } = useRpcTelemetry()
 
 type SelectedImage = {
   id: string
@@ -650,14 +705,21 @@ const isAndroid = typeof navigator !== 'undefined' && /Android/i.test(navigator.
 const DRAFT_STORAGE_PREFIX = 'codex-web-local.thread-draft.v1.'
 let lastActiveThreadId = ''
 
-const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
-  { value: 'none', label: 'None' },
-  { value: 'minimal', label: 'Minimal' },
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'xhigh', label: 'Extra high' },
-]
+const reasoningOptions = computed<Array<{ value: ReasoningEffort; label: string }>>(() => {
+  const options: Array<{ value: ReasoningEffort; label: string }> = [
+    { value: 'none', label: 'None' },
+    { value: 'minimal', label: 'Minimal' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'Extra high' },
+    { value: 'max', label: 'Max' },
+  ]
+  if (isUltraReasoningModel(props.selectedModel)) {
+    options.push({ value: 'ultra', label: 'Ultra' })
+  }
+  return options
+})
 function formatModelLabel(modelId: string): string {
   return modelId.trim().replace(/^gpt/i, 'GPT')
 }
@@ -730,7 +792,7 @@ const standaloneFileAttachments = computed(() => {
 })
 const isInteractionDisabled = computed(() => props.disabled || !props.activeThreadId)
 const isComposerConfigDisabled = computed(() => props.disabled || !props.activeThreadId)
-const isFastModeSupported = computed(() => /^gpt-5\.(?:4|5)(?:$|-)/.test(props.selectedModel.trim()))
+const isFastModeSupported = computed(() => supportsFastMode(props.selectedModel))
 const showFastModeModelIcon = computed(() =>
   props.selectedSpeedMode === 'fast' && isFastModeSupported.value,
 )
@@ -742,7 +804,9 @@ const speedModeDescription = computed(() => {
     return t('Saving speed setting...')
   }
   return props.selectedSpeedMode === 'fast'
-    ? t('About 1.5x faster, with credits used at 2x')
+    ? getFastModeCreditMultiplier(props.selectedModel) === 2
+      ? t('About 1.5x faster, with credits used at 2x')
+      : t('About 1.5x faster, with credits used at 2.5x')
     : t('Default speed with normal credit usage')
 })
 const inProgressMode = computed<'steer' | 'queue'>(() =>
@@ -809,6 +873,29 @@ const contextUsageSummaryText = computed(() => contextUsageView.value?.summaryTe
 const contextUsageTooltipText = computed(() => contextUsageView.value?.tooltipText ?? '')
 const contextUsageRemainingPercent = computed(() => contextUsageView.value?.percentRemaining ?? 0)
 const contextUsageTone = computed(() => contextUsageView.value?.tone ?? 'healthy')
+const isRuntimeStatsExpanded = ref(false)
+const turnStartedAtMs = ref<number | null>(null)
+const turnElapsedMs = ref(0)
+const runtimeConnectionLabel = computed(() => {
+  const labels = {
+    offline: 'Offline',
+    connecting: 'Connecting',
+    connected: 'Live',
+    reconnecting: 'Reconnecting',
+  } as const
+  return labels[rpcTelemetry.value.connectionState]
+})
+const runtimeTokenSummary = computed(() => {
+  const usage = props.threadTokenUsage
+  return usage ? `${formatCompactTokenCount(usage.currentContextTokens)} tokens` : 'Tokens --'
+})
+const runtimeTokenDetail = computed(() => {
+  const usage = props.threadTokenUsage
+  if (!usage) return 'No token usage reported yet'
+  return `Current ${usage.currentContextTokens.toLocaleString()} · last ${usage.last.totalTokens.toLocaleString()} · total ${usage.total.totalTokens.toLocaleString()}`
+})
+const runtimeTurnSummary = computed(() => props.isTurnInProgress ? formatDuration(turnElapsedMs.value) : 'Idle')
+let turnElapsedTimer: number | null = null
 
 function formatPlanType(planType: string | null | undefined): string {
   if (!planType || planType === 'unknown') return ''
@@ -955,6 +1042,35 @@ function formatCompactTokenCount(value: number): string {
     return `${compact.replace(/\.0$/, '')}k`
   }
   return String(Math.round(value))
+}
+
+function formatDataSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`
+}
+
+function formatDataRate(bytesPerSecond: number): string {
+  return `${formatDataSize(bytesPerSecond)}/s`
+}
+
+function formatLatency(latencyMs: number | null): string {
+  return latencyMs === null ? '--' : `${Math.round(latencyMs)} ms`
+}
+
+function formatDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  return `${minutes}:${String(seconds).padStart(2, '0')}`
 }
 
 function formatBreakdownSummary(breakdown: UiTokenUsageBreakdown): string {
@@ -1986,6 +2102,10 @@ function onDocumentClick(event: MouseEvent): void {
 }
 
 onMounted(() => {
+  turnElapsedTimer = window.setInterval(() => {
+    if (turnStartedAtMs.value === null) return
+    turnElapsedMs.value = Date.now() - turnStartedAtMs.value
+  }, 500)
   document.addEventListener('click', onDocumentClick)
   window.addEventListener('drop', onWindowDragCleanup)
   window.addEventListener('dragend', onWindowDragCleanup)
@@ -2001,6 +2121,10 @@ defineExpose<ThreadComposerExposed>({
 })
 
 onBeforeUnmount(() => {
+  if (turnElapsedTimer !== null) {
+    clearInterval(turnElapsedTimer)
+    turnElapsedTimer = null
+  }
   document.removeEventListener('click', onDocumentClick)
   window.removeEventListener('drop', onWindowDragCleanup)
   window.removeEventListener('dragend', onWindowDragCleanup)
@@ -2039,6 +2163,31 @@ watch([draft, selectedImages, fileAttachments, selectedSkills], () => {
 watch(draft, () => {
   queueComposerOverflowMeasurement()
 })
+
+watch(
+  () => props.isTurnInProgress,
+  (isActive) => {
+    if (isActive) {
+      if (turnStartedAtMs.value === null) {
+        turnStartedAtMs.value = Date.now()
+        turnElapsedMs.value = 0
+      }
+      return
+    }
+    turnStartedAtMs.value = null
+    turnElapsedMs.value = 0
+  },
+  { immediate: true },
+)
+
+watch(
+  () => props.activeThreadId,
+  () => {
+    if (!props.isTurnInProgress) return
+    turnStartedAtMs.value = Date.now()
+    turnElapsedMs.value = 0
+  },
+)
 
 watch(
   () => props.cwd,
@@ -2170,6 +2319,63 @@ watch(
 
 .thread-composer-skill-chip-remove {
   @apply ml-0.5 inline-flex h-3.5 w-3.5 items-center justify-center rounded-full border-0 bg-transparent text-emerald-500 transition hover:bg-emerald-200 hover:text-emerald-700 text-xs leading-none p-0;
+}
+
+.thread-composer-live-stats {
+  @apply mt-2 rounded-lg border border-zinc-200/80 bg-zinc-50/80 px-2 py-1.5 text-[11px] leading-5 text-zinc-500;
+}
+
+.thread-composer-live-stats-summary {
+  @apply flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5;
+}
+
+.thread-composer-live-stats-connection {
+  @apply inline-flex shrink-0 items-center gap-1 font-medium text-zinc-600;
+}
+
+.thread-composer-live-stats-connection.is-connected {
+  @apply text-emerald-700;
+}
+
+.thread-composer-live-stats-connection.is-reconnecting,
+.thread-composer-live-stats-connection.is-connecting {
+  @apply text-amber-700;
+}
+
+.thread-composer-live-stats-connection.is-offline {
+  @apply text-zinc-400;
+}
+
+.thread-composer-live-stats-dot {
+  @apply h-1.5 w-1.5 rounded-full bg-current;
+}
+
+.thread-composer-live-stats-metric {
+  @apply whitespace-nowrap tabular-nums;
+}
+
+.thread-composer-live-stats-context {
+  @apply max-w-[13rem] truncate;
+}
+
+.thread-composer-live-stats-toggle {
+  @apply ms-auto border-0 bg-transparent px-1 text-[11px] font-medium text-zinc-600 underline-offset-2 hover:text-zinc-900 hover:underline;
+}
+
+.thread-composer-live-stats-details {
+  @apply mt-1.5 grid gap-0.5 border-t border-zinc-200/70 pt-1.5;
+}
+
+.thread-composer-live-stats-row {
+  @apply flex min-w-0 items-baseline justify-between gap-3;
+}
+
+.thread-composer-live-stats-row span {
+  @apply shrink-0;
+}
+
+.thread-composer-live-stats-row strong {
+  @apply min-w-0 truncate text-end font-medium text-zinc-700 tabular-nums;
 }
 
 .thread-composer-rate-limit {
