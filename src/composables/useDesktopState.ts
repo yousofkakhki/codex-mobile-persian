@@ -1200,7 +1200,13 @@ function getWorkspaceProjectOrderNames(
   duplicateLeafNames: Set<string>,
 ): string[] {
   const remoteProjectsById = getRemoteProjectById(rootsState)
-  return getWorkspaceProjectOrderPaths(rootsState).map((rootPath) => {
+  const orderedPaths = getWorkspaceProjectOrderPaths(rootsState)
+  for (const projectOrderItem of rootsState?.projectOrder ?? []) {
+    if (projectOrderItem.trim() && !orderedPaths.includes(projectOrderItem)) {
+      orderedPaths.push(projectOrderItem)
+    }
+  }
+  return orderedPaths.map((rootPath) => {
     if (remoteProjectsById.has(rootPath)) return rootPath
     const normalizedRootPath = normalizePathForUi(rootPath).trim()
     const leafName = toProjectNameFromWorkspaceRoot(normalizedRootPath)

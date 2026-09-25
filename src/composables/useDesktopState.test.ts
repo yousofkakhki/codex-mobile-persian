@@ -167,6 +167,61 @@ describe('filterGroupsByWorkspaceRoots', () => {
     ])
   })
 
+  it('keeps projects listed in project-order when saved roots are stale', () => {
+    const groups: UiProjectGroup[] = [
+      {
+        projectName: 'current-project',
+        threads: [thread('current-chat', '/tmp/current-project')],
+      },
+      {
+        projectName: 'older-project',
+        threads: [thread('older-chat', '/tmp/older-project')],
+      },
+    ]
+    const rootsState: WorkspaceRootsState = {
+      order: ['/tmp/current-project'],
+      labels: {},
+      active: ['/tmp/current-project'],
+      projectOrder: ['/tmp/current-project', '/tmp/older-project'],
+    }
+
+    expect(filterGroupsByWorkspaceRoots(groups, rootsState).map((group) => group.projectName)).toEqual([
+      'current-project',
+      'older-project',
+    ])
+  })
+
+  it('keeps stale-order projects visible in the loaded sidebar state', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [
+        {
+          projectName: 'current-project',
+          threads: [thread('current-chat', '/tmp/current-project')],
+        },
+        {
+          projectName: 'older-project',
+          threads: [thread('older-chat', '/tmp/older-project')],
+        },
+      ],
+      nextCursor: null,
+    })
+    gatewayMocks.getWorkspaceRootsState.mockResolvedValue({
+      order: ['/tmp/current-project'],
+      labels: {},
+      active: ['/tmp/current-project'],
+      projectOrder: ['/tmp/current-project', '/tmp/older-project'],
+    })
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+
+    expect(state.projectGroups.value.map((group) => group.projectName)).toEqual([
+      'current-project',
+      'older-project',
+    ])
+  })
+
   it('keeps empty duplicate workspace roots visible in Codex project order', () => {
     const groups: UiProjectGroup[] = [
       {
