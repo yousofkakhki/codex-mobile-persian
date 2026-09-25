@@ -283,6 +283,9 @@
                 <span>{{ providerError }}</span>
                 <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, providerError)">{{ t('Send feedback') }}</a>
               </div>
+              <div v-if="selectedProvider === 'ninerouter'" class="sidebar-settings-row sidebar-settings-row--input">
+                <p class="sidebar-settings-label">{{ t('Uses the server-configured 9Router connection. Credentials stay on the server.') }}</p>
+              </div>
               <div v-if="selectedProvider === 'openrouter'" class="sidebar-settings-row sidebar-settings-row--input">
                 <div class="sidebar-settings-provider-info">
                   <span class="sidebar-settings-label">{{ t('OpenRouter API key') }}</span>
@@ -461,6 +464,19 @@
                 </label>
                 <div class="sidebar-settings-field-help">
                   {{ t('Put one Telegram user ID per line or separate them with commas. Use `*` to allow all Telegram users. Unauthorized users will see their own ID in the rejection message so they can copy it here.') }}
+                </div>
+                <label class="sidebar-settings-field">
+                  <span class="sidebar-settings-field-label">{{ t('Completion notification chat IDs') }}</span>
+                  <textarea
+                    v-model="telegramNotificationChatIdsDraft"
+                    class="sidebar-settings-textarea"
+                    rows="2"
+                    placeholder="123456789&#10;987654321"
+                    spellcheck="false"
+                  />
+                </label>
+                <div class="sidebar-settings-field-help">
+                  {{ t('Send a completion message to these Telegram chats whenever any WebUI thread finishes. Use `/whoami` in each private bot chat to find the chat ID.') }}
                 </div>
                 <div v-if="telegramConfigError" class="sidebar-settings-telegram-error">
                   <span>{{ telegramConfigError }}</span>
@@ -1675,9 +1691,10 @@ const freeModeHasCustomKey = ref(false)
 const freeModeCustomKeyMasked = ref<string | null>(null)
 const freeModeCustomKeySaving = ref(false)
 const providerError = ref('')
-const selectedProvider = ref<'codex' | 'openrouter' | 'opencode-zen' | 'custom'>('codex')
+const selectedProvider = ref<'codex' | 'ninerouter' | 'openrouter' | 'opencode-zen' | 'custom'>('codex')
 const providerDropdownOptions = computed(() => [
   { value: 'codex', label: t('Codex') },
+  { value: 'ninerouter', label: t('9Router') },
   { value: 'openrouter', label: t('OpenRouter') },
   { value: 'opencode-zen', label: t('OpenCode Zen') },
   { value: 'custom', label: t('Custom endpoint') },
@@ -1690,6 +1707,7 @@ const opencodeZenKey = ref('')
 const isTelegramConfigOpen = ref(false)
 const telegramBotTokenDraft = ref('')
 const telegramAllowedUserIdsDraft = ref('')
+const telegramNotificationChatIdsDraft = ref('')
 const telegramConfigError = ref('')
 const isTelegramSaving = ref(false)
 const isCreateFolderOpen = ref(false)
@@ -1736,6 +1754,7 @@ const telegramStatus = ref<TelegramStatus>({
   active: false,
   mappedChats: 0,
   mappedThreads: 0,
+  notificationChats: 0,
   allowedUsers: 0,
   allowAllUsers: false,
   lastError: '',
@@ -2215,7 +2234,7 @@ const telegramStatusText = computed(() => {
   const allowlist = telegramStatus.value.allowAllUsers
     ? t('allow all users')
     : `${telegramStatus.value.allowedUsers} ${t('allowed user(s)')}`
-  const mapped = `${telegramStatus.value.mappedChats} ${t('chat(s)')}, ${telegramStatus.value.mappedThreads} ${t('thread(s)')}, ${allowlist}`
+  const mapped = `${telegramStatus.value.mappedChats} ${t('chat(s)')}, ${telegramStatus.value.mappedThreads} ${t('thread(s)')}, ${telegramStatus.value.notificationChats} ${t('completion recipient(s)')}, ${allowlist}`
   const error = telegramStatus.value.lastError ? `, ${t('error')}: ${telegramStatus.value.lastError}` : ''
   return `${base}, ${mapped}${error}`
 })
@@ -2370,11 +2389,12 @@ async function refreshTelegramStatus(): Promise<void> {
     telegramStatus.value = await getTelegramStatus()
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to load Telegram status'
-    telegramStatus.value = {
+  telegramStatus.value = {
       configured: false,
       active: false,
       mappedChats: 0,
       mappedThreads: 0,
+      notificationChats: 0,
       allowedUsers: 0,
       allowAllUsers: false,
       lastError: message,
@@ -2387,6 +2407,7 @@ async function refreshTelegramConfig(): Promise<void> {
     const config = await getTelegramConfig()
     telegramBotTokenDraft.value = config.botToken
     telegramAllowedUserIdsDraft.value = config.allowedUserIds.map((value) => String(value)).join('\n')
+    telegramNotificationChatIdsDraft.value = config.notificationChatIds.map((value) => String(value)).join('\n')
     telegramConfigError.value = ''
   } catch (error) {
     telegramConfigError.value = error instanceof Error ? error.message : 'Failed to load Telegram configuration'
@@ -2410,9 +2431,18 @@ function parseTelegramAllowedUserIdsInput(value: string): Array<number | '*'> {
   return allowAllUsers ? ['*', ...normalizedUserIds] : normalizedUserIds
 }
 
+function parseTelegramChatIdsInput(value: string): number[] {
+  return Array.from(new Set(value
+    .split(/[\n,]/)
+    .map((entry) => entry.trim().replace(/^(telegram|tg):/i, '').trim())
+    .filter((entry) => /^-?\d+$/.test(entry))
+    .map((entry) => Number.parseInt(entry, 10))))
+}
+
 async function saveTelegramConfig(): Promise<void> {
   const botToken = telegramBotTokenDraft.value.trim()
   const allowedUserIds = parseTelegramAllowedUserIdsInput(telegramAllowedUserIdsDraft.value)
+  const notificationChatIds = parseTelegramChatIdsInput(telegramNotificationChatIdsDraft.value)
   if (!botToken) {
     telegramConfigError.value = t('Telegram bot token is required.')
     return
@@ -2425,8 +2455,9 @@ async function saveTelegramConfig(): Promise<void> {
   isTelegramSaving.value = true
   telegramConfigError.value = ''
   try {
-    await configureTelegramBot(botToken, allowedUserIds)
+    await configureTelegramBot(botToken, allowedUserIds, notificationChatIds)
     telegramAllowedUserIdsDraft.value = allowedUserIds.map((value) => String(value)).join('\n')
+    telegramNotificationChatIdsDraft.value = notificationChatIds.join('\n')
     await Promise.all([
       refreshTelegramConfig(),
       refreshTelegramStatus(),
@@ -4440,6 +4471,13 @@ async function onProviderChange(provider: string): Promise<void> {
       selectedProvider.value = 'codex'
       const result = await setFreeMode(false)
       freeModeEnabled.value = result.enabled
+    } else if (provider === 'ninerouter') {
+      selectedProvider.value = 'ninerouter'
+      await setCustomProvider('', '', {
+        wireApi: 'responses',
+        provider: 'ninerouter',
+      })
+      freeModeEnabled.value = true
     } else if (provider === 'openrouter') {
       selectedProvider.value = 'openrouter'
       const result = await setFreeMode(true)
@@ -4572,7 +4610,9 @@ async function loadFreeModeStatus(): Promise<void> {
     freeModeEnabled.value = status.enabled
     freeModeHasCustomKey.value = status.customKey ?? false
     freeModeCustomKeyMasked.value = status.maskedKey ?? null
-    if (status.enabled) {
+    if (status.provider === 'ninerouter') {
+      selectedProvider.value = 'ninerouter'
+    } else if (status.enabled) {
       if (status.provider === 'opencode-zen') {
         selectedProvider.value = 'opencode-zen'
       } else if (status.provider === 'custom') {

@@ -152,10 +152,14 @@ export const FREE_MODE_STATE_FILE = 'webui-custom-providers.json'
 
 export const CUSTOM_PROVIDER_ID = 'custom-endpoint'
 export const OPENCODE_ZEN_PROVIDER_ID = 'opencode-zen'
+export const NINEROUTER_PROVIDER_ID = 'ninerouter'
 const CUSTOM_RUNTIME_PROVIDER_ID = 'custom_endpoint'
 const OPENCODE_ZEN_RUNTIME_PROVIDER_ID = 'opencode_zen'
+const NINEROUTER_RUNTIME_PROVIDER_ID = NINEROUTER_PROVIDER_ID
 export const OPENCODE_ZEN_BASE_URL = 'https://opencode.ai/zen/v1'
 export const OPENCODE_ZEN_DEFAULT_MODEL = 'muse-spark-1.3-contributor-free'
+export const NINEROUTER_BASE_URL = 'https://router.kakhki.ir/v1'
+const NINEROUTER_ENV_KEY = 'NINEROUTER_API_KEY'
 
 export type WireApi = 'responses' | 'chat'
 
@@ -164,7 +168,7 @@ export interface FreeModeState {
   apiKey: string | null
   model: string
   customKey?: boolean
-  provider?: 'openrouter' | 'custom' | 'opencode-zen'
+  provider?: 'codex' | 'openrouter' | 'custom' | 'opencode-zen' | 'ninerouter'
   customBaseUrl?: string
   wireApi?: WireApi
   providerKeys?: Record<string, string>
@@ -260,11 +264,35 @@ function getOpenCodeZenProviderConfigArgs(serverPort?: number): string[] {
   ]
 }
 
+function getNinerouterProviderConfigArgs(): string[] {
+  const providerConfigKey = `model_providers.${NINEROUTER_RUNTIME_PROVIDER_ID}`
+  return [
+    '-c', `${providerConfigKey}.name="9router"`,
+    '-c', `${providerConfigKey}.base_url="${NINEROUTER_BASE_URL}"`,
+    '-c', `${providerConfigKey}.wire_api="responses"`,
+    '-c', `${providerConfigKey}.env_key="${NINEROUTER_ENV_KEY}"`,
+  ]
+}
+
 export function getProviderCompatibilityConfigArgs(serverPort?: number): string[] {
-  return getOpenCodeZenProviderConfigArgs(serverPort)
+  return [
+    ...getOpenCodeZenProviderConfigArgs(serverPort),
+    ...getNinerouterProviderConfigArgs(),
+  ]
 }
 
 export function getFreeModeConfigArgs(state: FreeModeState, serverPort?: number): string[] {
+  if (state.provider === 'codex') {
+    return ['-c', 'model_provider="openai"']
+  }
+
+  if (state.provider === NINEROUTER_PROVIDER_ID) {
+    return [
+      '-c', `model_provider="${NINEROUTER_RUNTIME_PROVIDER_ID}"`,
+      ...getNinerouterProviderConfigArgs(),
+    ]
+  }
+
   if (!state.enabled) return []
 
   if (state.provider === 'opencode-zen') {

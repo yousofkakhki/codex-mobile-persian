@@ -7,10 +7,11 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { homedir } from 'node:os'
 import { tmpdir } from 'node:os'
+import { createRequire } from 'node:module'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
-import { writeFile } from 'node:fs/promises'
+import { chmod, writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
 import { callRpcWithRateLimitDecodeRecovery } from './rateLimitDecodeRecovery.js'
@@ -25,6 +26,7 @@ import {
   getFreeModels,
   refreshFreeModelsInBackground,
   FREE_MODE_STATE_FILE,
+  NINEROUTER_PROVIDER_ID,
   OPENCODE_ZEN_DEFAULT_MODEL,
   OPENCODE_ZEN_PROVIDER_ID,
   createDefaultOpenCodeZenFreeModeState,
@@ -50,6 +52,8 @@ import {
 } from '../commandResolution.js'
 import type { CollaborationModeKind, ReasoningEffort } from '../types/codex.js'
 import { isAbsoluteLikePath } from '../pathUtils.js'
+
+const require = createRequire(import.meta.url)
 
 type JsonRpcCall = {
   jsonrpc: '2.0'
@@ -1406,6 +1410,12 @@ function getCurrentImportedSessionModelDefaults(): { model: string; modelProvide
       modelProvider: 'custom_endpoint',
     }
   }
+  if (fmState.provider === NINEROUTER_PROVIDER_ID) {
+    return {
+      model: fmState.model?.trim() || '',
+      modelProvider: NINEROUTER_PROVIDER_ID,
+    }
+  }
   if (fmState.apiKey?.trim()) {
     return {
       model: fmState.model?.trim() || FREE_MODE_DEFAULT_MODEL,
@@ -1623,6 +1633,59 @@ function registerImportedSessionsInStateDb(sessions: ImportedSessionRecord[]): v
   }
 }
 
+type StateDbReader = {
+  prepare: (sql: string) => { all: () => unknown[] }
+  close: () => void
+}
+
+type NodeSqliteModule = {
+  DatabaseSync?: new (path: string, options?: { readOnly?: boolean; timeout?: number }) => StateDbReader
+}
+
+function readStateDbRowsWithNodeSqlite(stateDbPath: string, sql: string): Array<Record<string, unknown>> | null {
+  try {
+    const sqlite = require('node:sqlite') as NodeSqliteModule
+    if (!sqlite.DatabaseSync) return null
+    const database = new sqlite.DatabaseSync(stateDbPath, { readOnly: true, timeout: 2000 })
+    try {
+      return database.prepare(sql).all().flatMap((row) => {
+        const record = asRecord(row)
+        return record ? [record] : []
+      })
+    } finally {
+      database.close()
+    }
+  } catch {
+    return null
+  }
+}
+
+function normalizeImportedThreadRows(rows: unknown[]): Array<Record<string, unknown>> {
+  return rows.flatMap((row) => {
+    const record = asRecord(row)
+    const id = readNonEmptyString(record?.id)
+    const path = readNonEmptyString(record?.rollout_path)
+    const cwd = readNonEmptyString(record?.cwd)
+    if (!id || !path || !cwd) return []
+    const title = readNonEmptyString(record?.title) || readNonEmptyString(record?.first_user_message) || 'Imported chat'
+    const createdAt = typeof record?.created_at === 'number' ? record.created_at : Math.floor(Date.now() / 1000)
+    const updatedAt = typeof record?.updated_at === 'number' ? record.updated_at : createdAt
+    return [{
+      id,
+      preview: title,
+      modelProvider: readNonEmptyString(record?.model_provider) || 'openai',
+      createdAt,
+      updatedAt,
+      path,
+      cwd,
+      cliVersion: readNonEmptyString(record?.cli_version),
+      source: 'cli',
+      gitInfo: null,
+      turns: [],
+    }]
+  })
+}
+
 function listImportedThreadsFromStateDb(): Array<Record<string, unknown>> {
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
   if (!existsSync(stateDbPath)) return []
@@ -1630,40 +1693,17 @@ function listImportedThreadsFromStateDb(): Array<Record<string, unknown>> {
 SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
        cli_version, first_user_message, archived
 FROM threads
-WHERE archived = 0 AND replace(rollout_path, '\\', '/') LIKE '%/sessions/%' AND id IN (
-  SELECT id FROM threads WHERE first_user_message != '' OR title != ''
-)
+WHERE archived = 0 AND replace(rollout_path, '\\', '/') LIKE '%/sessions/%'
 ORDER BY updated_at DESC
 LIMIT 200;
 `
+  const nodeSqliteRows = readStateDbRowsWithNodeSqlite(stateDbPath, sql)
+  if (nodeSqliteRows) return normalizeImportedThreadRows(nodeSqliteRows)
   const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
   if (result.status !== 0 || !result.stdout.trim()) return []
   try {
     const rows = JSON.parse(result.stdout) as unknown
-    if (!Array.isArray(rows)) return []
-    return rows.flatMap((row) => {
-      const record = asRecord(row)
-      const id = readNonEmptyString(record?.id)
-      const path = readNonEmptyString(record?.rollout_path)
-      const cwd = readNonEmptyString(record?.cwd)
-      if (!id || !path || !cwd) return []
-      const title = readNonEmptyString(record?.title) || readNonEmptyString(record?.first_user_message) || 'Imported chat'
-      const createdAt = typeof record?.created_at === 'number' ? record.created_at : Math.floor(Date.now() / 1000)
-      const updatedAt = typeof record?.updated_at === 'number' ? record.updated_at : createdAt
-      return [{
-        id,
-        preview: title,
-        modelProvider: readNonEmptyString(record?.model_provider) || 'openai',
-        createdAt,
-        updatedAt,
-        path,
-        cwd,
-        cliVersion: readNonEmptyString(record?.cli_version),
-        source: 'cli',
-        gitInfo: null,
-        turns: [],
-      }]
-    })
+    return Array.isArray(rows) ? normalizeImportedThreadRows(rows) : []
   } catch {
     return []
   }
@@ -1718,14 +1758,17 @@ ${archivedPredicate};
   }
 }
 
-function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
+async function mergeImportedThreadsIntoThreadListResult(result: unknown): Promise<unknown> {
   const record = asRecord(result)
   const data = Array.isArray(record?.data) ? record.data : null
   if (!record || !data) return result
+  const threadTitles = await readMergedThreadTitleCache()
   const importedById = new Map<string, Record<string, unknown>>()
   for (const thread of listImportedThreadsFromStateDb()) {
     const id = readNonEmptyString(thread.id)
-    if (id) importedById.set(id, thread)
+    if (!id) continue
+    const title = readNonEmptyString(threadTitles.titles[id])
+    importedById.set(id, title ? { ...thread, name: title, preview: title } : thread)
   }
   if (importedById.size === 0) return result
   const mergedData: unknown[] = []
@@ -2202,32 +2245,7 @@ function sortOpenCodeZenModelIds(modelIds: string[]): string[] {
   return [...freeIds, ...paidIds]
 }
 
-async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<ProviderModelsResponse> {
-  const configPayload = asRecord(await appServer.rpc('config/read', {}))
-  const config = asRecord(configPayload?.config)
-  const providerId = readNonEmptyString(config?.model_provider)
-  if (!providerId) {
-    return { data: [], providerId: '', source: 'provider' }
-  }
-
-  const providers = asRecord(config?.model_providers)
-  const provider = asRecord(providers?.[providerId])
-  if (!provider) {
-    logProviderModelDiscoveryWarning('configured provider is missing from model_providers', { providerId })
-    return { data: [], providerId, source: 'provider' }
-  }
-
-  const wireApi = readNonEmptyString(provider.wire_api)
-  if (wireApi !== 'responses') {
-    return { data: [], providerId, source: 'provider' }
-  }
-
-  const baseUrl = readNonEmptyString(provider.base_url)
-  if (!baseUrl) {
-    logProviderModelDiscoveryWarning('responses provider is missing base_url', { providerId })
-    return { data: [], providerId, source: 'provider' }
-  }
-
+export function buildProviderDiscoveryHeaders(provider: Record<string, unknown>): Headers {
   const headers = new Headers()
   const configuredHeaders = asRecord(provider.http_headers)
   if (configuredHeaders) {
@@ -2240,18 +2258,61 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
 
   const bearerToken = readNonEmptyString(provider.experimental_bearer_token)
   if (bearerToken && !headers.has('Authorization')) {
-    headers.set('Authorization', `Bearer ${bearerToken}`)
+    headers.set('Authorization', 'Bearer ' + bearerToken)
   }
 
-  const envKey = readNonEmptyString(provider.env_key)
-  const envHttpHeaders = asRecord(provider.env_http_headers)
-  if (envKey || envHttpHeaders) {
-    logProviderModelDiscoveryWarning('provider discovery skipped env-backed auth/header expansion', {
-      providerId,
-      hasEnvKey: Boolean(envKey),
-      hasEnvHttpHeaders: Boolean(envHttpHeaders),
-    })
+  const envKeyName = normalizeHeaderValue(provider.env_key)
+  const envKey = envKeyName ? normalizeHeaderValue(process.env[envKeyName]) : null
+  if (envKey && !headers.has('Authorization')) {
+    headers.set('Authorization', 'Bearer ' + envKey)
   }
+
+  const envHttpHeaders = asRecord(provider.env_http_headers)
+  if (envHttpHeaders) {
+    for (const [key, rawEnvName] of Object.entries(envHttpHeaders)) {
+      const envName = normalizeHeaderValue(rawEnvName)
+      const value = envName ? normalizeHeaderValue(process.env[envName]) : null
+      if (!value) continue
+      headers.set(key, value)
+    }
+  }
+
+  return headers
+}
+
+async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<ProviderModelsResponse> {
+  const configPayload = asRecord(await appServer.rpc('config/read', {}))
+  const config = asRecord(configPayload?.config)
+  const providerId = readNonEmptyString(config?.model_provider)
+  if (!providerId) {
+    return { data: [], providerId: '', source: 'provider' }
+  }
+  const configuredModel = readNonEmptyString(config?.model)
+  const fallback = (): ProviderModelsResponse => ({
+    data: configuredModel ? [configuredModel] : [],
+    providerId,
+    source: 'provider',
+  })
+
+  const providers = asRecord(config?.model_providers)
+  const provider = asRecord(providers?.[providerId])
+  if (!provider) {
+    logProviderModelDiscoveryWarning('configured provider is missing from model_providers', { providerId })
+    return fallback()
+  }
+
+  const wireApi = readNonEmptyString(provider.wire_api)
+  if (wireApi !== 'responses') {
+    return fallback()
+  }
+
+  const baseUrl = readNonEmptyString(provider.base_url)
+  if (!baseUrl) {
+    logProviderModelDiscoveryWarning('responses provider is missing base_url', { providerId })
+    return fallback()
+  }
+
+  const headers = buildProviderDiscoveryHeaders(provider)
 
   let requestUrl: URL
   try {
@@ -2261,7 +2322,7 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       providerId,
       error: getErrorMessage(error, 'invalid url'),
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 
   let response: Response
@@ -2276,7 +2337,7 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       providerId,
       error: isTimeoutError(error) ? `request timed out after ${PROVIDER_MODELS_FETCH_TIMEOUT_MS}ms` : getErrorMessage(error, 'network error'),
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 
   let payload: unknown = null
@@ -2288,7 +2349,7 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       status: response.status,
       error: getErrorMessage(error, 'invalid json'),
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 
   if (!response.ok) {
@@ -2297,12 +2358,14 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       status: response.status,
       statusText: response.statusText,
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 
   try {
+    const modelIds = normalizeProviderModelsData(payload)
+    if (configuredModel && !modelIds.includes(configuredModel)) modelIds.unshift(configuredModel)
     return {
-      data: normalizeProviderModelsData(payload),
+      data: modelIds,
       providerId,
       source: 'provider',
     }
@@ -2311,7 +2374,7 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       providerId,
       error: getErrorMessage(error, 'invalid payload'),
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 }
 
@@ -4323,9 +4386,10 @@ let explicitCodexModelProviderConfigCache: {
   mtimeMs: number | null
   size: number | null
   value: boolean
+  provider: string | null
 } | null = null
 
-function hasExplicitCodexModelProviderConfigSync(): boolean {
+function readExplicitCodexModelProviderConfigSync(): string | null {
   const configPath = join(getCodexHomeDir(), 'config.toml')
   let info: ReturnType<typeof statSync> | null = null
   try {
@@ -4336,18 +4400,20 @@ function hasExplicitCodexModelProviderConfigSync(): boolean {
       mtimeMs: null,
       size: null,
       value: false,
+      provider: null,
     }
-    return false
+    return null
   }
   if (
     explicitCodexModelProviderConfigCache?.path === configPath
     && explicitCodexModelProviderConfigCache.mtimeMs === info.mtimeMs
     && explicitCodexModelProviderConfigCache.size === info.size
   ) {
-    return explicitCodexModelProviderConfigCache.value
+    return explicitCodexModelProviderConfigCache.provider
   }
 
   let value = false
+  let provider: string | null = null
   try {
     const raw = readFileSync(configPath, 'utf8')
     let inTopLevelTable = true
@@ -4365,6 +4431,17 @@ function hasExplicitCodexModelProviderConfigSync(): boolean {
       if (!inTopLevelTable) continue
       if (isModelProviderAssignment(content)) {
         value = true
+        const equalsIndex = content.indexOf('=')
+        const rawValue = equalsIndex >= 0 ? content.slice(equalsIndex + 1).trim() : ''
+        if (rawValue.length >= 2) {
+          const first = rawValue[0]
+          const last = rawValue[rawValue.length - 1]
+          if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+            provider = rawValue.slice(1, -1).trim() || null
+          } else {
+            provider = rawValue
+          }
+        }
         break
       }
     }
@@ -4376,8 +4453,14 @@ function hasExplicitCodexModelProviderConfigSync(): boolean {
     mtimeMs: info.mtimeMs,
     size: info.size,
     value,
+    provider,
   }
-  return value
+  return provider
+}
+
+function hasExplicitCodexModelProviderConfigSync(): boolean {
+  readExplicitCodexModelProviderConfigSync()
+  return explicitCodexModelProviderConfigCache?.value === true
 }
 
 export async function writeFreeModeStateFile(statePath: string, state: FreeModeState): Promise<void> {
@@ -4910,6 +4993,7 @@ let sessionIndexThreadTitleCacheState: SessionIndexThreadTitleCacheState = {
 type TelegramBridgeConfigState = {
   botToken: string
   chatIds: number[]
+  notificationChatIds: number[]
   allowedUserIds: Array<number | '*'>
 }
 
@@ -5204,7 +5288,7 @@ async function appendThreadQueuedMessage(threadId: string, message: StoredQueued
 }
 
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
-  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
   return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
     ? (value as ReasoningEffort)
     : ''
@@ -5598,12 +5682,23 @@ async function rollbackCreatedWorktree(
 
 function normalizeTelegramBridgeConfig(value: unknown): TelegramBridgeConfigState {
   const record = asRecord(value)
-  if (!record) return { botToken: '', chatIds: [], allowedUserIds: [] }
+  if (!record) return { botToken: '', chatIds: [], notificationChatIds: [], allowedUserIds: [] }
   const botToken = typeof record.botToken === 'string' ? record.botToken.trim() : ''
   const rawChatIds = Array.isArray(record.chatIds) ? record.chatIds : []
   const chatIds = Array.from(new Set(rawChatIds
     .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
     .map((value) => Math.trunc(value)))).slice(0, 50)
+  const rawNotificationChatIds = Array.isArray(record.notificationChatIds) ? record.notificationChatIds : []
+  const notificationChatIds = Array.from(new Set(rawNotificationChatIds
+    .map((value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value)
+      if (typeof value === 'string') {
+        const normalized = value.trim().replace(/^(telegram|tg):/i, '').trim()
+        if (/^-?\d+$/.test(normalized)) return Number.parseInt(normalized, 10)
+      }
+      return Number.NaN
+    })
+    .filter((value) => Number.isFinite(value)))).slice(0, 50)
   const rawAllowedUserIds = Array.isArray(record.allowedUserIds) ? record.allowedUserIds : []
   const allowAllUsers = rawAllowedUserIds.some((value) => typeof value === 'string' && value.trim() === '*')
   const normalizedAllowedUserIds = Array.from(new Set(rawAllowedUserIds
@@ -5621,17 +5716,36 @@ function normalizeTelegramBridgeConfig(value: unknown): TelegramBridgeConfigStat
   const allowedUserIds: Array<number | '*'> = allowAllUsers
     ? ['*' as const, ...normalizedAllowedUserIds]
     : normalizedAllowedUserIds
-  return { botToken, chatIds, allowedUserIds }
+  return { botToken, chatIds, notificationChatIds, allowedUserIds }
+}
+
+function telegramEnvironmentConfig(): TelegramBridgeConfigState {
+  return normalizeTelegramBridgeConfig({
+    botToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
+    allowedUserIds: (process.env.TELEGRAM_ALLOWED_USER_IDS ?? '').split(',').filter(Boolean),
+    notificationChatIds: (process.env.TELEGRAM_NOTIFICATION_CHAT_IDS ?? '').split(',').filter(Boolean),
+  })
 }
 
 async function readTelegramBridgeConfig(): Promise<TelegramBridgeConfigState> {
   const telegramConfigPath = getTelegramBridgeConfigPath()
+  const environmentConfig = telegramEnvironmentConfig()
   try {
     const raw = await readFile(telegramConfigPath, 'utf8')
     const payload = asRecord(JSON.parse(raw)) ?? {}
-    return normalizeTelegramBridgeConfig(payload)
+    const normalized = normalizeTelegramBridgeConfig(payload)
+    return {
+      botToken: normalized.botToken || environmentConfig.botToken,
+      chatIds: normalized.chatIds,
+      notificationChatIds: normalized.notificationChatIds.length > 0
+        ? normalized.notificationChatIds
+        : environmentConfig.notificationChatIds,
+      allowedUserIds: normalized.allowedUserIds.length > 0
+        ? normalized.allowedUserIds
+        : environmentConfig.allowedUserIds,
+    }
   } catch {
-    return { botToken: '', chatIds: [], allowedUserIds: [] }
+    return environmentConfig
   }
 }
 
@@ -5641,8 +5755,10 @@ async function writeTelegramBridgeConfig(nextState: TelegramBridgeConfigState): 
   await writeFile(telegramConfigPath, JSON.stringify({
     botToken: normalized.botToken,
     chatIds: normalized.chatIds,
+    notificationChatIds: normalized.notificationChatIds,
     allowedUserIds: normalized.allowedUserIds,
   }), 'utf8')
+  await chmod(telegramConfigPath, 0o600)
 }
 
 let telegramBridgeConfigMutation: Promise<void> = Promise.resolve()
@@ -6992,6 +7108,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       if (!config.botToken) return
       telegramBridge.configureToken(config.botToken)
       telegramBridge.configureAllowedUserIds(config.allowedUserIds)
+      telegramBridge.configureNotificationChatIds(config.notificationChatIds)
       telegramBridge.start()
     })
     .catch(() => {})
@@ -7147,6 +7264,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 apiKey: null,
                 model: FREE_MODE_DEFAULT_MODEL,
                 wireApi: prev.wireApi === 'chat' ? 'chat' : 'responses',
+                provider: 'codex',
                 providerKeys: prevKeys,
               }
               await writeFreeModeStateFile(statePath, state)
@@ -7165,10 +7283,18 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             const maskedKey = state.apiKey && state.customKey
               ? state.apiKey.substring(0, 12) + '...' + state.apiKey.substring(state.apiKey.length - 4)
               : null
+            const configuredProvider = readExplicitCodexModelProviderConfigSync()
+            const activeProvider = state.provider === 'codex'
+              ? 'codex'
+              : state.enabled
+                ? (state.provider ?? 'openrouter')
+                : state.provider === NINEROUTER_PROVIDER_ID || configuredProvider === NINEROUTER_PROVIDER_ID
+                  ? NINEROUTER_PROVIDER_ID
+                  : 'codex'
             let models = getCachedFreeModels()
             let currentModel = state.enabled ? state.model : null
             let wireApi = state.wireApi ?? null
-            if (state.provider === OPENCODE_ZEN_PROVIDER_ID) {
+            if (activeProvider === OPENCODE_ZEN_PROVIDER_ID) {
               currentModel = state.enabled ? (state.model?.trim() || OPENCODE_ZEN_DEFAULT_MODEL) : null
               try {
                 const zenModels = sortOpenCodeZenModelIds(await fetchOpenCodeZenModelIds(state.apiKey))
@@ -7191,6 +7317,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 ]
               }
               wireApi = 'responses'
+            } else if (activeProvider === NINEROUTER_PROVIDER_ID) {
+              wireApi = 'responses'
             } else {
               refreshFreeModelsInBackground()
             }
@@ -7202,7 +7330,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               currentModel,
               customKey: Boolean(state.customKey),
               maskedKey,
-              provider: state.provider ?? 'openrouter',
+              provider: activeProvider,
               customBaseUrl: state.customBaseUrl ?? null,
               wireApi,
             })
@@ -7273,11 +7401,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             const baseUrl = typeof body?.baseUrl === 'string' ? body.baseUrl.trim() : ''
             const apiKey = typeof body?.apiKey === 'string' ? body.apiKey.trim() : ''
             const wireApi = body?.wireApi === 'chat' ? 'chat' as const : 'responses' as const
-            const providerType = body?.provider === 'opencode-zen'
-              ? 'opencode-zen' as const
-              : body?.provider === 'openrouter'
-                ? 'openrouter' as const
-                : 'custom' as const
+            const providerType = body?.provider === NINEROUTER_PROVIDER_ID
+              ? 'ninerouter' as const
+              : body?.provider === 'opencode-zen'
+                ? 'opencode-zen' as const
+                : body?.provider === 'openrouter'
+                  ? 'openrouter' as const
+                  : 'custom' as const
             if (providerType === 'custom' && !baseUrl) {
               setJson(res, 400, { error: 'baseUrl is required' })
               return
@@ -7287,26 +7417,39 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             if (current.provider && current.apiKey) {
               prevKeys[current.provider] = current.apiKey
             }
-            const resolvedKey = apiKey || prevKeys[providerType] || ''
+            const resolvedKey = providerType === NINEROUTER_PROVIDER_ID
+              ? ''
+              : apiKey || prevKeys[providerType] || ''
             if (resolvedKey) {
               prevKeys[providerType] = resolvedKey
             }
-            const currentModel = (current.model ?? '').trim()
+            let currentModel = (current.model ?? '').trim()
+            if (!current.provider || current.provider === 'codex') {
+              try {
+                const configPayload = asRecord(await appServer.rpc('config/read', {}))
+                const config = asRecord(configPayload?.config)
+                currentModel = readNonEmptyString(config?.model) || currentModel
+              } catch {
+                // Keep the persisted model when the current app-server is unavailable.
+              }
+            }
             const resolvedModel = providerType === 'openrouter'
               ? (currentModel.includes('/') ? currentModel : FREE_MODE_DEFAULT_MODEL)
               : providerType === 'custom'
                 ? await fetchCustomEndpointDefaultModel(baseUrl, resolvedKey)
-                : OPENCODE_ZEN_DEFAULT_MODEL
+                : providerType === 'opencode-zen'
+                  ? OPENCODE_ZEN_DEFAULT_MODEL
+                  : currentModel
             const state: FreeModeState = {
               enabled: true,
-              apiKey: resolvedKey,
+              apiKey: providerType === NINEROUTER_PROVIDER_ID ? null : resolvedKey,
               model: resolvedModel,
               customKey: providerType === 'openrouter'
                 ? shouldMarkOpenRouterKeyAsCustom(current, apiKey)
-                : true,
+                : providerType === NINEROUTER_PROVIDER_ID ? false : true,
               provider: providerType,
               customBaseUrl: providerType === 'custom' ? baseUrl : undefined,
-              wireApi,
+              wireApi: providerType === NINEROUTER_PROVIDER_ID ? 'responses' : wireApi,
               providerKeys: prevKeys,
             }
             await writeFreeModeStateFile(statePath, state)
@@ -7508,7 +7651,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
           : trimmedResult
         const listMergedResult = body.method === 'thread/list'
-          ? mergeImportedThreadsIntoThreadListResult(errorMergedResult)
+          ? await mergeImportedThreadsIntoThreadListResult(errorMergedResult)
           : errorMergedResult
         const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, listMergedResult)
         const result = THREAD_METHODS_WITH_TURNS.has(body.method)
@@ -7883,6 +8026,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           }
           const fmState = ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
           if (fmState?.enabled) {
+            if (fmState.provider === NINEROUTER_PROVIDER_ID) {
+              const providerModels = await readProviderBackedModelIds(appServer)
+              setJson(res, 200, { ...providerModels, exclusive: true, source: NINEROUTER_PROVIDER_ID })
+              return
+            }
             if (fmState.provider === 'opencode-zen') {
               try {
                 const modelIds = sortOpenCodeZenModelIds(await fetchOpenCodeZenModelIds(fmState.apiKey))
@@ -9008,6 +9156,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const payload = asRecord(await readJsonBody(req))
         const botToken = typeof payload?.botToken === 'string' ? payload.botToken.trim() : ''
         const rawAllowedUserIds = Array.isArray(payload?.allowedUserIds) ? payload.allowedUserIds : []
+        const existingConfig = await readTelegramBridgeConfig()
+        const rawNotificationChatIds = Array.isArray(payload?.notificationChatIds)
+          ? payload.notificationChatIds
+          : existingConfig.notificationChatIds
         if (!botToken) {
           setJson(res, 400, { error: 'Missing botToken' })
           return
@@ -9015,6 +9167,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const config = normalizeTelegramBridgeConfig({
           botToken,
           allowedUserIds: rawAllowedUserIds,
+          notificationChatIds: rawNotificationChatIds,
         })
         if (config.allowedUserIds.length === 0) {
           setJson(res, 400, { error: 'At least one allowed Telegram user ID is required' })
@@ -9023,11 +9176,12 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
         telegramBridge.configureToken(config.botToken)
         telegramBridge.configureAllowedUserIds(config.allowedUserIds)
+        telegramBridge.configureNotificationChatIds(config.notificationChatIds)
         telegramBridge.start()
-        const existingConfig = await readTelegramBridgeConfig()
         await writeTelegramBridgeConfig({
           botToken: config.botToken,
           chatIds: existingConfig.chatIds,
+          notificationChatIds: config.notificationChatIds,
           allowedUserIds: config.allowedUserIds,
         })
         setJson(res, 200, { ok: true })
@@ -9038,9 +9192,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const config = await readTelegramBridgeConfig()
         setJson(res, 200, {
           data: {
-            botToken: config.botToken,
-            allowedUserIds: config.allowedUserIds,
-          },
+          botToken: config.botToken,
+          allowedUserIds: config.allowedUserIds,
+          notificationChatIds: config.notificationChatIds,
+        },
         })
         return
       }

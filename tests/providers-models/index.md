@@ -35,3 +35,4 @@ Return to the [manual test index](../../tests.md).
 | [Selected thread loads do not refetch provider models](selected-thread-loads-do-not-refetch-provider-models.md) |
 | [Provider-backed scheduled refreshes keep model menus populated](provider-backed-scheduled-refreshes-keep-model-menus-populated.md) |
 | [Zen automatic per-model routing](zen-hybrid-routing.md) |
+| [9Router server-configured provider](ninerouter-server-configured-provider.md) |

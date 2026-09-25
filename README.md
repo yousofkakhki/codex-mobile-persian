@@ -150,11 +150,14 @@ Set these environment variables before starting `codexapp`:
 ```bash
 export TELEGRAM_BOT_TOKEN="<your-telegram-bot-token>"
 export TELEGRAM_ALLOWED_USER_IDS="<your-telegram-user-id>,<optional-second-id>"
+export TELEGRAM_NOTIFICATION_CHAT_IDS="<first-chat-id>,<second-chat-id>" # optional completion alerts
 export TELEGRAM_DEFAULT_CWD="$PWD" # optional, defaults to current working directory
 npx @brutalstrikedevs/codexapp
 ```
 
 `TELEGRAM_ALLOWED_USER_IDS` is required for safe access. Only allowlisted Telegram user IDs can use the bridge. If no allowed user IDs are configured, incoming Telegram messages are rejected.
+
+`TELEGRAM_NOTIFICATION_CHAT_IDS` receives a completion message whenever any WebUI thread finishes. These are Telegram chat IDs, not usernames; use `/whoami` in each private chat with the bot to find them. Completion alerts include the thread title and ID, turn status, elapsed time, and the assistant's final response. Failed turns also send an alert with the error when available.
 
 To find your Telegram user ID:
 

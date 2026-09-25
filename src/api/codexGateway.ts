@@ -348,6 +348,7 @@ export type TelegramStatus = {
   active: boolean
   mappedChats: number
   mappedThreads: number
+  notificationChats: number
   allowedUsers: number
   allowAllUsers: boolean
   lastError: string
@@ -356,6 +357,7 @@ export type TelegramStatus = {
 export type TelegramConfig = {
   botToken: string
   allowedUserIds: Array<number | '*'>
+  notificationChatIds: number[]
 }
 
 export type LocalDirectoryEntry = {
@@ -688,7 +690,7 @@ async function enrichThreadMessagesWithFallback(threadId: string, messages: UiMe
 }
 
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
-  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
   return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
     ? (value as ReasoningEffort)
     : ''
@@ -1956,7 +1958,7 @@ export async function setCodexSpeedMode(mode: SpeedMode): Promise<void> {
     edits: [
       {
         keyPath: 'features.fast_mode',
-        value: true,
+        value: normalizedMode === 'fast',
         mergeStrategy: 'upsert',
       },
       {
@@ -1978,7 +1980,7 @@ export interface FreeModeStatus {
   currentModel: string | null
   customKey: boolean
   maskedKey: string | null
-  provider?: 'openrouter' | 'custom' | 'opencode-zen'
+  provider?: 'codex' | 'openrouter' | 'custom' | 'opencode-zen' | 'ninerouter'
   customBaseUrl?: string
   wireApi?: 'responses' | 'chat' | null
 }
@@ -2009,7 +2011,7 @@ export async function setFreeModeCustomKey(key: string): Promise<{ ok: boolean; 
 export async function setCustomProvider(
   baseUrl: string,
   apiKey: string,
-  options?: { wireApi?: 'responses' | 'chat'; provider?: 'custom' | 'opencode-zen' | 'openrouter' },
+  options?: { wireApi?: 'responses' | 'chat'; provider?: 'custom' | 'opencode-zen' | 'openrouter' | 'ninerouter' },
 ): Promise<{ ok: boolean }> {
   const response = await fetch('/codex-api/free-mode/custom-provider', {
     method: 'POST',
@@ -3279,6 +3281,7 @@ export async function searchThreads(
 export async function configureTelegramBot(
   botToken: string,
   allowedUserIds: Array<number | '*'>,
+  notificationChatIds: number[] = [],
 ): Promise<void> {
   const response = await fetch('/codex-api/telegram/configure-bot', {
     method: 'POST',
@@ -3286,6 +3289,7 @@ export async function configureTelegramBot(
     body: JSON.stringify({
       botToken,
       allowedUserIds,
+      notificationChatIds,
     }),
   })
   const payload = await response.json()
@@ -3321,9 +3325,18 @@ export async function getTelegramConfig(): Promise<TelegramConfig> {
       allowedUserIds.push(Math.trunc(value))
     }
   }
+  const rawNotificationChatIds = Array.isArray(data.notificationChatIds) ? data.notificationChatIds : []
+  const notificationChatIds = Array.from(new Set(rawNotificationChatIds
+    .map((value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value)
+      if (typeof value === 'string' && /^-?\d+$/.test(value.trim())) return Number.parseInt(value.trim(), 10)
+      return Number.NaN
+    })
+    .filter((value) => Number.isFinite(value)))).slice(0, 50)
   return {
     botToken: typeof data.botToken === 'string' ? data.botToken : '',
     allowedUserIds,
+    notificationChatIds,
   }
 }
 
@@ -3347,6 +3360,7 @@ export async function getTelegramStatus(): Promise<TelegramStatus> {
     active: data.active === true,
     mappedChats: typeof data.mappedChats === 'number' ? data.mappedChats : 0,
     mappedThreads: typeof data.mappedThreads === 'number' ? data.mappedThreads : 0,
+    notificationChats: typeof data.notificationChats === 'number' ? data.notificationChats : 0,
     allowedUsers: typeof data.allowedUsers === 'number' ? data.allowedUsers : 0,
     allowAllUsers: data.allowAllUsers === true,
     lastError: typeof data.lastError === 'string' ? data.lastError : '',

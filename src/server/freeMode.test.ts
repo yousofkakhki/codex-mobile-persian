@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   FREE_MODE_DEFAULT_MODEL,
+  NINEROUTER_BASE_URL,
+  NINEROUTER_PROVIDER_ID,
   OPENCODE_ZEN_DEFAULT_MODEL,
   createDefaultOpenCodeZenFreeModeState,
   filterOpenCodeZenModelsForAuthState,
@@ -187,6 +189,31 @@ describe('unauthenticated free mode defaults', () => {
     expect(args).toContain('model_provider="openrouter_free"')
     expect(args).toContain(`model="${FREE_MODE_DEFAULT_MODEL}"`)
     expect(args).toContain('model_providers.openrouter_free.base_url="http://127.0.0.1:4173/codex-api/openrouter-proxy/v1"')
+  })
+
+  it('forces direct Codex even when config.toml selects another provider', () => {
+    expect(getFreeModeConfigArgs({
+      enabled: false,
+      apiKey: null,
+      model: FREE_MODE_DEFAULT_MODEL,
+      provider: 'codex',
+    })).toEqual(['-c', 'model_provider="openai"'])
+  })
+
+  it('configures 9Router without persisting or exposing its environment-backed key', () => {
+    const args = getFreeModeConfigArgs({
+      enabled: true,
+      apiKey: null,
+      model: 'cx/gpt-5.6-luna',
+      provider: NINEROUTER_PROVIDER_ID,
+      wireApi: 'responses',
+    }, 4173)
+
+    expect(args).toContain(`model_provider="${NINEROUTER_PROVIDER_ID}"`)
+    expect(args).toContain(`model_providers.${NINEROUTER_PROVIDER_ID}.name="9router"`)
+    expect(args).toContain(`model_providers.${NINEROUTER_PROVIDER_ID}.base_url="${NINEROUTER_BASE_URL}"`)
+    expect(args).toContain(`model_providers.${NINEROUTER_PROVIDER_ID}.env_key="NINEROUTER_API_KEY"`)
+    expect(args).not.toContain('NINEROUTER_API_KEY="')
   })
 
   it('does not replace an intentionally disabled free mode state', () => {

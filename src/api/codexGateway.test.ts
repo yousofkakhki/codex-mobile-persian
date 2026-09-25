@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { clearThreadGoal, getAvailableModelIds, getThreadDetail, getThreadGoal, resumeThread, setThreadGoal, startThreadTurn } from './codexGateway'
+import { clearThreadGoal, getAvailableModelIds, getThreadDetail, getThreadGoal, resumeThread, setCodexSpeedMode, setThreadGoal, startThreadTurn } from './codexGateway'
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []
@@ -58,6 +58,39 @@ describe('startThreadTurn collaboration mode payloads', () => {
         developer_instructions: null,
       },
     })
+  })
+
+  it('preserves Ultra for the Astra custom model', async () => {
+    const { requests } = mockRpcFetch()
+
+    await startThreadTurn('thread-astra', 'solve the hard problem', [], 'cx/gpt-6-astra', 'ultra')
+
+    expect(requests[0].params).toMatchObject({
+      model: 'cx/gpt-6-astra',
+      effort: 'ultra',
+    })
+  })
+})
+
+describe('setCodexSpeedMode', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('disables the persisted Fast feature when switching back to Standard', async () => {
+    const { requests } = mockRpcFetch()
+
+    await setCodexSpeedMode('fast')
+    await setCodexSpeedMode('standard')
+
+    expect((requests[0].params as { edits: unknown }).edits).toEqual([
+      { keyPath: 'features.fast_mode', value: true, mergeStrategy: 'upsert' },
+      { keyPath: 'service_tier', value: 'fast', mergeStrategy: 'upsert' },
+    ])
+    expect((requests[1].params as { edits: unknown }).edits).toEqual([
+      { keyPath: 'features.fast_mode', value: false, mergeStrategy: 'upsert' },
+      { keyPath: 'service_tier', value: null, mergeStrategy: 'replace' },
+    ])
   })
 })
 
