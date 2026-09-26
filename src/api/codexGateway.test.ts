@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { clearThreadGoal, getAvailableModelIds, getThreadDetail, getThreadGoal, resumeThread, setCodexSpeedMode, setThreadGoal, startThreadTurn } from './codexGateway'
+import { clearThreadGoal, getAvailableModelIds, getOlderThreadMessages, getThreadDetail, getThreadGoal, resumeThread, setCodexSpeedMode, setThreadGoal, startThreadTurn } from './codexGateway'
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []
@@ -13,6 +13,10 @@ function mockRpcFetch(): { requests: Array<{ method: string, params: Record<stri
 
     return new Response(JSON.stringify({
       result: {
+        thread: { turns: [], status: 'idle' },
+        model: 'model-x',
+        modelProvider: 'openai',
+        initialTurnsPage: { data: [], nextCursor: null, backwardsCursor: null },
         turn: {
           id: `turn-${requests.length}`,
         },
@@ -186,12 +190,12 @@ describe('getThreadDetail', () => {
     vi.unstubAllGlobals()
   })
 
-  it('reads modelProvider from nested thread payloads returned by thread/read', async () => {
+  it('reads modelProvider from nested thread payloads returned by bounded thread/resume', async () => {
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const body = typeof init?.body === 'string'
         ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
         : { method: '', params: {} }
-      expect(body.method).toBe('thread/read')
+      expect(body.method).toBe('thread/resume')
       return new Response(JSON.stringify({
         result: {
           thread: {
@@ -199,6 +203,8 @@ describe('getThreadDetail', () => {
             modelProvider: 'opencode_zen',
             turns: [],
           },
+          initialTurnsPage: { data: [], nextCursor: null, backwardsCursor: null },
+          turnsBackwardsCursor: null,
         },
       }), {
         status: 200,
@@ -247,6 +253,59 @@ describe('thread goals', () => {
 })
 
 describe('resumeThread', () => {
+  it('requests a bounded recent turn page instead of hydrating full history', async () => {
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> } : { method: '', params: {} }
+      requests.push(body)
+      if (body.method === 'thread/resume') {
+        return new Response(JSON.stringify({ result: {
+          thread: { turns: [], status: 'idle' },
+          model: 'model-x',
+          modelProvider: 'openai',
+          initialTurnsPage: { data: [], nextCursor: 'initial-older-page-cursor', backwardsCursor: 'opposite-direction' },
+          turnsBackwardsCursor: 'head-cursor-fallback',
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ result: {} }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const resumed = await resumeThread('paged-thread')
+    expect(requests[0]).toEqual({
+      method: 'thread/resume',
+      params: {
+        threadId: 'paged-thread',
+        excludeTurns: true,
+        initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' },
+      },
+    })
+    expect(resumed.olderCursor).toBe('initial-older-page-cursor')
+    expect(resumed.hasMoreOlder).toBe(true)
+  })
+
+  it('loads older turns with the opaque app-server cursor', async () => {
+    const requests: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      requests.push(url)
+      return new Response(JSON.stringify({
+        result: {
+          data: [
+            { id: 'turn-newer', items: [], status: 'completed', itemsView: 'full', error: null, startedAt: null, completedAt: null, durationMs: null },
+            { id: 'turn-older', items: [], status: 'completed', itemsView: 'full', error: null, startedAt: null, completedAt: null, durationMs: null },
+          ],
+          nextCursor: 'next-opaque-cursor',
+          backwardsCursor: 'reverse-cursor',
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    const page = await getOlderThreadMessages('paged-thread', 'opaque+cursor/1', 10)
+    expect(requests).toHaveLength(1)
+    expect(requests[0]).toContain('cursor=opaque%2Bcursor%2F1')
+    expect(requests[0]).not.toContain('beforeTurnId')
+    expect(page.nextCursor).toBe('next-opaque-cursor')
+    expect(page.turnIndexByTurnId).toEqual({ 'turn-older': 0, 'turn-newer': 1 })
+  })
+
   afterEach(() => {
     vi.useRealTimers()
     vi.unstubAllGlobals()
@@ -272,7 +331,7 @@ describe('resumeThread', () => {
 
     expect(results.every((result) => result.status === 'rejected')).toBe(true)
     expect(requests).toEqual([
-      { method: 'thread/resume', params: { threadId: 'missing-thread' } },
+      { method: 'thread/resume', params: { threadId: 'missing-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
     ])
   })
 
@@ -301,8 +360,8 @@ describe('resumeThread', () => {
       modelProvider: 'openai',
     })
     expect(requests).toEqual([
-      { method: 'thread/resume', params: { threadId: 'legacy-custom-endpoint-thread' } },
-      { method: 'thread/resume', params: { threadId: 'legacy-custom-endpoint-thread', modelProvider: 'openai' } },
+      { method: 'thread/resume', params: { threadId: 'legacy-custom-endpoint-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
+      { method: 'thread/resume', params: { threadId: 'legacy-custom-endpoint-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' }, modelProvider: 'openai' } },
     ])
   })
 
@@ -319,9 +378,8 @@ describe('resumeThread', () => {
           headers: { 'Content-Type': 'application/json' },
         })
       }
-      return new Response(JSON.stringify({
-        result: { thread: { modelProvider: 'openai', turns: [] } },
-      }), {
+      if (body.method === 'thread/read') return new Response(JSON.stringify({ result: { thread: { modelProvider: 'openai', turns: [] } } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ result: { data: [], nextCursor: null, backwardsCursor: null } }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       })
@@ -329,8 +387,9 @@ describe('resumeThread', () => {
 
     await expect(resumeThread('shared-thread')).resolves.toMatchObject({ modelProvider: 'openai' })
     expect(requests).toEqual([
-      { method: 'thread/resume', params: { threadId: 'shared-thread' } },
-      { method: 'thread/read', params: { threadId: 'shared-thread', includeTurns: true } },
+      { method: 'thread/resume', params: { threadId: 'shared-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
+      { method: 'thread/read', params: { threadId: 'shared-thread', includeTurns: false } },
+      { method: 'thread/turns/list', params: { threadId: 'shared-thread', limit: 10, sortDirection: 'desc', itemsView: 'full' } },
     ])
   })
 
@@ -354,8 +413,8 @@ describe('resumeThread', () => {
     const retried = resumeThread('stalled-thread')
     expect(retried).not.toBe(first)
     expect(requests).toEqual([
-      { method: 'thread/resume', params: { threadId: 'stalled-thread' } },
-      { method: 'thread/resume', params: { threadId: 'stalled-thread' } },
+      { method: 'thread/resume', params: { threadId: 'stalled-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
+      { method: 'thread/resume', params: { threadId: 'stalled-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
     ])
   })
 })

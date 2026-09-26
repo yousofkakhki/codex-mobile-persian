@@ -154,11 +154,13 @@ function isAuthorizedByRequestLike(
   validTokens: Map<string, number>,
 ): boolean {
   const remote = remoteAddress ?? ''
-  // SSH reverse tunnels terminate on loopback, so remoteAddress alone is not enough
-  // to prove this is a direct local browser request.
+  // The app-server runs locally and calls internal provider proxy routes over loopback.
+  // Public requests through nginx carry the public Host header and do not match this bypass.
   if (isLocalhostRemote(remote) && isLocalhostHost(hostHeader ?? '')) {
     return true
   }
+  // SSH reverse tunnels terminate on loopback, so remoteAddress alone is not enough
+  // to prove this is a direct local browser request.
   if (isTrustedTailscaleRemote(remote)) {
     return true
   }
