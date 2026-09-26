@@ -43,7 +43,10 @@ import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { getZenModelCatalog } from './zenModelCatalog.js'
 import type { ZenModelMetadata } from '../types/zenModels.js'
 import { handleZenProxyRequest } from './zenProxy.js'
-import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
+import {
+  handleCustomEndpointModelsRequest,
+  handleCustomEndpointProxyRequest,
+} from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
@@ -740,13 +743,36 @@ async function sanitizeInlinePayloadDeep(
   return changed ? { value: nextRecord, changed: true } : { value, changed: false }
 }
 
+export async function listThreadTurnsPage(
+  appServer: { rpc: (method: string, params: unknown) => Promise<unknown> },
+  threadId: string,
+  cursor: string,
+  limit: number,
+): Promise<unknown> {
+  return appServer.rpc('thread/turns/list', {
+    threadId,
+    cursor,
+    limit,
+    sortDirection: 'desc',
+    itemsView: 'full',
+  })
+}
+
 export async function sanitizeThreadTurnsInlinePayloads(method: string, result: unknown): Promise<unknown> {
-  if (!THREAD_METHODS_WITH_TURNS.has(method)) return result
+  const isTurnsPage = method === 'thread/turns/list'
+  if (!THREAD_METHODS_WITH_TURNS.has(method) && !isTurnsPage) return result
 
   const record = asRecord(result)
   const thread = asRecord(record?.thread)
-  const turns = Array.isArray(thread?.turns) ? thread.turns : null
-  if (!record || !thread || !turns || turns.length === 0) return result
+  const turns = isTurnsPage
+    ? (Array.isArray(record?.data) ? record.data : null)
+    : (Array.isArray(thread?.turns) ? thread.turns : null)
+  if (!record || !turns || turns.length === 0) return result
+  if (!isTurnsPage && !thread) return result
+
+  const buildSanitizedResult = (nextTurns: unknown[]): unknown => isTurnsPage
+    ? { ...record, data: nextTurns }
+    : { ...record, thread: { ...thread, turns: nextTurns } }
 
   let changed = false
   const nextTurns: unknown[] = []
@@ -795,13 +821,7 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
   }
 
   if (!changed) return result
-  return {
-    ...record,
-    thread: {
-      ...thread,
-      turns: nextTurns,
-    },
-  }
+  return buildSanitizedResult(nextTurns)
 }
 
 function trimThreadTurnsInRpcResult(method: string, result: unknown): unknown {
@@ -7195,6 +7215,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         return
       }
 
+      if (url.pathname === '/codex-api/custom-proxy/v1/models' && req.method === 'GET') {
+        const statePath = join(getCodexHomeDir(), FREE_MODE_STATE_FILE)
+        let bearerToken = ''
+        let baseUrl = ''
+        try {
+          const state = ensureDefaultFreeModeStateForMissingAuthSync(statePath)
+          bearerToken = state?.apiKey ?? ''
+          baseUrl = state?.customBaseUrl ?? ''
+        } catch { /* use empty */ }
+        handleCustomEndpointModelsRequest(req, res, { baseUrl, bearerToken })
+        return
+      }
+
       if (url.pathname === '/codex-api/custom-proxy/v1/responses' && req.method === 'POST') {
         const statePath = join(getCodexHomeDir(), FREE_MODE_STATE_FILE)
         let bearerToken = ''
@@ -7674,59 +7707,22 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-turn-page') {
         try {
           const threadId = url.searchParams.get('threadId')?.trim() ?? ''
-          const beforeTurnId = url.searchParams.get('beforeTurnId')?.trim() ?? ''
+          const cursor = url.searchParams.get('cursor') ?? ''
           const limitRaw = url.searchParams.get('limit')?.trim() ?? String(THREAD_RESPONSE_TURN_LIMIT)
           const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_RESPONSE_TURN_LIMIT))
-          if (!threadId) {
-            setJson(res, 400, { error: 'Missing threadId' })
+          if (!threadId || !cursor) {
+            setJson(res, 400, { error: 'Missing threadId or cursor' })
             return
           }
-
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.readThreadForTurnPage(threadId))
-          const record = asRecord(threadReadResult)
-          const thread = asRecord(record?.thread)
-          if (!record || !thread) {
-            setJson(res, 502, { error: 'thread/read returned an invalid thread response' })
+          const result = await listThreadTurnsPage(appServer, threadId, cursor, limit)
+          const resultRecord = asRecord(result)
+          if (!resultRecord || !Array.isArray(resultRecord.data)) {
+            setJson(res, 502, { error: 'thread/turns/list returned an invalid page' })
             return
           }
-
-          const turns = Array.isArray(thread.turns) ? thread.turns : []
-          const beforeIndex = beforeTurnId
-            ? turns.findIndex((turn) => asRecord(turn)?.id === beforeTurnId)
-            : turns.length
-          if (beforeTurnId && beforeIndex < 0) {
-            setJson(res, 200, {
-              result: {
-                ...record,
-                thread: {
-                  ...thread,
-                  turns: [],
-                },
-              },
-              startTurnIndex: 0,
-              hasMoreOlder: false,
-            })
-            return
-          }
-
-          const endIndex = beforeIndex
-          const startIndex = Math.max(0, endIndex - limit)
-          const pageTurns = turns.slice(startIndex, endIndex)
-          const pagedResult = {
-            ...record,
-            thread: {
-              ...thread,
-              turns: pageTurns,
-            },
-          }
-          const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', pagedResult)
-          const result = await mergeSessionSkillInputsIntoThreadResult(sanitized)
-
-          setJson(res, 200, {
-            result,
-            startTurnIndex: startIndex,
-            hasMoreOlder: startIndex > 0,
-          })
+          const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/turns/list', result)
+          const transformed = await mergeSessionSkillInputsIntoThreadResult(sanitized)
+          setJson(res, 200, { result: transformed })
         } catch (error) {
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to load earlier thread messages') })
         }

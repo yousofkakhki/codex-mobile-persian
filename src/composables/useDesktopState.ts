@@ -722,6 +722,20 @@ function areMessageArraysEqual(first: UiMessage[], second: UiMessage[]): boolean
   return true
 }
 
+function shiftMessageTurnIndices(messages: UiMessage[], offset: number): UiMessage[] {
+  if (offset === 0) return messages
+  return messages.map((message) => (
+    typeof message.turnIndex === 'number'
+      ? { ...message, turnIndex: message.turnIndex + offset }
+      : message
+  ))
+}
+
+function shiftTurnIndexLookup(lookup: Record<string, number>, offset: number): Record<string, number> {
+  if (offset === 0) return lookup
+  return Object.fromEntries(Object.entries(lookup).map(([turnId, turnIndex]) => [turnId, turnIndex + offset]))
+}
+
 function mergeMessages(
   previous: UiMessage[],
   incoming: UiMessage[],
@@ -1540,6 +1554,7 @@ export function useDesktopState() {
   const loadedVersionByThreadId = ref<Record<string, string>>({})
   const loadedMessagesByThreadId = ref<Record<string, boolean>>({})
   const hasMoreOlderMessagesByThreadId = ref<Record<string, boolean>>({})
+  const olderTurnCursorByThreadId = ref<Record<string, string>>({})
   const loadingOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const resumedThreadById = ref<Record<string, boolean>>({})
   const turnIndexByTurnIdByThreadId = ref<Record<string, Record<string, number>>>({})
@@ -4597,6 +4612,11 @@ export function useDesktopState() {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: detail.hasMoreOlder === true,
       }
+      if (detail.olderCursor) {
+        olderTurnCursorByThreadId.value = { ...olderTurnCursorByThreadId.value, [threadId]: detail.olderCursor }
+      } else {
+        olderTurnCursorByThreadId.value = omitKey(olderTurnCursorByThreadId.value, threadId)
+      }
       markThreadMessagesPersisted(threadId, nextMessages)
       replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
       rebindLiveFileChangeTurnIndices(threadId)
@@ -4668,8 +4688,8 @@ export function useDesktopState() {
     if (loadingOlderMessagesByThreadId.value[threadId] === true) return
     if (hasMoreOlderMessagesByThreadId.value[threadId] !== true) return
 
-    const beforeTurnId = getFirstPersistedTurnId(threadId)
-    if (!beforeTurnId) {
+    const cursor = olderTurnCursorByThreadId.value[threadId]
+    if (!cursor) {
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: false,
@@ -4683,18 +4703,36 @@ export function useDesktopState() {
     }
 
     try {
-      const page = await getOlderThreadMessages(threadId, beforeTurnId)
+      const page = await getOlderThreadMessages(threadId, cursor, 10)
+      const previousTurnIndexLookup = turnIndexByTurnIdByThreadId.value[threadId] ?? {}
+      const knownTurnIds = new Set(Object.keys(previousTurnIndexLookup))
+      const pageTurnIds = Object.keys(page.turnIndexByTurnId)
+      const newPageTurnIds = pageTurnIds.filter((turnId) => !knownTurnIds.has(turnId))
+      const pageTurnIdSet = new Set(newPageTurnIds)
+      const olderMessages = page.messages.filter((message) => !message.turnId || pageTurnIdSet.has(message.turnId))
       const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-      const mergedMessages = mergeMessages(page.messages, previousPersisted, { preserveMissing: true })
+      const shift = newPageTurnIds.length
+      const shiftedPreviousPersisted = shiftMessageTurnIndices(previousPersisted, shift)
+      const shiftedPreviousTurnIndexLookup = shiftTurnIndexLookup(previousTurnIndexLookup, shift)
+      const mergedMessages = mergeMessages(olderMessages, shiftedPreviousPersisted, { preserveMissing: true })
       setPersistedMessagesForThread(threadId, mergedMessages)
+      const shiftedLiveFileChanges = shiftMessageTurnIndices(liveFileChangeMessagesByThreadId.value[threadId] ?? [], shift)
+      if (shiftedLiveFileChanges.length > 0) {
+        setLiveFileChangeMessagesForThread(threadId, shiftedLiveFileChanges)
+      }
       replaceTurnIndexLookupForThread(threadId, {
-        ...(turnIndexByTurnIdByThreadId.value[threadId] ?? {}),
         ...page.turnIndexByTurnId,
+        ...shiftedPreviousTurnIndexLookup,
       })
       rebindLiveFileChangeTurnIndices(threadId)
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,
         [threadId]: page.hasMoreOlder,
+      }
+      if (page.nextCursor) {
+        olderTurnCursorByThreadId.value = { ...olderTurnCursorByThreadId.value, [threadId]: page.nextCursor }
+      } else {
+        olderTurnCursorByThreadId.value = omitKey(olderTurnCursorByThreadId.value, threadId)
       }
     } catch (loadError) {
       error.value = loadError instanceof Error ? loadError.message : 'Failed to load earlier messages'
