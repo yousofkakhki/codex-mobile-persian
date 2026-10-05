@@ -40,6 +40,8 @@
 28. Click the goal card pencil or Goal composer pill, edit the objective and status, save, refresh, and confirm both changes persist
 29. Repeat the persisted goal card and editor checks in dark theme, then restore or clear the test goal
 30. On the disposable thread, open the goal editor and save; inspect the `/codex-api/rpc` request and response for `thread/goal/set`
+31. With a disposable budget-limited goal, switch to dark theme and inspect the goal card, Resume unlimited button, and editor. Confirm dark surfaces and legible text, not white cards on a dark page.
+32. Click Resume unlimited; confirm `status: active` and `tokenBudget: null` are sent without replacing the objective, then refresh and confirm the active goal persists.
 
 #### Expected Results
 - `/goal <objective>` routes to `thread/goal/set` with `status: active`
@@ -62,6 +64,7 @@
 - Persisted goals hydrate on thread selection and remain editable after refresh
 - Saving a goal from the WebUI editor sends `tokenBudget: null`, leaving its token budget unlimited; explicit numeric budgets remain supported by the API
 - The goal-save RPC request and returned goal both contain `tokenBudget: null`
+- Goal cards and recovery/editor controls use shared dark-theme overrides; Resume unlimited changes only the selected goal and disappears after successful recovery.
 
 #### Rollback/Cleanup
 - Use `/goal clear` on test threads after manual verification

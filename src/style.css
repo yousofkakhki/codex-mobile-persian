@@ -25,6 +25,38 @@
   @apply bg-zinc-950;
 }
 
+:root.dark .thread-goal-card,
+:root.dark .thread-goal-editor {
+  @apply border-zinc-700 bg-zinc-900;
+}
+
+:root.dark .thread-goal-card-copy strong {
+  @apply text-zinc-100;
+}
+
+:root.dark .thread-goal-card-copy span,
+:root.dark .thread-goal-card-edit {
+  @apply text-zinc-400;
+}
+
+:root.dark .thread-goal-resume {
+  @apply border-violet-800 bg-violet-950 text-violet-200 hover:bg-violet-900;
+}
+
+:root.dark .thread-goal-editor-input {
+  @apply border-zinc-700 bg-zinc-800 text-zinc-100 focus:border-violet-500 focus:bg-zinc-800;
+}
+
+:root.dark .thread-goal-editor-status button,
+:root.dark .thread-goal-editor-actions button {
+  @apply border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700;
+}
+
+:root.dark .thread-goal-editor-status button.is-active,
+:root.dark .thread-goal-editor-actions button.is-primary {
+  @apply border-violet-500 bg-violet-600 text-white hover:bg-violet-500;
+}
+
 :root.dark .mobile-drawer {
   @apply bg-zinc-900;
 }
