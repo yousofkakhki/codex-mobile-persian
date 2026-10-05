@@ -33,6 +33,14 @@ function mockRpcFetch(): { requests: Array<{ method: string, params: Record<stri
 }
 
 describe('startThreadTurn collaboration mode payloads', () => {
+  it('preserves NineRouter extended aliases and Max effort in default and plan settings', async () => {
+    const { requests } = mockRpcFetch()
+    await startThreadTurn('thread-luna', 'test', [], 'cx/gpt-6-luna[1m]', 'max', [], [], 'default')
+    await startThreadTurn('thread-sol', 'test', [], 'cx/gpt-6.1-sol', 'max', [], [], 'plan')
+    expect(requests[0].params).toMatchObject({ model: 'cx/gpt-6-luna[1m]', effort: 'max', collaborationMode: { settings: { model: 'cx/gpt-6-luna[1m]', reasoning_effort: 'max' } } })
+    expect(requests[1].params).toMatchObject({ model: 'cx/gpt-6.1-sol', effort: 'max', collaborationMode: { settings: { model: 'cx/gpt-6.1-sol', reasoning_effort: 'max' } } })
+  })
+
   afterEach(() => {
     vi.unstubAllGlobals()
   })

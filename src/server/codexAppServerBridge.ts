@@ -41,6 +41,8 @@ import {
 } from './freeMode.js'
 import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { getZenModelCatalog } from './zenModelCatalog.js'
+import { normalizeProviderModelMetadata } from './providerModelMetadata.js'
+import { readConfiguredContextWindows } from './runtimeModelCatalog.js'
 import type { ZenModelMetadata } from '../types/zenModels.js'
 import { handleZenProxyRequest } from './zenProxy.js'
 import {
@@ -2384,10 +2386,14 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
   try {
     const modelIds = normalizeProviderModelsData(payload)
     if (configuredModel && !modelIds.includes(configuredModel)) modelIds.unshift(configuredModel)
+    const configuredWindows = await readConfiguredContextWindows(config?.model_context_window)
     return {
       data: modelIds,
       providerId,
       source: 'provider',
+      models: normalizeProviderModelMetadata(payload).map(model => ({
+        ...model, configuredContextWindow: configuredWindows[model.id] ?? null,
+      })),
     }
   } catch (error) {
     logProviderModelDiscoveryWarning('provider /models payload was invalid', {

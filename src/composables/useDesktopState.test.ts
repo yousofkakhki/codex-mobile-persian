@@ -864,6 +864,25 @@ describe('startup refresh coalescing', () => {
 })
 
 describe('provider model selection', () => {
+  it('validates selected reasoning levels against NineRouter catalog metadata', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/gpt-6.1-sol', providerId: 'ninerouter', reasoningEffort: 'ultra', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockImplementation(async (options) => {
+      options.onMetadata([{ id: 'cx/gpt-6.1-sol', contextWindow: 1050000, supportsReasoning: true, reasoningOptions: ['low', 'medium', 'high', 'xhigh', 'max'] }])
+      return ['cx/gpt-6.1-sol']
+    })
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    state.setSelectedReasoningEffort('max')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    state.setSelectedReasoningEffort('ultra')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    state.setSelectedReasoningEffort('none')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    expect(state.availableModelMetadata.value[0].contextWindow).toBe(1050000)
+  })
+
   it('does not overwrite a model chosen while catalog refresh is pending', async () => {
     installTestWindow()
     gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'muse-spark-1.3-contributor-free', providerId: 'opencode_zen', reasoningEffort: 'medium', speedMode: 'standard' })

@@ -365,7 +365,7 @@
             :options="reasoningOptions"
             :placeholder="t('Thinking')"
             open-direction="up"
-            :disabled="isComposerConfigDisabled"
+            :disabled="isComposerConfigDisabled || reasoningOptions.length === 0"
             @update:model-value="onReasoningEffortSelect"
           />
 
@@ -506,6 +506,9 @@ import {
   getFastModeCreditMultiplier,
   isFastModeSupported as supportsFastMode,
   isUltraReasoningModel,
+  getModelReasoningEfforts,
+  resolveModelContextWindow,
+  getContextWindowStatus,
 } from '../../utils/modelCapabilities'
 import {
   createComposerPrompt,
@@ -718,7 +721,8 @@ const reasoningOptions = computed<Array<{ value: ReasoningEffort; label: string 
   if (isUltraReasoningModel(props.selectedModel)) {
     options.push({ value: 'ultra', label: 'Ultra' })
   }
-  return options
+  const supported = getModelReasoningEfforts(props.selectedModel, props.modelMetadata?.find(model => model.id === props.selectedModel))
+  return options.filter(option => supported.includes(option.value))
 })
 function formatModelLabel(modelId: string): string {
   return modelId.trim().replace(/^gpt/i, 'GPT')
@@ -731,7 +735,9 @@ const modelOptions = computed(() =>
       value: modelId, label: formatModelLabel(modelId),
       badge: metadata ? metadata.upstreamApi === 'responses' ? 'Responses' : metadata.upstreamApi === 'chat-completions' ? 'Chat' : 'Unknown API' : undefined,
       disabled: metadata?.supportsTools === false || metadata?.upstreamApi === 'unknown',
-      description: metadata?.supportsTools === false ? 'Not compatible with agent tools' : metadata?.upstreamApi === 'unknown' ? 'No supported API route' : metadata ? 'Automatic routing · SDK-inferred, not access-tested' : undefined,
+      description: metadata?.supportsTools === false ? 'Not compatible with agent tools' : metadata?.upstreamApi === 'unknown' ? 'No supported API route' : metadata?.routingSource === 'provider-catalog'
+        ? `Provider advertised${metadata.contextWindow ? ` · ${metadata.contextWindow.toLocaleString()} context tokens` : ''}${metadata.maxOutputTokens ? ` · ${metadata.maxOutputTokens.toLocaleString()} max output` : ''}`
+        : metadata ? 'Automatic routing · SDK-inferred, not access-tested' : undefined,
     }
   }),
 )
@@ -1116,7 +1122,10 @@ function buildContextUsageView(
   } | null {
   if (!usage) return null
 
-  const contextWindow = usage.modelContextWindow ?? null
+  const metadata = props.modelMetadata?.find(model => model.id === props.selectedModel)
+  const advertised = metadata?.contextWindow
+  const status = getContextWindowStatus(usage.modelContextWindow, metadata)
+  const contextWindow = resolveModelContextWindow(usage.modelContextWindow, advertised)
   if (typeof contextWindow !== 'number' || !Number.isFinite(contextWindow) || contextWindow <= 0) return null
 
   const tokensInContext = Math.max(0, usage.last.totalTokens)
@@ -1129,10 +1138,19 @@ function buildContextUsageView(
       : 'healthy'
 
   return {
-    summaryText: `${percentRemaining}% · ${formatCompactTokenCount(tokensInContext)} / ${formatCompactTokenCount(contextWindow)}`,
+    summaryText: status.differs
+      ? `Last turn ${formatCompactTokenCount(tokensInContext)} / ${formatCompactTokenCount(contextWindow)} · Next ${formatCompactTokenCount(status.configuredWindow ?? 0)}`
+      : `${percentRemaining}% · ${formatCompactTokenCount(tokensInContext)} / ${formatCompactTokenCount(contextWindow)}`,
     tooltipText: [
+      ...(status.differs ? [
+        'Saved usage differs from the selected model configuration; this may be a previous-turn measurement or a per-thread override.',
+        `Next-turn configured capacity (${props.selectedModel}): ${status.configuredWindow?.toLocaleString()} tokens. Confirmed by the next live usage event.`,
+      ] : []),
       `Context window: ${percentRemaining}% left (${percentUsed}% used)`,
       `In context: ${tokensInContext.toLocaleString()} / ${contextWindow.toLocaleString()} tokens`,
+      ...(advertised && advertised !== usage.modelContextWindow ? [typeof usage.modelContextWindow === 'number'
+        ? `Provider advertised: ${advertised.toLocaleString()} tokens; runtime limit remains authoritative`
+        : 'Provider-advertised estimate; runtime context limit is unknown'] : []),
       `Last turn: ${formatBreakdownSummary(usage.last)}`,
       `Session total: ${formatBreakdownSummary(usage.total)}`,
     ].join('\n'),

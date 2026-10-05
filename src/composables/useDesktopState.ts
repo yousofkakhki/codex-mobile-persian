@@ -62,7 +62,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
-import { isReasoningEffortSupported, normalizeModelIdForProvider } from '../utils/modelCapabilities.js'
+import { isReasoningEffortSupported as supportsReasoningEffort, getModelReasoningEfforts, normalizeModelIdForProvider } from '../utils/modelCapabilities.js'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -2058,8 +2058,13 @@ export function useDesktopState() {
 
   function ensureSelectedReasoningEffortSupportsModel(modelId: string): void {
     if (!isReasoningEffortSupported(modelId, selectedReasoningEffort.value)) {
-      selectedReasoningEffort.value = 'medium'
+      const efforts = getModelReasoningEfforts(modelId, availableModelMetadata.value.find(model => model.id === modelId))
+      selectedReasoningEffort.value = efforts.includes('medium') ? 'medium' : efforts[0] ?? ''
     }
+  }
+
+  function isReasoningEffortSupported(modelId: string, effort: ReasoningEffort | ''): boolean {
+    return supportsReasoningEffort(modelId, effort, availableModelMetadata.value.find(model => model.id === modelId))
   }
 
   async function updateSelectedSpeedMode(mode: SpeedMode): Promise<void> {

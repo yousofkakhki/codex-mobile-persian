@@ -37,3 +37,4 @@ Return to the [manual test index](../../tests.md).
 | [Zen automatic per-model routing](zen-hybrid-routing.md) |
 | [9Router server-configured provider](ninerouter-server-configured-provider.md) |
 | [Startup provider refresh deduplication](startup-provider-refresh-deduplication.md) |
+| [NineRouter advertised model capabilities](ninerouter-model-capabilities.md) |
