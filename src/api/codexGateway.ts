@@ -273,11 +273,15 @@ export async function setThreadGoal(threadId: string, input: ThreadGoalSetInput)
   const params: Record<string, unknown> = { threadId: normalizedThreadId }
   if (input.objective?.trim()) params.objective = input.objective.trim()
   if (input.status) params.status = input.status
-  if (Object.prototype.hasOwnProperty.call(input, 'tokenBudget')) params.tokenBudget = input.tokenBudget
+  params.tokenBudget = Object.prototype.hasOwnProperty.call(input, 'tokenBudget') ? input.tokenBudget : null
   const payload = await callRpc<{ goal?: unknown }>('thread/goal/set', params)
   const goal = normalizeThreadGoal(payload.goal)
   if (!goal) throw new Error('thread/goal/set response was malformed')
   return goal
+}
+
+export async function resumeThreadGoal(threadId: string): Promise<ThreadGoal> {
+  return setThreadGoal(threadId, { status: 'active', tokenBudget: null })
 }
 
 export async function clearThreadGoal(threadId: string): Promise<boolean> {

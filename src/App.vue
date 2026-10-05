@@ -1043,6 +1043,13 @@
                       </div>
                     </div>
                     <button class="thread-goal-card-edit" type="button" aria-label="Edit goal" title="Edit goal" @click="openGoalEditor">✎</button>
+                    <button
+                      v-if="selectedThreadGoal.status === 'budgetLimited'"
+                      class="thread-goal-resume"
+                      type="button"
+                      :disabled="isSavingThreadGoal"
+                      @click="onResumeThreadGoal"
+                    >{{ isSavingThreadGoal ? 'Resuming…' : 'Resume unlimited' }}</button>
                   </section>
                   <section v-if="isGoalEditorOpen" class="thread-goal-editor" role="dialog" aria-label="Edit thread goal">
                     <textarea v-model="goalEditorObjective" class="thread-goal-editor-input" aria-label="Goal objective" rows="5" />
@@ -1267,6 +1274,7 @@ import {
   startCodexLogin,
   searchThreads,
   switchAccount,
+  resumeThreadGoal,
   setThreadGoal,
 } from './api/codexGateway'
 import type { ReasoningEffort, SpeedMode, UiAccountEntry, UiRateLimitWindow, UiServerRequest, UiServerRequestReply, UiThreadAutomation, UiThreadTokenUsage } from './types/codex'
@@ -2190,10 +2198,28 @@ async function onSaveThreadGoal(): Promise<void> {
   isSavingThreadGoal.value = true
   goalEditorError.value = ''
   try {
-    selectedThreadGoal.value = await setThreadGoal(threadId, { objective, status: goalEditorStatus.value })
+    selectedThreadGoal.value = await setThreadGoal(threadId, {
+      objective,
+      status: goalEditorStatus.value,
+      tokenBudget: null,
+    })
     isGoalEditorOpen.value = false
   } catch (error) {
     goalEditorError.value = error instanceof Error ? error.message : 'Failed to save goal'
+  } finally {
+    isSavingThreadGoal.value = false
+  }
+}
+
+async function onResumeThreadGoal(): Promise<void> {
+  const threadId = selectedThreadId.value.trim()
+  if (!threadId || selectedThreadGoal.value?.status !== 'budgetLimited' || isSavingThreadGoal.value) return
+  isSavingThreadGoal.value = true
+  goalEditorError.value = ''
+  try {
+    selectedThreadGoal.value = await resumeThreadGoal(threadId)
+  } catch (error) {
+    goalEditorError.value = error instanceof Error ? error.message : 'Failed to resume goal'
   } finally {
     isSavingThreadGoal.value = false
   }
@@ -5313,6 +5339,10 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
   @apply inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-0 bg-transparent text-lg text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900;
 }
 
+.thread-goal-resume {
+  @apply shrink-0 rounded-full border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-semibold text-violet-700 transition hover:bg-violet-100 disabled:cursor-wait disabled:opacity-60;
+}
+
 .thread-goal-editor {
   @apply rounded-xl border border-zinc-200 bg-white p-3 shadow-lg;
 }
@@ -5363,6 +5393,10 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 :global(:root.dark) .thread-goal-card-copy span,
 :global(:root.dark) .thread-goal-card-edit {
   @apply text-zinc-400;
+}
+
+:global(:root.dark) .thread-goal-resume {
+  @apply border-violet-800 bg-violet-950 text-violet-200 hover:bg-violet-900;
 }
 
 :global(:root.dark) .thread-goal-editor-input {

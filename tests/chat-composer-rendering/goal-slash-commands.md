@@ -6,7 +6,7 @@
 #### Prerequisites/Setup
 1. Dev server running at `http://100.107.32.83:4173`
 2. App server running against a Codex build that exposes `thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`
-3. At least one existing thread is available
+3. A disposable thread is available for goal-budget verification
 4. Light and dark themes are both available from Settings
 
 #### Steps
@@ -39,6 +39,7 @@
 27. Open an existing thread that already has a persisted goal and confirm its status/objective card appears above the composer without typing `/goal`
 28. Click the goal card pencil or Goal composer pill, edit the objective and status, save, refresh, and confirm both changes persist
 29. Repeat the persisted goal card and editor checks in dark theme, then restore or clear the test goal
+30. On the disposable thread, open the goal editor and save; inspect the `/codex-api/rpc` request and response for `thread/goal/set`
 
 #### Expected Results
 - `/goal <objective>` routes to `thread/goal/set` with `status: active`
@@ -59,6 +60,8 @@
 - Interrupt works even when the active turn id is only known from the persisted thread detail
 - Light and dark theme overlays remain readable
 - Persisted goals hydrate on thread selection and remain editable after refresh
+- Saving a goal from the WebUI editor sends `tokenBudget: null`, leaving its token budget unlimited; explicit numeric budgets remain supported by the API
+- The goal-save RPC request and returned goal both contain `tokenBudget: null`
 
 #### Rollback/Cleanup
 - Use `/goal clear` on test threads after manual verification

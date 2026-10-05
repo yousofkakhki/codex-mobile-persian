@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { clearThreadGoal, getAvailableModelIds, getOlderThreadMessages, getThreadDetail, getThreadGoal, resumeThread, setCodexSpeedMode, setThreadGoal, startThreadTurn } from './codexGateway'
+import { clearThreadGoal, getAvailableModelIds, getOlderThreadMessages, getThreadDetail, getThreadGoal, resumeThread, resumeThreadGoal, setCodexSpeedMode, setThreadGoal, startThreadTurn } from './codexGateway'
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []
@@ -243,12 +243,65 @@ describe('thread goals', () => {
 
     await expect(getThreadGoal('thread-goal')).resolves.toMatchObject({ objective: 'Existing objective', status: 'blocked' })
     await expect(setThreadGoal('thread-goal', { objective: 'Edited objective', status: 'active' })).resolves.toMatchObject({ objective: 'Edited objective', status: 'active' })
+    await expect(setThreadGoal('thread-goal', { objective: 'Budgeted objective', tokenBudget: 5000 })).resolves.toMatchObject({ objective: 'Budgeted objective' })
     await expect(clearThreadGoal('thread-goal')).resolves.toBe(true)
     expect(requests).toEqual([
       { method: 'thread/goal/get', params: { threadId: 'thread-goal' } },
-      { method: 'thread/goal/set', params: { threadId: 'thread-goal', objective: 'Edited objective', status: 'active' } },
+      { method: 'thread/goal/set', params: { threadId: 'thread-goal', objective: 'Edited objective', status: 'active', tokenBudget: null } },
+      { method: 'thread/goal/set', params: { threadId: 'thread-goal', objective: 'Budgeted objective', tokenBudget: 5000 } },
       { method: 'thread/goal/clear', params: { threadId: 'thread-goal' } },
     ])
+  })
+
+  it('resumes a budget-limited goal with an unlimited budget', async () => {
+    const { requests } = mockRpcFetch()
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
+      requests.push(body)
+      return new Response(JSON.stringify({ result: { goal: {
+        threadId: body.params.threadId,
+        objective: 'Existing objective',
+        status: body.params.status ?? 'budgetLimited',
+        tokenBudget: body.params.tokenBudget ?? 100,
+        tokensUsed: 100,
+        timeUsedSeconds: 1,
+        createdAt: 1,
+        updatedAt: 2,
+      } } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+    await setThreadGoal('thread-goal', { status: 'active', tokenBudget: null })
+    expect(requests).toEqual([{
+      method: 'thread/goal/set',
+      params: { threadId: 'thread-goal', status: 'active', tokenBudget: null },
+    }])
+  })
+
+  it('resumes the existing objective without changing it', async () => {
+    const requests: Array<{ method: string; params: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; params: Record<string, unknown> }
+      requests.push(body)
+      return new Response(JSON.stringify({ result: { goal: {
+        threadId: body.params.threadId,
+        objective: 'Keep existing objective',
+        status: body.params.status ?? 'budgetLimited',
+        tokenBudget: 100,
+        tokensUsed: 100,
+        timeUsedSeconds: 10,
+        createdAt: 1,
+        updatedAt: 2,
+      } } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }))
+
+    await expect(resumeThreadGoal('thread-goal')).resolves.toMatchObject({
+      objective: 'Keep existing objective',
+      status: 'active',
+      tokenBudget: 100,
+    })
+    expect(requests).toEqual([{
+      method: 'thread/goal/set',
+      params: { threadId: 'thread-goal', status: 'active', tokenBudget: null },
+    }])
   })
 })
 
