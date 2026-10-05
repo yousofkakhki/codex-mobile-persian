@@ -158,7 +158,7 @@ const OPENCODE_ZEN_RUNTIME_PROVIDER_ID = 'opencode_zen'
 const NINEROUTER_RUNTIME_PROVIDER_ID = NINEROUTER_PROVIDER_ID
 export const OPENCODE_ZEN_BASE_URL = 'https://opencode.ai/zen/v1'
 export const OPENCODE_ZEN_DEFAULT_MODEL = 'muse-spark-1.3-contributor-free'
-export const NINEROUTER_BASE_URL = 'https://router.kakhki.ir/v1'
+export const NINEROUTER_BASE_URL = 'http://127.0.0.1:20128/v1'
 const NINEROUTER_ENV_KEY = 'NINEROUTER_API_KEY'
 
 export type WireApi = 'responses' | 'chat'

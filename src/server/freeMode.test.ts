@@ -216,6 +216,10 @@ describe('unauthenticated free mode defaults', () => {
     expect(args).not.toContain('NINEROUTER_API_KEY="')
   })
 
+  it('routes 9Router directly to the VPS loopback service', () => {
+    expect(NINEROUTER_BASE_URL).toBe('http://127.0.0.1:20128/v1')
+  })
+
   it('does not replace an intentionally disabled free mode state', () => {
     expect(shouldCreateDefaultFreeModeStateForMissingAuth({
       enabled: false,
