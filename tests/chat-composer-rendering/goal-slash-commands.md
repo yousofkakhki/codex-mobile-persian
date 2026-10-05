@@ -42,6 +42,8 @@
 30. On the disposable thread, open the goal editor and save; inspect the `/codex-api/rpc` request and response for `thread/goal/set`
 31. With a disposable budget-limited goal, switch to dark theme and inspect the goal card, Resume unlimited button, and editor. Confirm dark surfaces and legible text, not white cards on a dark page.
 32. Click Resume unlimited; confirm `status: active` and `tokenBudget: null` are sent without replacing the objective, then refresh and confirm the active goal persists.
+33. Open disposable thread A with a goal, then switch to thread B with no goal while delaying B's goal-get response. A's goal card and Goal pill must disappear immediately. Complete B's empty response and refresh; neither should return.
+34. Delay a goal save/resume/clear on A, switch to B, then release A's response. B's goal state and editor must remain unchanged. Repeat in light and dark themes, using stubbed responses or disposable threads only.
 
 #### Expected Results
 - `/goal <objective>` routes to `thread/goal/set` with `status: active`
@@ -65,6 +67,7 @@
 - Saving a goal from the WebUI editor sends `tokenBudget: null`, leaving its token budget unlimited; explicit numeric budgets remain supported by the API
 - The goal-save RPC request and returned goal both contain `tokenBudget: null`
 - Goal cards and recovery/editor controls use shared dark-theme overrides; Resume unlimited changes only the selected goal and disappears after successful recovery.
+- Goal visibility is scoped to the selected thread; switching invalidates prior requests synchronously. Late reads and writes, including switch-away-and-back races, cannot overwrite the current goal state. Returned goal thread IDs are validated.
 
 #### Rollback/Cleanup
 - Use `/goal clear` on test threads after manual verification

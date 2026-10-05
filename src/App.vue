@@ -1234,11 +1234,11 @@ import IconTablerSettings from './components/icons/IconTablerSettings.vue'
 import IconTablerTerminal from './components/icons/IconTablerTerminal.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
 import { useDesktopState } from './composables/useDesktopState'
+import { useThreadGoalState } from './composables/useThreadGoalState'
 import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
 import {
-  clearThreadGoal,
   checkoutGitBranch,
   cloneGithubRepository,
   configureTelegramBot,
@@ -1262,7 +1262,6 @@ import {
   getTelegramStatus,
   getThreadTerminalQuickCommands,
   getThreadTerminalStatus,
-  getThreadGoal,
   getWorkspaceRootsState,
   importProjectZip,
   listLocalDirectories,
@@ -1274,12 +1273,10 @@ import {
   startCodexLogin,
   searchThreads,
   switchAccount,
-  resumeThreadGoal,
-  setThreadGoal,
 } from './api/codexGateway'
 import type { ReasoningEffort, SpeedMode, UiAccountEntry, UiRateLimitWindow, UiServerRequest, UiServerRequestReply, UiThreadAutomation, UiThreadTokenUsage } from './types/codex'
 import type { ComposerDraftPayload, ThreadComposerExposed } from './components/content/ThreadComposer.vue'
-import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, TelegramStatus, ThreadGoal, ThreadGoalStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
+import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, TelegramStatus, ThreadGoalStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
@@ -2154,12 +2151,13 @@ const terminalHeaderDropdownOptions = computed(() => [
   ...terminalHeaderQuickCommands.value.map((command) => ({ label: command.label, value: command.value })),
 ])
 const goalStatusOptions: ThreadGoalStatus[] = ['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']
-const selectedThreadGoal = ref<ThreadGoal | null>(null)
+const threadGoalState = useThreadGoalState(selectedThreadId, isHomeRoute)
+const selectedThreadGoal = threadGoalState.goal
 const isGoalEditorOpen = ref(false)
-const isSavingThreadGoal = ref(false)
+const isSavingThreadGoal = threadGoalState.saving
 const goalEditorObjective = ref('')
 const goalEditorStatus = ref<ThreadGoalStatus>('active')
-const goalEditorError = ref('')
+const goalEditorError = threadGoalState.error
 
 function formatGoalStatus(status: string): string {
   if (status === 'usageLimited') return 'usage limited'
@@ -2168,20 +2166,7 @@ function formatGoalStatus(status: string): string {
 }
 
 async function refreshSelectedThreadGoal(): Promise<void> {
-  const threadId = selectedThreadId.value.trim()
-  if (!threadId || isHomeRoute.value) {
-    selectedThreadGoal.value = null
-    return
-  }
-  try {
-    const goal = await getThreadGoal(threadId)
-    if (selectedThreadId.value === threadId) selectedThreadGoal.value = goal
-  } catch (error) {
-    if (selectedThreadId.value === threadId) {
-      selectedThreadGoal.value = null
-      goalEditorError.value = error instanceof Error ? error.message : 'Failed to load goal'
-    }
-  }
+  await threadGoalState.refresh()
 }
 
 function openGoalEditor(): void {
@@ -2195,49 +2180,22 @@ async function onSaveThreadGoal(): Promise<void> {
   const threadId = selectedThreadId.value.trim()
   const objective = goalEditorObjective.value.trim()
   if (!threadId || !objective || isSavingThreadGoal.value) return
-  isSavingThreadGoal.value = true
-  goalEditorError.value = ''
-  try {
-    selectedThreadGoal.value = await setThreadGoal(threadId, {
-      objective,
-      status: goalEditorStatus.value,
-      tokenBudget: null,
-    })
+  if (await threadGoalState.save({ objective, status: goalEditorStatus.value, tokenBudget: null })) {
     isGoalEditorOpen.value = false
-  } catch (error) {
-    goalEditorError.value = error instanceof Error ? error.message : 'Failed to save goal'
-  } finally {
-    isSavingThreadGoal.value = false
   }
 }
 
 async function onResumeThreadGoal(): Promise<void> {
   const threadId = selectedThreadId.value.trim()
   if (!threadId || selectedThreadGoal.value?.status !== 'budgetLimited' || isSavingThreadGoal.value) return
-  isSavingThreadGoal.value = true
-  goalEditorError.value = ''
-  try {
-    selectedThreadGoal.value = await resumeThreadGoal(threadId)
-  } catch (error) {
-    goalEditorError.value = error instanceof Error ? error.message : 'Failed to resume goal'
-  } finally {
-    isSavingThreadGoal.value = false
-  }
+  await threadGoalState.resume()
 }
 
 async function onClearThreadGoal(): Promise<void> {
   const threadId = selectedThreadId.value.trim()
   if (!threadId || isSavingThreadGoal.value) return
-  isSavingThreadGoal.value = true
-  goalEditorError.value = ''
-  try {
-    await clearThreadGoal(threadId)
-    selectedThreadGoal.value = null
+  if (await threadGoalState.clear()) {
     isGoalEditorOpen.value = false
-  } catch (error) {
-    goalEditorError.value = error instanceof Error ? error.message : 'Failed to clear goal'
-  } finally {
-    isSavingThreadGoal.value = false
   }
 }
 const contentStyle = computed(() => {
