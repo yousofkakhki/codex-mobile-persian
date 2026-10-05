@@ -2284,7 +2284,6 @@ onMounted(() => {
   void refreshDefaultProjectName()
   void refreshTelegramConfig()
   void refreshTelegramStatus()
-  void loadFreeModeStatus()
   void refreshThreadTerminalStatus()
   void refreshTerminalQuickCommands()
 })
@@ -4629,7 +4628,7 @@ async function clearFreeModeCustomKey(): Promise<void> {
   }
 }
 
-async function loadFreeModeStatus(): Promise<void> {
+async function loadFreeModeStatus(options: { deferRefresh?: boolean } = {}): Promise<boolean> {
   try {
     const previousProvider = selectedProvider.value
     const status = await getFreeModeStatus()
@@ -4657,7 +4656,7 @@ async function loadFreeModeStatus(): Promise<void> {
       externalAuthImportAttempted = false
     }
     const providerChanged = selectedProvider.value !== previousProvider
-    if (providerChanged) {
+    if (providerChanged && options.deferRefresh !== true) {
       await refreshAll({
         includeSelectedThreadMessages: false,
         providerChanged: true,
@@ -4665,15 +4664,17 @@ async function loadFreeModeStatus(): Promise<void> {
       })
     }
     const importedExternalAuth = await maybeImportExternalCodexAuthAccount()
-    if (importedExternalAuth) {
+    if (importedExternalAuth && options.deferRefresh !== true) {
       await refreshAll({
         includeSelectedThreadMessages: false,
         providerChanged: providerChanged || importedExternalAuth,
         awaitAncillaryRefreshes: true,
       })
     }
+    return providerChanged || importedExternalAuth
   } catch {
     // Ignore — free mode status unknown
+    return false
   }
 }
 
@@ -4798,8 +4799,10 @@ async function initialize(): Promise<void> {
     primeSelectedThread('', { persist: false })
   }
 
+  const providerChanged = await loadFreeModeStatus({ deferRefresh: true })
   await refreshAll({
     includeSelectedThreadMessages: route.name === 'thread',
+    providerChanged,
   })
   void loadAccountsState({ silent: true })
   await applyLaunchProjectPathFromUrl()

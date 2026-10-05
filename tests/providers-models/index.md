@@ -36,3 +36,4 @@ Return to the [manual test index](../../tests.md).
 | [Provider-backed scheduled refreshes keep model menus populated](provider-backed-scheduled-refreshes-keep-model-menus-populated.md) |
 | [Zen automatic per-model routing](zen-hybrid-routing.md) |
 | [9Router server-configured provider](ninerouter-server-configured-provider.md) |
+| [Startup provider refresh deduplication](startup-provider-refresh-deduplication.md) |
