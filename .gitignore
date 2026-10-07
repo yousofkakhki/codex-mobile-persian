@@ -9,7 +9,15 @@ test-results/
 package-lock.json
 pnpm-lock.yaml
 .codex/
-.env.local
+
+# Local environment and TLS material must never enter publication trees.
+.env
+.env.*
+!.env.example
+!.env.sample
+.cert/
+*.pem
+*.key
 
 package.json
 .omx/
