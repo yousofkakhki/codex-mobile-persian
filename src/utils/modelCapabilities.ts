@@ -44,7 +44,9 @@ export function getModelReasoningEfforts(modelId: string, metadata?: Partial<Zen
   const allowed = [...STANDARD_REASONING_EFFORTS, 'ultra'] as ReasoningEffort[]
   const explicit = metadata?.reasoningOptions?.filter((value): value is ReasoningEffort =>
     typeof value === 'string' && allowed.includes(value as ReasoningEffort))
-  if (explicit?.length) return [...new Set(explicit)]
+  // An explicit provider empty list is restrictive; empty SDK/unknown metadata
+  // retains legacy defaults because it has never declared supported efforts.
+  if (explicit && (explicit.length > 0 || metadata?.reasoningSource === 'provider-catalog')) return [...new Set(explicit)]
   return isUltraReasoningModel(modelId) ? [...STANDARD_REASONING_EFFORTS, 'ultra'] : [...STANDARD_REASONING_EFFORTS]
 }
 

@@ -78,6 +78,9 @@ export function buildAppServerArgs(): string[] {
     ...(process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
       ? ['-c', `model_catalog_json=${JSON.stringify(process.env.CODEXUI_MODEL_CATALOG_JSON.trim())}`]
       : []),
+    ...(normalizeRuntimeValue(process.env.CODEXUI_MULTI_AGENT_V2) === 'true'
+      ? ['-c', 'features.multi_agent_v2=true']
+      : []),
   ]
 }
 

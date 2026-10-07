@@ -1,9 +1,9 @@
-import { readFile, stat } from 'node:fs/promises'
+import { open, stat } from 'node:fs/promises'
 
 export function getConfiguredContextWindows(catalog: unknown, contextOverride?: unknown): Record<string, number> {
   const rows = (catalog as { models?: unknown[] } | null)?.models
   if (!Array.isArray(rows)) return {}
-  const result: Record<string, number> = {}
+  const result: Record<string, number> = Object.create(null)
   for (const value of rows) {
     const model = value as Record<string, unknown> | null
     if (!model || typeof model.slug !== 'string') continue
@@ -14,26 +14,49 @@ export function getConfiguredContextWindows(catalog: unknown, contextOverride?: 
     }
     const percent = model.effective_context_window_percent ?? 95
     if (typeof context !== 'number' || !Number.isSafeInteger(context) || context <= 0
-      || typeof percent !== 'number' || percent <= 0 || percent > 100) continue
-    result[model.slug] = Math.floor(context * percent / 100)
+      || typeof percent !== 'number' || !Number.isFinite(percent) || percent <= 0 || percent > 100) continue
+    const effective = Math.floor(context * percent / 100)
+    if (effective > 0) result[model.slug] = effective
   }
   return result
 }
 
+
+const MAX_CATALOG_BYTES = 4 * 1024 * 1024
 let cached: { key: string; pending: Promise<unknown> } | undefined
 
-export async function readConfiguredContextWindows(contextOverride?: unknown): Promise<Record<string, number>> {
+export async function readConfiguredModelCatalog(): Promise<unknown> {
   const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
   if (!path) return {}
+  let entry: typeof cached
   try {
     const info = await stat(path)
-    const key = `${path}:${info.mtimeMs}:${info.size}`
+    if (!Number.isSafeInteger(info.size) || info.size <= 0 || info.size > MAX_CATALOG_BYTES) return {}
+    const key = `${path}:${info.mtimeMs}:${info.ctimeMs}:${info.size}:${info.dev}:${info.ino}`
     if (cached?.key !== key) {
-      cached = { key, pending: readFile(path, 'utf8').then(JSON.parse) }
+      cached = { key, pending: (async () => {
+        const file = await open(path, 'r')
+        try {
+          const buffer = Buffer.alloc(info.size + 1)
+          let total = 0
+          while (total < buffer.length) {
+            const { bytesRead } = await file.read(buffer, total, buffer.length - total, total)
+            if (!bytesRead) break
+            total += bytesRead
+          }
+          if (total > info.size) throw new Error('Catalog changed during read')
+          return JSON.parse(buffer.subarray(0, total).toString('utf8')) as unknown
+        } finally { await file.close() }
+      })() }
     }
-    return getConfiguredContextWindows(await cached.pending, contextOverride)
+    entry = cached
+    return await entry.pending
   } catch {
-    cached = undefined
-    return {} // Missing metadata must not turn provider discovery into an outage.
+    if (!entry || cached === entry) cached = undefined
+    return {} // Optional metadata must not make strict provider discovery unavailable.
   }
+}
+
+export async function readConfiguredContextWindows(contextOverride?: unknown): Promise<Record<string, number>> {
+  return getConfiguredContextWindows(await readConfiguredModelCatalog(), contextOverride)
 }

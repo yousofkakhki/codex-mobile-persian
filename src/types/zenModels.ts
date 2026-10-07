@@ -7,7 +7,7 @@ export type ZenModelMetadata = {
   configuredContextWindow?: number | null
   maxOutputTokens?: number | null
   supportsReasoning?: boolean | null
-  reasoningSource?: 'provider-catalog' | 'codex-family-fallback'
+  reasoningSource?: 'provider-catalog' | 'codex-family-fallback' | 'codex-runtime-catalog'
   supportsTools: boolean | null
   inputModalities: string[] | null
   reasoningOptions: unknown[]

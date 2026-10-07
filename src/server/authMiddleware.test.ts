@@ -81,6 +81,22 @@ describe("auth middleware behind a reverse proxy", () => {
     }
   })
 
+  it("does not treat loopback app-server authorization as owner authorization", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs")
+    const { tmpdir } = await import("node:os")
+    const { join } = await import("node:path")
+    const home = mkdtempSync(join(tmpdir(), "codex-auth-owner-test-"))
+    process.env.CODEX_HOME = home
+    try {
+      const auth = createAuthSession("test-password")
+      const req = { socket: { remoteAddress: "127.0.0.1" }, headers: { host: "127.0.0.1:5900" } } as never
+      expect(auth.isRequestAuthorized(req)).toBe(true)
+      expect(auth.isOwnerAuthorized(req)).toBe(false)
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
   it("authorizes loopback app-server requests for localhost hosts but not proxied public hosts", async () => {
     const { mkdtempSync, rmSync } = await import("node:fs")
     const { tmpdir } = await import("node:os")

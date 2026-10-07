@@ -30,12 +30,16 @@
   @apply border-zinc-700 bg-zinc-900;
 }
 
-:root.dark .thread-goal-card-copy strong {
+:root.dark .thread-goal-card-copy strong,
+:root.dark .thread-goal-budget-editor label {
   @apply text-zinc-100;
 }
 
 :root.dark .thread-goal-card-copy span,
-:root.dark .thread-goal-card-edit {
+:root.dark .thread-goal-card-copy small,
+:root.dark .thread-goal-card-edit,
+:root.dark .thread-goal-budget-editor small,
+:root.dark .thread-goal-editor-status-note {
   @apply text-zinc-400;
 }
 
@@ -43,12 +47,14 @@
   @apply border-violet-800 bg-violet-950 text-violet-200 hover:bg-violet-900;
 }
 
-:root.dark .thread-goal-editor-input {
+:root.dark .thread-goal-editor-input,
+:root.dark .thread-goal-budget-editor input {
   @apply border-zinc-700 bg-zinc-800 text-zinc-100 focus:border-violet-500 focus:bg-zinc-800;
 }
 
 :root.dark .thread-goal-editor-status button,
-:root.dark .thread-goal-editor-actions button {
+:root.dark .thread-goal-editor-actions button,
+:root.dark .thread-goal-budget-launcher .is-budget {
   @apply border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700;
 }
 

@@ -1,28 +1,31 @@
 ### Startup provider refresh deduplication
 
 #### Feature/Change Name
-Load saved provider state before the first startup refresh so deep-linked threads do not perform a second provider-model and rate-limit refresh.
+Resolve saved provider discovery before one initial global catalog refresh. Load deep-linked history after the catalog, retaining the current synchronous routing block and refresh-generation protections.
 
 #### Prerequisites/Setup
-1. Build the project with `pnpm run build`.
-2. Start the WebUI on port 5900 with a saved non-Codex provider configuration.
-3. Use an existing thread and note its thread ID.
+1. Use an isolated, disposable frontend fixture or an explicitly authorized local WebUI with a saved non-Codex provider. Do not alter the running service/config/auth to perform this check.
+2. Existing thread ID available; profile scripts and dependencies already installed.
+3. For automated no-generation verification, run `node_modules/.bin/vitest run src/api/codexGateway.test.ts src/composables/useDesktopState.globalProvider.test.ts`.
 
 #### Steps
-1. Open the thread directly at `http://127.0.0.1:5900/#/thread/<thread-id>`.
-2. Run `PROFILE_BASE_URL=http://127.0.0.1:5900 PROFILE_ROUTE='#/thread/<thread-id>' PROFILE_WAIT_MS=1000 node scripts/profile-browser-runtime.cjs`.
-3. Inspect the generated `output/playwright/browser-runtime-profile-thread-*.json`.
-4. Repeat on the home route using `PROFILE_ROUTE='/'`.
+1. Open `http://127.0.0.1:<isolated-port>/#/thread/<thread-id>` with the saved provider.
+2. Run `PROFILE_BASE_URL=http://127.0.0.1:<isolated-port> PROFILE_ROUTE='#/thread/<thread-id>' PROFILE_WAIT_MS=1000 node scripts/profile-browser-runtime.cjs`.
+3. Inspect the profile JSON: count provider-model requests, account/rate-limit refreshes, thread-list loads, and thread resume calls; separate unrelated ancillary GETs and polling.
+4. Repeat with the home route; delay discovery via a synthetic network fixture and attempt both new/existing-thread submissions. Verify no turn/start, directory creation, or worktree creation before startup readiness.
+5. Delay catalog discovery and overlap provider refreshes using isolated test fixtures, including same-provider endpoint saves. Confirm no stale catalog, provider, or model is usable until the latest refresh completes.
+6. Force discovery/catalog failure in the fixture. Confirm catalog error is visible and generation remains blocked; UI provider status is not a substitute for authoritative global config.
 
 #### Expected Results
-- `duplicateCounts.providerModels` is 1 for direct-thread startup.
-- `duplicateCounts.rateLimitsRead` is 1 for direct-thread startup.
-- The thread list loads once; the app does not remain on `Loading threads...`.
-- Provider models and the selected thread's messages remain available after refresh.
-- Any repeated pending-server-requests or project-root-suggestion GETs are inspected separately; these are not provider/rate-limit refreshes.
+- One saved-provider discovery and one initial `refreshAll` flow; no independent `onMounted` discovery/refresh race.
+- `duplicateCounts.providerModels` and `duplicateCounts.rateLimitsRead` are each 1 for steady startup without concurrent configuration changes.
+- Deep-link history resumes only after the authoritative global catalog has completed, avoiding a separate on-demand model refresh inside history loading.
+- Global selection remains the default for both new and existing threads. Returned-provider verification, synchronous route invalidation, and refresh-generation checks remain intact.
+- Goal reads remain thread scoped and bounded; no generation probes are needed.
+- External-auth changes after startup may still trigger their existing authorized refresh and should be counted separately.
 
 #### Rollback/Cleanup
-- Stop only temporary profiling servers created for this check.
-- Leave the persistent systemd WebUI service running.
+- Restore any fixture-only delayed/error routes and temporary browser storage. Do not change real saved provider/auth/config as cleanup.
+- Stop only an isolated server you explicitly started; leave persistent services untouched.
 
 ---

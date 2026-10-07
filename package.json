@@ -24,7 +24,7 @@
     "cli"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22.16.0"
   },
   "bin": {
     "codexapp": "dist-cli/index.js",

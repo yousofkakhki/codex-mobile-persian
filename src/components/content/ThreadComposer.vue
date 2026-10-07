@@ -505,7 +505,6 @@ import { useRpcTelemetry } from '../../composables/useRpcTelemetry'
 import {
   getFastModeCreditMultiplier,
   isFastModeSupported as supportsFastMode,
-  isUltraReasoningModel,
   getModelReasoningEfforts,
   resolveModelContextWindow,
   getContextWindowStatus,
@@ -708,6 +707,14 @@ const isAndroid = typeof navigator !== 'undefined' && /Android/i.test(navigator.
 const DRAFT_STORAGE_PREFIX = 'codex-web-local.thread-draft.v1.'
 let lastActiveThreadId = ''
 
+const modelMetadataById = computed(() => {
+  const result = new Map<string, ZenModelMetadata>()
+  for (const metadata of props.modelMetadata ?? []) {
+    if (!result.has(metadata.id)) result.set(metadata.id, metadata)
+  }
+  return result
+})
+
 const reasoningOptions = computed<Array<{ value: ReasoningEffort; label: string }>>(() => {
   const options: Array<{ value: ReasoningEffort; label: string }> = [
     { value: 'none', label: 'None' },
@@ -718,10 +725,8 @@ const reasoningOptions = computed<Array<{ value: ReasoningEffort; label: string 
     { value: 'xhigh', label: 'Extra high' },
     { value: 'max', label: 'Max' },
   ]
-  if (isUltraReasoningModel(props.selectedModel)) {
-    options.push({ value: 'ultra', label: 'Ultra' })
-  }
-  const supported = getModelReasoningEfforts(props.selectedModel, props.modelMetadata?.find(model => model.id === props.selectedModel))
+  const supported = getModelReasoningEfforts(props.selectedModel, modelMetadataById.value.get(props.selectedModel))
+  if (supported.includes('ultra')) options.push({ value: 'ultra', label: 'Ultra' })
   return options.filter(option => supported.includes(option.value))
 })
 function formatModelLabel(modelId: string): string {
@@ -730,13 +735,13 @@ function formatModelLabel(modelId: string): string {
 
 const modelOptions = computed(() =>
   props.models.map((modelId) => {
-    const metadata = props.modelMetadata?.find(model => model.id === modelId)
+    const metadata = modelMetadataById.value.get(modelId)
     return {
       value: modelId, label: formatModelLabel(modelId),
       badge: metadata ? metadata.upstreamApi === 'responses' ? 'Responses' : metadata.upstreamApi === 'chat-completions' ? 'Chat' : 'Unknown API' : undefined,
       disabled: metadata?.supportsTools === false || metadata?.upstreamApi === 'unknown',
       description: metadata?.supportsTools === false ? 'Not compatible with agent tools' : metadata?.upstreamApi === 'unknown' ? 'No supported API route' : metadata?.routingSource === 'provider-catalog'
-        ? `Provider advertised${metadata.contextWindow ? ` · ${metadata.contextWindow.toLocaleString()} context tokens` : ''}${metadata.maxOutputTokens ? ` · ${metadata.maxOutputTokens.toLocaleString()} max output` : ''}`
+        ? `Provider advertised${metadata.contextWindow ? ` · ${metadata.contextWindow.toLocaleString()} context tokens` : ''}${metadata.maxOutputTokens ? ` · ${metadata.maxOutputTokens.toLocaleString()} max output` : ''}${metadata.reasoningSource === 'codex-family-fallback' ? ' · Reasoning: Codex-family fallback, not provider-declared' : ''}`
         : metadata ? 'Automatic routing · SDK-inferred, not access-tested' : undefined,
     }
   }),
@@ -1122,7 +1127,7 @@ function buildContextUsageView(
   } | null {
   if (!usage) return null
 
-  const metadata = props.modelMetadata?.find(model => model.id === props.selectedModel)
+  const metadata = modelMetadataById.value.get(props.selectedModel)
   const advertised = metadata?.contextWindow
   const status = getContextWindowStatus(usage.modelContextWindow, metadata)
   const contextWindow = resolveModelContextWindow(usage.modelContextWindow, advertised)
@@ -1144,11 +1149,11 @@ function buildContextUsageView(
     tooltipText: [
       ...(status.differs ? [
         'Saved usage differs from the selected model configuration; this may be a previous-turn measurement or a per-thread override.',
-        `Next-turn configured capacity (${props.selectedModel}): ${status.configuredWindow?.toLocaleString()} tokens. Confirmed by the next live usage event.`,
+        `Next-turn configured capacity (${props.selectedModel}): ${status.configuredWindow?.toLocaleString()} tokens; not execution-confirmed.`,
       ] : []),
       `Context window: ${percentRemaining}% left (${percentUsed}% used)`,
       `In context: ${tokensInContext.toLocaleString()} / ${contextWindow.toLocaleString()} tokens`,
-      ...(advertised && advertised !== usage.modelContextWindow ? [typeof usage.modelContextWindow === 'number'
+      ...(advertised && advertised !== usage.modelContextWindow ? [resolveModelContextWindow(usage.modelContextWindow, null) !== null
         ? `Provider advertised: ${advertised.toLocaleString()} tokens; runtime limit remains authoritative`
         : 'Provider-advertised estimate; runtime context limit is unknown'] : []),
       `Last turn: ${formatBreakdownSummary(usage.last)}`,

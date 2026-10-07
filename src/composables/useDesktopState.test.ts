@@ -32,6 +32,7 @@ const gatewayMocks = vi.hoisted(() => ({
   renameThread: vi.fn(),
   replyToServerRequest: vi.fn(),
   resumeThread: vi.fn(),
+  invalidateThreadResumeCache: vi.fn(),
   revertThreadFileChanges: vi.fn(),
   rollbackThread: vi.fn(),
   setCodexSpeedMode: vi.fn(),
@@ -864,23 +865,62 @@ describe('startup refresh coalescing', () => {
 })
 
 describe('provider model selection', () => {
-  it('validates selected reasoning levels against NineRouter catalog metadata', async () => {
+  it('discards stale provider metadata when an older catalog settles after a newer refresh', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/current', providerId: 'ninerouter', reasoningEffort: 'medium', speedMode: 'standard' })
+    const deferred: Array<{ callback: (metadata: unknown[]) => void; release: (ids: string[]) => void }> = []
+    gatewayMocks.getAvailableModelIds.mockImplementation(options => new Promise<string[]>(resolve => {
+      deferred.push({ callback: options.onMetadata, release: resolve })
+    }))
+    const state = useDesktopState()
+    const older = state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true, providerChanged: true })
+    await vi.waitFor(() => expect(deferred).toHaveLength(1))
+    const newer = state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true, providerChanged: true })
+    expect(state.availableModelMetadata.value).toEqual([])
+    await vi.waitFor(() => expect(deferred).toHaveLength(2))
+    deferred[1]!.callback([{ id: 'cx/current', contextWindow: 1000, reasoningOptions: ['high'], reasoningSource: 'provider-catalog' }])
+    deferred[1]!.release(['cx/current'])
+    await newer
+    deferred[0]!.callback([{ id: 'cx/retired', contextWindow: 999999, reasoningOptions: ['max'], reasoningSource: 'provider-catalog' }])
+    deferred[0]!.release(['cx/retired'])
+    await older
+    expect(state.availableModelMetadata.value).toMatchObject([{ id: 'cx/current', contextWindow: 1000 }])
+    state.setSelectedReasoningEffort('high')
+    state.setSelectedReasoningEffort('max')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(2)
+  })
+
+  it('validates selected reasoning against provider metadata without an extra discovery request', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
     gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/gpt-6.1-sol', providerId: 'ninerouter', reasoningEffort: 'ultra', speedMode: 'standard' })
     gatewayMocks.getAvailableModelIds.mockImplementation(async (options) => {
-      options.onMetadata([{ id: 'cx/gpt-6.1-sol', contextWindow: 1050000, supportsReasoning: true, reasoningOptions: ['low', 'medium', 'high', 'xhigh', 'max'] }])
-      return ['cx/gpt-6.1-sol']
+      options.onMetadata([
+        { id: 'cx/gpt-6.1-sol', contextWindow: 1050000, supportsReasoning: true, reasoningOptions: ['low', 'medium', 'high', 'xhigh', 'max'], reasoningSource: 'provider-catalog' },
+        { id: 'cx/gpt-reserve', supportsReasoning: false, reasoningOptions: [] },
+        { id: 'cx/high-only', reasoningOptions: ['high'], reasoningSource: 'provider-catalog' },
+      ])
+      return ['cx/gpt-6.1-sol', 'cx/gpt-reserve', 'cx/high-only']
     })
     const state = useDesktopState()
     await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
     state.setSelectedReasoningEffort('max')
     expect(state.selectedReasoningEffort.value).toBe('max')
     state.setSelectedReasoningEffort('ultra')
-    expect(state.selectedReasoningEffort.value).toBe('max')
     state.setSelectedReasoningEffort('none')
     expect(state.selectedReasoningEffort.value).toBe('max')
-    expect(state.availableModelMetadata.value[0].contextWindow).toBe(1050000)
+    expect(state.availableModelMetadata.value[0]?.contextWindow).toBe(1050000)
+    state.setSelectedModelId('cx/gpt-reserve')
+    expect(state.selectedReasoningEffort.value).toBe('')
+    state.setSelectedReasoningEffort('high')
+    expect(state.selectedReasoningEffort.value).toBe('')
+    state.setSelectedModelId('cx/high-only')
+    state.setSelectedReasoningEffort('high')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    expect(gatewayMocks.getCurrentModelConfig).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(1)
   })
 
   it('does not overwrite a model chosen while catalog refresh is pending', async () => {
@@ -901,6 +941,8 @@ describe('provider model selection', () => {
 
   it('preserves an explicitly selected next-turn model across thread resume and reload', async () => {
     installTestWindow()
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'muse-spark-1.3-contributor-free', providerId: 'opencode_zen', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['muse-spark-1.3-contributor-free', 'mimo-v2.5-free'])
     gatewayMocks.resumeThread.mockResolvedValue({ model: 'muse-spark-1.3-contributor-free', modelProvider: 'opencode_zen', messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {} })
     const state = useDesktopState()
     state.primeSelectedThread('zen-persist')
@@ -1067,7 +1109,7 @@ describe('provider model selection', () => {
     })
   })
 
-  it('keeps an existing OpenCode Zen thread locked to Zen models after Codex auth becomes active', async () => {
+  it('applies global Codex models to an existing OpenCode Zen thread after Codex auth becomes active', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({
       groups: [{ projectName: 'Project', threads: [thread('legacy-zen-thread', '/tmp/project')] }],
@@ -1105,20 +1147,17 @@ describe('provider model selection', () => {
 
     expect(gatewayMocks.getAvailableModelIds).toHaveBeenLastCalledWith({
       includeProviderModels: true,
-      requireProviderModels: true,
+      requireProviderModels: false,
       onMetadata: expect.any(Function),
-      providerId: 'opencode-zen',
+      providerId: undefined,
     })
-    expect(state.availableModelIds.value).toEqual([
-      'big-pickle',
-      'ring-2.6-1t-free',
-    ])
-    expect(state.selectedModelId.value).toBe('big-pickle')
-    expect(state.readModelIdForThread('legacy-zen-thread')).toBe('big-pickle')
+    expect(state.availableModelIds.value).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
+    expect(state.selectedModelId.value).toBe('gpt-5.4-mini')
+    expect(state.readModelIdForThread('legacy-zen-thread')).toBe('gpt-5.4-mini')
     expect(state.readModelIdForThread('')).toBe('gpt-5.4-mini')
   })
 
-  it('loads provider models for a selected provider-backed thread during scheduled refreshes', async () => {
+  it('loads globally active provider models for a legacy thread during scheduled refreshes', async () => {
     installTestWindow()
     vi.mocked(window.setTimeout).mockImplementation(((callback: TimerHandler) => {
       if (typeof callback === 'function') {
@@ -1163,12 +1202,12 @@ describe('provider model selection', () => {
 
     expect(gatewayMocks.getAvailableModelIds).toHaveBeenLastCalledWith({
       includeProviderModels: true,
-      requireProviderModels: true,
+      requireProviderModels: false,
       onMetadata: expect.any(Function),
-      providerId: 'opencode-zen',
+      providerId: undefined,
     })
-    expect(state.availableModelIds.value).toEqual(['big-pickle', 'ring-2.6-1t-free'])
-    expect(state.selectedModelId.value).toBe('big-pickle')
+    expect(state.availableModelIds.value).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
+    expect(state.selectedModelId.value).toBe('gpt-5.4-mini')
   })
 
   it('captures the active provider when creating a new thread', async () => {
@@ -1310,7 +1349,7 @@ describe('provider model selection', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('mini-thread')
+    await vi.waitFor(() => expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('mini-thread'))
     expect(state.messages.value.map((message) => `${message.role}:${message.text}`)).toEqual([
       'user:hi',
       'system:Worked for <1s',

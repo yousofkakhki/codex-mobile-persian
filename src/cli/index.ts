@@ -26,6 +26,10 @@ import { createServer as createApp } from '../server/httpServer.js'
 import { generatePassword } from '../server/password.js'
 import { spawnSyncCommand } from '../utils/commandInvocation.js'
 
+import { assertSQLiteRuntime } from '../server/threadProjectionIntegrity.js'
+
+assertSQLiteRuntime()
+
 const program = new Command().name('codexui').description('Web interface for Codex app-server')
 const __dirname = dirname(fileURLToPath(import.meta.url))
 let hasPromptedCloudflaredInstall = false

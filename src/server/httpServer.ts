@@ -23,6 +23,18 @@ export type ServerInstance = {
   attachWebSocket: (server: HttpServer) => void
 }
 
+function isLoopbackOwnerRequest(req: IncomingMessage): boolean {
+  const remote = req.socket.remoteAddress?.startsWith('::ffff:')
+    ? req.socket.remoteAddress.slice('::ffff:'.length)
+    : req.socket.remoteAddress
+  const host = String(req.headers.host ?? '').toLowerCase()
+  const localHost = host === 'localhost'
+    || host.startsWith('localhost:')
+    || host === '127.0.0.1'
+    || host.startsWith('127.0.0.1:')
+  return (remote === '127.0.0.1' || remote === '::1') && localHost
+}
+
 const IMAGE_CONTENT_TYPES: Record<string, string> = {
   '.avif': 'image/avif',
   '.bmp': 'image/bmp',
@@ -74,13 +86,21 @@ function readWildcardPathParam(value: unknown): string {
 
 export function createServer(options: ServerOptions = {}): ServerInstance {
   const app = express()
-  const bridge = createCodexBridgeMiddleware()
   const authSession = options.password ? createAuthSession(options.password) : null
+  const isOwnerAuthorized = (req: IncomingMessage): boolean => (
+    authSession ? authSession.isOwnerAuthorized(req) : isLoopbackOwnerRequest(req)
+  )
+  const bridge = createCodexBridgeMiddleware({ isOwnerAuthorized })
 
   // 1. Auth middleware (if password is set)
   if (authSession) {
     app.use(authSession.middleware)
   }
+
+  app.get('/codex-api/owner/authorization', (req, res) => {
+    const authorized = isOwnerAuthorized(req)
+    res.status(authorized ? 200 : 403).json({ authorized })
+  })
 
   // 2. Bridge middleware for /codex-api/*
   app.use(bridge)

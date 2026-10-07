@@ -147,6 +147,14 @@ function buildSessionCookie(token: string, expiresAt: number): string {
   ].join('; ')
 }
 
+function isAuthorizedByCookie(cookieHeader: string | undefined, validTokens: Map<string, number>): boolean {
+  const cookies = parseCookies(cookieHeader)
+  const token = cookies[TOKEN_COOKIE]
+  if (!token) return false
+  const expiresAt = validTokens.get(token)
+  return typeof expiresAt === 'number' && expiresAt > Date.now()
+}
+
 function isAuthorizedByRequestLike(
   remoteAddress: string | undefined,
   hostHeader: string | undefined,
@@ -165,11 +173,7 @@ function isAuthorizedByRequestLike(
     return true
   }
 
-  const cookies = parseCookies(cookieHeader)
-  const token = cookies[TOKEN_COOKIE]
-  if (!token) return false
-  const expiresAt = validTokens.get(token)
-  return typeof expiresAt === 'number' && expiresAt > Date.now()
+  return isAuthorizedByCookie(cookieHeader, validTokens)
 }
 
 const LOGIN_PAGE_HTML = `<!DOCTYPE html>
@@ -221,6 +225,7 @@ export function createAuthMiddleware(password: string): RequestHandler {
 export type AuthSession = {
   middleware: RequestHandler
   isRequestAuthorized: (req: IncomingMessage) => boolean
+  isOwnerAuthorized: (req: IncomingMessage) => boolean
 }
 
 export function createAuthSession(password: string): AuthSession {
@@ -297,5 +302,6 @@ export function createAuthSession(password: string): AuthSession {
     isRequestAuthorized: (req: IncomingMessage) => (
       isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)
     ),
+    isOwnerAuthorized: (req: IncomingMessage) => isAuthorizedByCookie(req.headers.cookie, validTokens),
   }
 }

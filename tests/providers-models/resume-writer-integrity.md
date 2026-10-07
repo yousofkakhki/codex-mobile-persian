@@ -1,0 +1,47 @@
+# Bounded resume and active-writer integrity
+
+Prerequisites: use a separate test CODEX_HOME. Never rewrite real rollout JSONL, delete locks, edit real SQLite, or interrupt an active writer for this check. Node.js >=22.16.0 is required and enforced by the package engine and CLI startup. The inspector uses built-in node:sqlite with readOnly=true/query_only and a 1000ms SQLite busy timeout; no undeclared system sqlite3 dependency.
+
+Actions:
+1. Open a durable thread twice. Request a different provider/model on the second open while its writer remains subscribed.
+2. Confirm one cold resume, then only metadata thread/read(includeTurns=false) and a newest page of at most 10 turns. Preserve opaque older cursors.
+3. Confirm the returned top-level provider remains the effective original provider, not requested overrides or historical nested metadata. Provider-mismatched sends fail closed.
+4. With a separately fabricated fixture whose projected byte checkpoint exceeds its canonical plain JSONL size, request resume/read/turns-list/turn-start.
+5. Confirm immediate explicit integrity failure before child startup/Rust dispatch, with no rollout/DB mutation. Existing active writers are never killed or unsubscribed to force overrides.
+6. Inject a stalled handler in the unit transport harness. After timeout, repeated calls fail closed without dispatch; only a matching late response or normal child exit releases quarantine. No generation retry.
+7. Another-process writer conflict uses only bounded read-only history (also after the legacy provider retry). Verify a read-only result is not marked write-ready and send fails before turn/start.
+
+8. Concurrently open the same cold thread with one queue resume (no page) and one UI resume (different model/provider and page). Confirm only one writer acquisition; UI waits and gets its own capped page/cursor, preserving effective provider/model.
+9. Set top-level `sqlite_home` in disposable config; also set `CODEX_SQLITE_HOME` to a different fixture. Confirm config wins, then remove it and confirm environment wins. Both launch args and preflight use the same pinned directory. Unsupported filename versions, unknown SQLx identities (including state59/history8), incomplete/failed/changed-checksum ledgers, nonzero PRAGMA user_version and incompatible invariant types/primary keys fail closed without editing databases. Complete successful prefixes of the explicitly reviewed state1..58/history1..7 version+SHA384 allowlists are supported, not arbitrary MAX values. Baseline54/6 and audited58/7 are source contracts, not minimum installed CLI versions. Schema-less legacy fixtures retain actual Codex key/type/nullability/ordinal definitions; only a truly empty user_version=0 lazy database is allowed.
+10. Load another-process readOnly history with an active turn. Queue, rollback, interrupt, goal update and file undo/redo must send no mutation; rollback-files itself returns 409 before reading history or touching files unless this connection has a proven idle writer. No writer is implicitly acquired for file revert.
+11. Change provider/runtime config while a writer is attached (or acquisition is pending), then request reads and dispose. Confirm no SIGTERM; new mutations/acquisitions are rejected while bounded reads, interrupt and explicit unsubscribe remain available. After explicit release/close, the next request replaces the process. A stuck handler stays quarantined until its real late response/exit; this is intentional, not automatic repair.
+
+SQLite home scope: the bridge explicitly pins locally resolved top-level config/env/default `sqlite_home` as a Codex CLI override. Layered/nested, ambiguous, or multiline sqlite_home values are rejected rather than guessing. After initialization the bridge verifies the merged effective config/read sqlite_home before any resume/history/turn dispatch. A managed/system requirement mismatch or missing path fails closed; a blocked config/read stays bounded/quarantined. There is no silent fallback to inspecting a different home. Existing state/list helpers outside this resume inspector are unchanged.
+
+Lifecycle limits: attached idle writers are conservatively preserved too; turn completion is not proof of rollout flush/ownership release. Outer OS/service-manager SIGTERM is outside this in-process guard. No browser/Docker/live-writer check or history repair was performed by this unit-only correction.
+
+Cleanup: remove only the disposable fixture home after normal fixture process EOF. No production cleanup or data repair is part of this change. A preexisting durable/projection mismatch remains an owner-supervised recovery task.
+
+Performance: only equivalent resume requests coalesce; incompatible callers serialize per-thread acquisition and fetch their own bounded page without reacquiring the writer; attachment cache stores only model/provider metadata. Hot open uses two bounded supported reads rather than another writer/persist barrier. Local checkpoint checks query exact keys and stat one file; there is no rollout scan or unbounded new history hydration. Browser/live latency was not measured while an active user writer existed.
+
+## Final combined closure regressions
+- Defer a provider/config save while initialization or idle-status RPC is awaiting: no new acquisition, turn mutation, or file callback may dispatch after drift. Read/list/interrupt/unsubscribe remain usable.
+- Unsubscribe an in-progress fixture then change config and request a read: preserve the writer and child until an actual thread/closed shutdown notification, not unsubscribe acknowledgement.
+- Queue two incompatible resumes: a definitive JSON-RPC invalid-params (-32602) response lets the next caller evaluate its own options; an unresolved timeout never permits a second acquisition.
+- PUT a whole queue map containing an unowned thread or omitting an existing unowned queue: backend returns 409 without replacing queues. Changed queues require this process to have writer ownership; unchanged queue maps are not a generation action.
+- At 375x812 and 768x1024, light/dark composer attachment, model, skills, reasoning, Goal, microphone and send controls remain present with no clipped button or horizontal row overflow. Small screens wrap controls instead of hiding them.
+- Exact-package native smoke uses real Codex 0.154.0, a fabricated history file, separate CODEX_HOME/sqlite_home, no auth and Docker --network none. No turn/start is called. Clean up only fixture container/home.
+
+## Verified SQLx schema compatibility (isolated)
+Prerequisites: Node22.16+ (verification uses exact22.23.1), existing dependencies and a disposable synthetic home. Source identities are official SQL at 6b9826e3aa83b1a5947db50f4332cb9c65f1b340 for state1..54/history1..6 and d27764b82f7118f674371e6d6e76271d9d606edb for state55..58/history7. The test fixture verifies each SQL SHA384 before applying it; do not use copied production databases or rollout content.
+
+Actions:
+1. Run `/root/.hermes/node/bin/node node_modules/vitest/vitest.mjs run src/server/threadProjection*.test.ts --no-cache --configLoader runner --maxWorkers 2` from the isolated candidate.
+2. Verify healthy exact54/6 and58/7 fixtures plus every complete reviewed prefix. Exercise the synthetic missing ID separately from the healthy checkpoint at plain JSONL EOF.
+3. Remove the first/interior migration, fail a migration, alter checksum/type, append future59/8, or change invariant PK/type/nullability/ordinal/user_version. All reject before any child/RPC dispatch. Repeat without a requested thread checkpoint to prove schema validation is unconditional. Rename the SQLx table to `_SQLX_MIGRATIONS` or `_Sqlx_Migrations`: a valid complete ledger still passes, but altered checksums must reject. Replace the reserved ledger with a view, including lowercase and case variants: all reject rather than falling through to legacy inspection.
+4. Give an INTEGER-column fixture a BLOB/fractional/negative/unsafe checkpoint, then give a58/7 fixture a checkpoint beyond plain durable EOF. Both remain blocked; database and rollout hashes remain unchanged by inspection. Compressed offsets remain decoded-byte offsets, never compressed file sizes.
+5. Build CLI using existing dependencies. Run the exact built guard in a CJS VM extraction against synthetic healthy/damaged fixtures and, only if read-only inspection is authorized, an all-zero nonexistent live ID. No live resume, turn/start, history hydration, generation, migration or database write is part of this probe.
+
+Expected: all prefixes and intact EOF pass; unknown or structurally incompatible schemas and durable checkpoint mismatches still fail closed. Node engine/runtime checks, configured-home quarantine, ownership and read-only guards remain intact. SQLx ledger read is capped at reviewed length+1; no rollout scan or new RPC is introduced.
+
+Rollback/cleanup: remove only disposable fixture homes after fixture-process shutdown. The candidate does not repair/downgrade/reset/delete production state and is not deployed. Restart/version authorization is separate: CODEXUI_CODEX_COMMAND may point to `/root/.local/bin/codex`, whose current symlink can resolve to0.160.1 while the attached child is still0.154.0. A later owner-approved deployment must explicitly decide/pin the writer version; this schema compatibility correction does not require or authorize a CLI upgrade or restart.

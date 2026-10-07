@@ -1,76 +1,29 @@
-### Goal slash commands
+### Goal composer mode and owner-only finite Goal editor
 
-#### Feature/Change Name
-`/goal` slash-command support: `/goal <objective>` sets an active thread goal, `/goal` shows the current goal, `/goal pause` / `/goal resume` change goal status, and `/goal clear` removes the goal. Goal commands route to the `thread/goal/*` RPCs and never start or steer a normal turn.
+#### Scope and safety
+These checks use disposable, fully intercepted frontend/API fixtures only. Do not submit a real provider turn, change a production Goal, alter account/configuration, or clear/recreate history. Block all API escapes. Fixture responses and persistence are not native/provider execution evidence.
 
-#### Prerequisites/Setup
-1. Dev server running at `http://100.107.32.83:4173`
-2. App server running against a Codex build that exposes `thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`
-3. A disposable thread is available for goal-budget verification
-4. Light and dark themes are both available from Settings
+#### Actual implementation
+- Selecting `/goal` in the composer removes the slash token and enables the Goal mode button. Submitting an objective in that mode constructs literal `/goal <objective>` text for the normal message/`turn/start` path (or the existing in-progress message path). The composer does **not** parse it into `thread/goal/*` RPCs. Literal `/goal`, `/goal pause`, `/goal resume`, and `/goal clear` remain model-interpreted messages, not guaranteed local Goal operations. Do not send them to test backend policy.
+- The persisted Goal card/editor is a separate UI backed by `thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`. Editing the existing objective/status omits `tokenBudget`, preserving the durable cap and accounting.
+- Stop calls `turn/interrupt`; it does **not** first pause a Goal or guarantee autonomous continuation is disabled. Status-only pause via the Goal editor is separate from Stop.
+- `ownerConfirmed: true` is bridge-local consent on a budget-bearing frontend request, not proof of owner identity. The backend must authorize the owner independently and remove this field before the native Goal RPC. It must never be forwarded to native.
 
-#### Steps
-1. Run `pnpm vitest run src/api/codexGateway.test.ts src/composables/useDesktopState.test.ts`
-2. Run `pnpm run build:frontend`
-3. Open an existing thread in light theme
-4. Type `/` in the composer and confirm `/goal` and `/plan` are the first two rows, followed by available skills
-5. Select `/goal` and confirm the slash token disappears and a Goal mode button appears after the Thinking control
-6. Click the Goal mode button and confirm it disappears; select `/goal` again, type an objective, and submit it
-7. Type `/plan`, select the `/plan` row, and confirm a Plan mode button appears after the Thinking control without submitting a turn
-8. Click the Plan mode button and confirm it disappears and the composer returns to Default mode
-9. Confirm no normal user prompt is appended and no new turn starts
-10. Confirm the live overlay shows `Goal active` and includes the submitted objective
-11. Type `/` again, select a skill, and confirm the slash token is removed and the skill appears as a selected chip
-12. Submit `/goal $planning-with-files Track goal slash-command support`
-13. Confirm the command still routes to the goal workflow, the live overlay shows `Goal active`, and no normal turn starts even though a skill is attached
-14. Submit `/goal`
-15. Confirm the current goal is shown without starting or steering a turn
-16. Submit `/goal pause`, then confirm the overlay shows `Goal paused`
-17. Submit `/goal resume`, then confirm the overlay returns to `Goal active`
-18. Submit `/goal clear`, then confirm the goal notice disappears
-19. From the new-thread composer, submit `/goal Validate new-thread goal setup`
-20. Confirm a new thread is created, the goal notice appears, and no normal turn is started
-21. From the new-thread composer, submit `/goal $planning-with-files Validate new-thread goal setup`
-22. Confirm a new thread is created, the skill mention does not start a normal turn, and the goal notice appears
-23. Repeat steps 3-22 in dark theme
-24. While a goal-driven turn is running with the goal notice showing `Goal active`, press the Stop/interrupt button
-25. Confirm the turn stops, the goal notice switches to `Goal paused`, and the agent does not auto-continue the turn
-26. Submit `/goal resume`, then confirm the goal returns to `Goal active` (resume later or `/goal clear` when done)
-27. Open an existing thread that already has a persisted goal and confirm its status/objective card appears above the composer without typing `/goal`
-28. Click the goal card pencil or Goal composer pill, edit the objective and status, save, refresh, and confirm both changes persist
-29. Repeat the persisted goal card and editor checks in dark theme, then restore or clear the test goal
-30. On the disposable thread, open the goal editor and save; inspect the `/codex-api/rpc` request and response for `thread/goal/set`
-31. With a disposable budget-limited goal, switch to dark theme and inspect the goal card, Resume unlimited button, and editor. Confirm dark surfaces and legible text, not white cards on a dark page.
-32. Click Resume unlimited; confirm `status: active` and `tokenBudget: null` are sent without replacing the objective, then refresh and confirm the active goal persists.
-33. Open disposable thread A with a goal, then switch to thread B with no goal while delaying B's goal-get response. A's goal card and Goal pill must disappear immediately. Complete B's empty response and refresh; neither should return.
-34. Delay a goal save/resume/clear on A, switch to B, then release A's response. B's goal state and editor must remain unchanged. Repeat in light and dark themes, using stubbed responses or disposable threads only.
+#### Fixture setup
+1. Use installed dependencies, disable runner caches, and keep all fixture output in owned scratch. Run the full frontend test set and `vue-tsc --noEmit`. The actual-template regression compiles the original conditional Goal editor and original declarations/open/save handlers with installed Vue; external authorization and persistence alone are fixtures. It mounts in a test-only document, not a reachable application route.
+2. Prepare one selected owned thread with no Goal, and another with objective `Preserve original objective`, total budget `100000`, consumed tokens `117527`, and status `budgetLimited`. Snapshot consumed time and creation time as well. No provider is called.
 
-#### Expected Results
-- `/goal <objective>` routes to `thread/goal/set` with `status: active`
-- `/goal` routes to `thread/goal/get`
-- `/goal pause` and `/goal resume` route to `thread/goal/set` status updates
-- `/goal clear` routes to `thread/goal/clear` and hides the goal notice
-- Typing `/` opens a popup with `/goal` and `/plan` first, followed by available skills
-- Selecting a skill from the `/` popup adds it to the selected skill chips
-- Selecting `/goal` toggles a visible Goal mode button and leaves no command text in the draft
-- Submitting in Goal mode routes the objective through `/goal <objective>` and clears the Goal mode button
-- Selecting `/plan` toggles a visible Plan mode button without submitting a turn or leaving `/plan` in the draft
-- Clicking either active mode button turns that mode off; Goal and Plan are mutually exclusive
-- Slash rows, selected rows, and active mode buttons remain readable in light and dark themes
-- Goal commands do not call `turn/start` or `turn/steer`
-- Goal commands that include skill mentions still route to goal RPCs instead of normal turns
-- New-thread `/goal <objective>` creates the thread, sets the goal, and does not show an interrupt-pending state
-- Stopping an active goal-driven turn pauses the goal first so the agent does not auto-continue
-- Interrupt works even when the active turn id is only known from the persisted thread detail
-- Light and dark theme overlays remain readable
-- Persisted goals hydrate on thread selection and remain editable after refresh
-- Saving a goal from the WebUI editor sends `tokenBudget: null`, leaving its token budget unlimited; explicit numeric budgets remain supported by the API
-- The goal-save RPC request and returned goal both contain `tokenBudget: null`
-- Goal cards and recovery/editor controls use shared dark-theme overrides; Resume unlimited changes only the selected goal and disappears after successful recovery.
-- Goal visibility is scoped to the selected thread; switching invalidates prior requests synchronously. Late reads and writes, including switch-away-and-back races, cannot overwrite the current goal state. Returned goal thread IDs are validated.
+#### Checks
+1. In the intercepted composer fixture, selecting `/goal` toggles the Goal mode button; turning it off removes the mode. Goal and Plan remain mutually exclusive. Inspect the synthetic submit payload: Goal mode supplies literal `/goal <objective>` text on the normal turn path, not a Goal RPC. Include a skill mention and check the same distinction without real generation.
+2. For the selected owned no-Goal thread, deliberately open its editor. After owner authorization, **Total token budget** must be visible as `type=number`, with no default numeric value. Help must say **total**, not additional tokens, and show **0 consumed tokens**. The selected thread is not created implicitly by the editor.
+3. Enter a nonblank objective and an explicit safe positive-integer total. Save must ask for owner confirmation before exactly one finite-budget creation request. Inspect frontend/bridge input: `threadId`, objective, selected status, numeric `tokenBudget`, and bridge-local `ownerConfirmed: true`. Inspect separately that native Goal input excludes `ownerConfirmed`. This is fixture-only evidence.
+4. Without a budget or objective, with zero/negative/fractional/nonfinite/unsafe totals, on owner-confirmation cancellation, or without owner authorization, no new Goal write may be sent. A nonowner sees no numeric controls. Do not treat hiding a control as backend authorization.
+5. On an existing Goal, an ordinary objective/status edit must omit `tokenBudget` and require no budget confirmation. Do not install an unlimited/default budget.
+6. For the exhausted fixture, **Adjust budget to resume** opens the same numeric total editor with original total `100000` and **117527 consumed tokens** (locale formatting may add separators). Unchanged or invalid exhausted totals never rearm it. Enter `200000`, approve once, and check the recovery input contains status `active` and numeric total, with objective omitted. Blank editor objective must not block budget-only recovery.
+7. Read the fixture back: objective, consumed tokens/time, and creation time remain unchanged. Budget/status may change only through the approved recovery. These are intercepted fixture persistence checks, not a production budget adjustment or native accounting proof.
+8. Delay Goal reads/owner authorization/saves, then switch selected threads or go home. The actual context watcher must hide/reset the editor and authorization; a late authorization must not reveal controls in the new context. Existing Goal-state tests must keep per-thread cached data/errors/writes isolated.
+9. In light/dark themes at 375 and 768 widths, inspect the real Goal card, editor, labels, recovery action, and numeric control for readability and overflow. No synthetic test markup may stand in for the actual conditional budget block.
+10. In the intercepted Stop fixture, inspect `turn/interrupt` only; do not claim Goal pause or send a real interrupt/provider turn.
 
-#### Rollback/Cleanup
-- Use `/goal clear` on test threads after manual verification
-- Archive or delete test threads created only for this check
-
----
+#### Cleanup
+Close fixture contexts and discard owned scratch output. Do not issue literal `/goal clear`, clear/recreate real Goals, or overwrite thread history as cleanup.

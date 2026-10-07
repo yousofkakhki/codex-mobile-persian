@@ -1,40 +1,32 @@
-### Thread-locked providers across Zen, Codex, and OpenRouter
+### Global providers across Zen, Codex, OpenRouter, and custom endpoints
 
 #### Feature/Change Name
-Threads capture their provider at creation time and keep provider-scoped model menus and sends.
+Settings selects one global provider for new and existing threads. Stored `modelProvider` is historical metadata, not a routing override.
 
 #### Prerequisites/Setup
-1. Create a fresh temporary `CODEX_HOME` with no `auth.json`.
-2. Start the app locally with Vite only: `CODEX_HOME=<temp-home> npm run dev -- --host 127.0.0.1 --port 4173`.
-3. Keep a valid host auth file at `/Users/igor/.codex/auth.json`.
-4. Keep a valid OpenRouter key available.
+1. Use a disposable `CODEX_HOME`, a models-only local fixture, and synthetic generation transport. Never copy a real account or use billable generation.
+2. Start an isolated packaged app or `CODEX_HOME=<fixture-home> pnpm run dev --host 127.0.0.1 --port 4173`.
+3. Seed an old OpenAI thread and distinct provider catalogs. Include configured literal `Ggh` absent from the custom upstream catalog.
+4. Block outgoing generation; capture intercepted `thread/resume` and `turn/start` without forwarding generation.
 
 #### Steps
-1. In light theme, open `http://127.0.0.1:4173`.
-2. Create a project chat with no auth present and confirm the provider is OpenCode Zen.
-3. Open the model menu and confirm it only shows Zen models, including `big-pickle`, with no GPT/Codex entries.
-4. Send `hi` and confirm the request uses `big-pickle` and a visible assistant reply appears.
-5. Copy `/Users/igor/.codex/auth.json` into the isolated `CODEX_HOME` while the Vite server is still running, reload the app, and confirm the new-chat composer switches from `big-pickle` to a Codex/GPT model.
-6. Restart the Vite server with the same `CODEX_HOME`, reload the app, and confirm the composer still shows Codex/GPT models.
-7. In the same project, create a new chat and confirm it uses the current global Codex provider.
-8. Open the model menu and confirm it only shows Codex/GPT models, with no Zen entries.
-9. Send `hi` and confirm the request uses a GPT model and a visible assistant reply appears.
-10. Reopen the old Zen thread, confirm the model menu still shows only Zen models, send `hi`, and confirm the request still uses `big-pickle` with a visible assistant reply.
-11. Switch Settings provider to OpenRouter, configure the OpenRouter API key, and create another new chat in the same project.
-12. Confirm the new chat uses OpenRouter, the model menu shows only OpenRouter models, and `hi` sends through OpenRouter with a visible assistant reply.
-13. Reopen the Zen, Codex, and OpenRouter threads in the same project and confirm each model menu remains provider-scoped and each send uses that thread's provider.
-14. Repeat the provider label and model menu checks in dark theme.
+1. Open the existing thread and verify saved history renders in light theme.
+2. Switch global Settings from Codex to Zen, then OpenRouter. Reopen old threads and verify only the globally selected provider's models appear.
+3. Save a custom endpoint on an old OpenAI thread. Verify custom catalog refresh without stale ChatGPT models or injected `Ggh`. If upstream returns `Ggh`, keep its exact spelling.
+4. Capture an intercepted send: `thread/resume` must carry current global `modelProvider` and a catalog-compatible `model`; its effective returned provider must match before `turn/start`.
+5. Save another endpoint for the same provider. Repeat on hydrated threads: invalidate routing caches, keep history bounded/cached.
+6. Reload and repeat menu/history checks in dark theme.
+7. Fail catalog discovery or return empty. Verify visible error, no successful stale catalog, and blocked sends until recovery.
+8. Simulate a hot subscribed thread ignoring overrides or another process owning its writer. History remains readable; a clear provider/writer error blocks wrong-provider sends. Never remove locks or edit the database.
+9. Queue a message: current config provider/model overrides precede the turn; mismatched effective provider restores its queue item rather than continuing.
 
 #### Expected Results
-- Existing threads use their captured `modelProvider`, not the current global provider, for model-list filtering and sends.
-- New chats use the current global provider at creation time and do not inherit stale models from previously opened project threads.
-- Copying Codex auth into a running no-auth Vite session restarts stale Zen app-server config before the next model/config RPC, so Settings and the composer cannot disagree.
-- Projects can contain Zen, Codex, and OpenRouter threads at the same time without mixed provider/model state.
-- Light and dark theme model menus remain readable and provider-specific.
+- Existing and new threads use global Settings for catalog and routing; no manual per-thread change.
+- Aliases `custom`, `custom_endpoint`, and `custom-endpoint` behave consistently.
+- Save disposes the old app-server. Retired output/initialization cannot corrupt its replacement.
+- Equivalent resume requests coalesce; paging stays bounded; active-writer protection is preserved.
+- No custom retry hard-codes `gpt-5.4-mini` or silently switches to OpenAI.
+- Assert effective top-level `modelProvider`, not just resume HTTP success.
 
 #### Rollback/Cleanup
-- Stop the temporary Vite server.
-- Remove the temporary isolated `CODEX_HOME`.
-- Restore the preferred provider in Settings if it was changed during testing.
-
----
+Stop/remove only exact disposable fixture containers, network, and homes. Do not alter production state.

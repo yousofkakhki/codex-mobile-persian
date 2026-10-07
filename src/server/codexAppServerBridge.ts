@@ -14,6 +14,7 @@ import { once } from 'node:events'
 import { chmod, writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import { assertThreadProjectionIntegrity, resolveSQLiteHome } from './threadProjectionIntegrity.js'
 import { callRpcWithRateLimitDecodeRecovery } from './rateLimitDecodeRecovery.js'
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes } from './skillsRoutes.js'
@@ -42,7 +43,8 @@ import {
 import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { getZenModelCatalog } from './zenModelCatalog.js'
 import { normalizeProviderModelMetadata } from './providerModelMetadata.js'
-import { readConfiguredContextWindows } from './runtimeModelCatalog.js'
+import { readConfiguredContextWindows, readConfiguredModelCatalog } from './runtimeModelCatalog.js'
+import { nativeSlugForRoute, indexDescriptors, nativeUltraWireEffort, providerWireEfforts } from './runtimeLocalUltra.mjs'
 import type { ZenModelMetadata } from '../types/zenModels.js'
 import { handleZenProxyRequest } from './zenProxy.js'
 import {
@@ -50,12 +52,13 @@ import {
   handleCustomEndpointProxyRequest,
 } from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
+import { appendGoalBudgetAuditRecord } from './goalBudgetAudit.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
   resolveRipgrepCommand,
 } from '../commandResolution.js'
-import type { CollaborationModeKind, ReasoningEffort } from '../types/codex.js'
+import type { ReasoningEffort } from '../types/codex.js'
 import { isAbsoluteLikePath } from '../pathUtils.js'
 
 const require = createRequire(import.meta.url)
@@ -83,8 +86,11 @@ type RpcProxyRequest = {
   params?: unknown
 }
 
+type RuntimeModelCatalogSnapshot = { config: Record<string, unknown>; modelList: unknown; customBaseUrl: string; customWireApi: string; isCurrent: () => boolean }
+
 type RpcExecutor = {
   rpc: (method: string, params: unknown) => Promise<unknown>
+  readModelCatalogSnapshot?: () => Promise<RuntimeModelCatalogSnapshot | null>
 }
 
 type ServerRequestReply = {
@@ -2246,14 +2252,84 @@ async function fetchCustomEndpointDefaultModel(baseUrl: string, apiKey: string):
   }
 }
 
-async function fetchCustomEndpointModelIds(baseUrl: string, apiKey: string): Promise<string[]> {
+async function addRuntimeLocalReasoning(
+  appServer: RpcExecutor, models: ZenModelMetadata[], providerId: string, customBaseUrl = '', fetchedBaseUrl = '',
+): Promise<ZenModelMetadata[]> {
+  // Ultra is agent-local, not proof of a gateway-supported wire effort.
+  models = models.map(model => !model.id.startsWith('cx/') || !model.reasoningOptions.includes('ultra')
+    ? model : { ...model, reasoningOptions: model.reasoningOptions.filter(effort => effort !== 'ultra') })
+  const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
+  if (!path || !appServer.readModelCatalogSnapshot) return models
+  try {
+    const identity = (info: Awaited<ReturnType<typeof stat>>) => JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs])
+    const descriptorIdentity = identity(await stat(path))
+    const catalog = asRecord(await readConfiguredModelCatalog())
+    const descriptors = indexDescriptors(catalog?.models)
+    const eligible = new Map<string, string>()
+    for (const model of models) {
+      if (!nativeSlugForRoute(model.id) || model.supportsReasoning === false) continue
+      const wire = nativeUltraWireEffort(descriptors.get(model.id))
+      if (wire && (model.reasoningSource !== 'provider-catalog' || model.reasoningOptions.includes(wire))) eligible.set(model.id, wire)
+    }
+    if (!eligible.size) return models
+    const snapshot = await appServer.readModelCatalogSnapshot()
+    if (!snapshot || snapshot.config.model_catalog_json !== path
+      || asRecord(snapshot.config.features)?.multi_agent_v2 !== true
+      || descriptorIdentity !== identity(await stat(path)) || !snapshot.isCurrent()) return models
+    const normalizeProvider = (id: string) => ['custom', 'custom_endpoint', 'custom-endpoint'].includes(id.trim().toLowerCase())
+      ? 'custom-endpoint' : id
+    const effectiveProvider = readNonEmptyString(snapshot.config.model_provider)
+    if (normalizeProvider(effectiveProvider) !== normalizeProvider(providerId)) return models
+    const provider = asRecord(asRecord(snapshot.config.model_providers)?.[effectiveProvider])
+    if (provider?.wire_api !== 'responses') return models
+    const effectiveBaseUrl = readNonEmptyString(provider.base_url)
+    if (fetchedBaseUrl && effectiveBaseUrl !== fetchedBaseUrl) return models
+    const boundBaseUrl = customBaseUrl || effectiveBaseUrl
+    if (boundBaseUrl.replace(/\/+$/, '') !== 'http://127.0.0.1:20128/v1') return models
+    if (customBaseUrl && (snapshot.customBaseUrl !== customBaseUrl || snapshot.customWireApi !== 'responses')) return models
+    const port = parseInt(process.env.CODEXUI_SERVER_PORT ?? '', 10)
+    if (effectiveBaseUrl.replace(/\/+$/, '') !== boundBaseUrl.replace(/\/+$/, '')
+      && !(customBaseUrl && port > 0 && effectiveBaseUrl === `http://127.0.0.1:${port}/codex-api/custom-proxy/v1`)) return models
+    const result = asRecord(snapshot.modelList)
+    if (!Array.isArray(result?.data) || result?.nextCursor) return models
+    const runtimeRows = new Map<string, Record<string, unknown> | null>()
+    for (const value of result.data) {
+      const row = asRecord(value)
+      if (!row || typeof row.model !== 'string') continue
+      runtimeRows.set(row.model, runtimeRows.has(row.model) ? null : row)
+    }
+    const confirmed = new Map<string, string[]>()
+    for (const [id, wire] of eligible) {
+      const runtime = runtimeRows.get(id)
+      if (!runtime || runtime.id !== undefined && runtime.id !== id) continue
+      const efforts = providerWireEfforts(runtime)
+      const rows = runtime.supportedReasoningEfforts
+      if (Array.isArray(rows) && rows.every(value => typeof asRecord(value)?.reasoningEffort === 'string')
+        && rows.some(value => asRecord(value)?.reasoningEffort === 'ultra')
+        && efforts && efforts.has(wire)) {
+        const levels = descriptors.get(id)!.supported_reasoning_levels as unknown[]
+        confirmed.set(id, levels.map(value => asRecord(value)?.effort)
+          .filter((effort): effort is string => typeof effort === 'string' && efforts.has(effort)))
+      }
+    }
+    if (!snapshot.isCurrent()) return models
+    return models.map(model => !confirmed.has(model.id) ? model : {
+      ...model, reasoningOptions: [...(model.reasoningSource === 'provider-catalog'
+        ? model.reasoningOptions.filter(effort => effort !== 'ultra') : confirmed.get(model.id)!), 'ultra'],
+      reasoningSource: 'codex-runtime-catalog',
+    })
+  } catch { return models }
+}
+
+async function fetchCustomEndpointModels(baseUrl: string, apiKey: string): Promise<Pick<ProviderModelsResponse, 'data' | 'models'>> {
   const normalizedBaseUrl = baseUrl.trim()
-  if (!normalizedBaseUrl) return []
+  if (!normalizedBaseUrl) return { data: [] }
   const modelsUrl = buildProviderModelsUrl(normalizedBaseUrl, null)
   const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
   const response = await fetch(modelsUrl, { headers, signal: AbortSignal.timeout(PROVIDER_MODELS_FETCH_TIMEOUT_MS) })
-  if (!response.ok) return []
-  return normalizeProviderModelsData(await response.json() as unknown)
+  if (!response.ok) return { data: [] }
+  const payload = await response.json() as unknown
+  return { data: normalizeProviderModelsData(payload), models: normalizeProviderModelMetadata(payload) }
 }
 
 async function fetchOpenCodeZenModelIds(apiKey: string | null | undefined): Promise<string[]> {
@@ -2302,14 +2378,19 @@ export function buildProviderDiscoveryHeaders(provider: Record<string, unknown>)
   return headers
 }
 
-async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<ProviderModelsResponse> {
-  const configPayload = asRecord(await appServer.rpc('config/read', {}))
-  const config = asRecord(configPayload?.config)
+async function readProviderBackedModelIds(
+  appServer: RpcExecutor,
+  options: { config?: Record<string, unknown> | null; includeConfiguredModel?: boolean; requestedProviderId?: string } = {},
+): Promise<ProviderModelsResponse> {
+  const configPayload = options.config === undefined ? asRecord(await appServer.rpc('config/read', {})) : null
+  const config = options.config === undefined ? asRecord(configPayload?.config) : options.config
   const providerId = readNonEmptyString(config?.model_provider)
   if (!providerId) {
     return { data: [], providerId: '', source: 'provider' }
   }
-  const configuredModel = readNonEmptyString(config?.model)
+  const normalizedProviderId = providerId.toLowerCase().replace(/_/g, '-')
+  const isCustomProvider = normalizedProviderId === 'custom' || normalizedProviderId === 'custom-endpoint'
+  const configuredModel = options.includeConfiguredModel === false || isCustomProvider ? '' : readNonEmptyString(config?.model)
   const fallback = (): ProviderModelsResponse => ({
     data: configuredModel ? [configuredModel] : [],
     providerId,
@@ -2391,9 +2472,9 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       data: modelIds,
       providerId,
       source: 'provider',
-      models: normalizeProviderModelMetadata(payload).map(model => ({
+      models: await addRuntimeLocalReasoning(appServer, normalizeProviderModelMetadata(payload).map(model => ({
         ...model, configuredContextWindow: configuredWindows[model.id] ?? null,
-      })),
+      })), options.requestedProviderId ?? providerId, '', baseUrl),
     }
   } catch (error) {
     logProviderModelDiscoveryWarning('provider /models payload was invalid', {
@@ -2405,7 +2486,7 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
 }
 
 async function readProviderModelIdsForProvider(
-  appServer: AppServerProcess,
+  appServer: RpcExecutor,
   providerId: string,
 ): Promise<ProviderModelsResponse> {
   const normalizedProviderId = providerId.trim().toLowerCase().replace(/_/g, '-')
@@ -2438,10 +2519,12 @@ async function readProviderModelIdsForProvider(
     }
   }
 
-  if (normalizedProviderId === 'custom-endpoint' && fmState?.provider === 'custom' && fmState.customBaseUrl) {
+  if ((normalizedProviderId === 'custom' || normalizedProviderId === 'custom-endpoint') && fmState?.provider === 'custom' && fmState.customBaseUrl) {
     try {
+      const catalog = await fetchCustomEndpointModels(fmState.customBaseUrl, fmState.apiKey ?? '')
+      if (catalog.models) catalog.models = await addRuntimeLocalReasoning(appServer, catalog.models, 'custom_endpoint', fmState.customBaseUrl)
       return {
-        data: await fetchCustomEndpointModelIds(fmState.customBaseUrl, fmState.apiKey ?? ''),
+        ...catalog,
         providerId: 'custom_endpoint',
         source: 'custom',
       }
@@ -2450,7 +2533,10 @@ async function readProviderModelIdsForProvider(
     }
   }
 
-  return readProviderBackedModelIds(appServer)
+  return readProviderBackedModelIds(appServer, {
+    includeConfiguredModel: normalizedProviderId !== 'custom' && normalizedProviderId !== 'custom-endpoint',
+    requestedProviderId: providerId,
+  })
 }
 
 function extractThreadMessageText(threadReadPayload: unknown): string {
@@ -2528,8 +2614,28 @@ export async function callRpcWithArchiveRecovery(
     const threadId = readNonEmptyString(paramsRecord?.threadId)
 
     if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
-      await appServer.rpc('thread/resume', { threadId })
-      return appServer.rpc(method, params ?? null)
+      const collaborationMode = asRecord(paramsRecord?.collaborationMode)
+      const collaborationSettings = asRecord(collaborationMode?.settings)
+      const requestedModel = readNonEmptyString(paramsRecord?.model) || readNonEmptyString(collaborationSettings?.model)
+      const settings = await resolveCurrentTurnRoutingSettings(appServer, requestedModel)
+      const resumed = await appServer.rpc('thread/resume', {
+        threadId,
+        modelProvider: settings.modelProvider,
+        model: settings.model,
+        excludeTurns: true,
+      })
+      assertResumedTurnProvider(resumed, threadId, settings.modelProvider)
+      const retryParams = {
+        ...paramsRecord,
+        model: settings.model,
+        ...(collaborationMode && collaborationSettings ? {
+          collaborationMode: {
+            ...collaborationMode,
+            settings: { ...collaborationSettings, model: settings.model },
+          },
+        } : {}),
+      }
+      return appServer.rpc(method, retryParams)
     }
 
     if (method !== 'thread/archive') {
@@ -5186,9 +5292,66 @@ type ThreadQueueStateUpdate<T> = {
   result: T
 }
 
-type ResolvedCollaborationModeSettings = {
+type CurrentTurnRoutingSettings = {
+  modelProvider: string
   model: string
   reasoningEffort: ReasoningEffort | null
+}
+
+class TurnProviderMismatchError extends Error {}
+
+function assertResumedTurnProvider(result: unknown, threadId: string, modelProvider: string): void {
+  // thread.modelProvider is historical metadata; the top-level field is the effective runtime provider.
+  const returnedProvider = readNonEmptyString(asRecord(result)?.modelProvider)
+  if (returnedProvider !== modelProvider) {
+    throw new TurnProviderMismatchError(
+      `Cannot start thread "${threadId}": configured provider "${modelProvider}" but thread/resume returned "${returnedProvider || 'unknown'}". `
+      + 'The thread may still be loaded or have an active writer; finish the active turn and reload it before retrying.',
+    )
+  }
+}
+
+async function resolveCurrentTurnRoutingSettings(appServer: RpcExecutor, requestedModel = ''): Promise<CurrentTurnRoutingSettings> {
+  const configPayload = asRecord(await appServer.rpc('config/read', {}))
+  const config = asRecord(configPayload?.config)
+  const modelProvider = readNonEmptyString(config?.model_provider)
+  const configuredModel = readNonEmptyString(config?.model)
+  let model = requestedModel || configuredModel
+  const providerState = modelProvider === 'custom_endpoint'
+    ? ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
+    : null
+  const configuredProvider = asRecord(asRecord(config?.model_providers)?.[modelProvider])
+  const useCustomCatalog = modelProvider === 'custom_endpoint' && Boolean(readNonEmptyString(configuredProvider?.base_url)
+    || providerState?.enabled && providerState.provider === 'custom' && providerState.customBaseUrl)
+  if (useCustomCatalog) {
+    const catalog = readNonEmptyString(configuredProvider?.base_url)
+      ? await readProviderBackedModelIds(appServer, { config, includeConfiguredModel: false })
+      : await readProviderModelIdsForProvider(appServer, modelProvider)
+    model = catalog.data.includes(model) ? model : catalog.data[0] ?? ''
+  } else if (modelProvider === 'openrouter_free' && requestedModel && requestedModel !== configuredModel) {
+    const models = getCachedFreeModels()
+    model = models.includes(requestedModel) ? requestedModel : configuredModel || models[0] || ''
+  } else if (modelProvider === 'opencode_zen' && requestedModel && requestedModel !== configuredModel) {
+    const catalog = await readProviderModelIdsForProvider(appServer, modelProvider)
+    model = catalog.data.includes(requestedModel) ? requestedModel : configuredModel || catalog.data[0] || ''
+  }
+  if (!useCustomCatalog && modelProvider && !model) {
+    const modelsPayload = asRecord(await appServer.rpc('model/list', {}))
+    const models = Array.isArray(modelsPayload?.data) ? modelsPayload.data : []
+    for (const row of models) {
+      const record = asRecord(row)
+      model = readNonEmptyString(record?.id) || readNonEmptyString(record?.model)
+      if (model) break
+    }
+  }
+  if (!modelProvider || !model) {
+    throw new Error('Starting a turn requires a configured provider and available model.')
+  }
+  return {
+    modelProvider,
+    model,
+    reasoningEffort: normalizeCollaborationModeReasoningEffort(normalizeReasoningEffort(config?.model_reasoning_effort)),
+  }
 }
 
 function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | null {
@@ -5283,12 +5446,16 @@ async function writeThreadQueueStateUnlocked(nextState: ThreadQueueState): Promi
 
 async function withThreadQueueStateUpdate<T>(
   update: (state: ThreadQueueState) => ThreadQueueStateUpdate<T> | Promise<ThreadQueueStateUpdate<T>>,
+  guard?: (state: ThreadQueueState, commit: () => Promise<T>) => Promise<T>,
 ): Promise<T> {
   const run = threadQueueMutationChain.then(async () => {
     const currentState = await readThreadQueueState()
-    const { nextState, result } = await update(currentState)
-    await writeThreadQueueStateUnlocked(nextState)
-    return result
+    const commit = async (): Promise<T> => {
+      const { nextState, result } = await update(currentState)
+      await writeThreadQueueStateUnlocked(nextState)
+      return result
+    }
+    return guard ? guard(currentState, commit) : commit()
   })
   threadQueueMutationChain = run.catch(() => {})
   return run
@@ -6049,7 +6216,7 @@ class AppServerProcess {
   private readBuffer = ''
   private nextId = 1
   private stopping = false
-  private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
+  private readonly pending = new Map<number, { method: string; resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
   private readonly notificationListeners = new Set<(value: { method: string; params: unknown }) => void>()
   private readonly pendingServerRequests = new Map<number, PendingServerRequest>()
   private readonly streamEventsByThreadId = new Map<string, StreamEventFrame[]>()
@@ -6060,6 +6227,23 @@ class AppServerProcess {
   private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
+  private activeSQLiteHome = ''
+  private confirmedSQLiteHome = ''
+  private sqliteHomeVerificationPromise: Promise<void> | null = null
+  private configChangeDeferred = false
+  private activeCustomCatalogBinding = ''
+  private activeCatalogFileIdentity = ''
+  private runtimeModelCatalogCache: { process: ChildProcessWithoutNullStreams | null; pending: Promise<RuntimeModelCatalogSnapshot | null>; expiresAt: number } | null = null
+  private readonly fileMutationsByThreadId = new Set<string>()
+  private readonly goalMutationsByThreadId = new Map<string, object>()
+  // A lease excludes competitors; only a one-use policy permit authorizes native Goal writes.
+  private readonly goalWritePermits = new WeakMap<object, { method: string; params: unknown; generation: ChildProcessWithoutNullStreams; lease: object; assertAllowed: () => void }>()
+  private readonly joinedThreads = new Map<string, unknown>()
+  // Subscription removal acknowledges no writer shutdown; protect until thread/closed.
+  private readonly writerThreadIds = new Set<string>()
+  private readonly timedOutRpcIds = new Map<number, string>()
+  private readonly resumePromisesByRequest = new Map<string, Promise<unknown>>()
+  private readonly resumeTailsByThreadId = new Map<string, Promise<unknown>>()
 
 
   private getCodexCommand(): string {
@@ -6070,8 +6254,10 @@ class AppServerProcess {
     return codexCommand
   }
 
-  private buildAppServerConfig(): { args: string[]; env: Record<string, string> } {
+  private buildAppServerConfig(): { args: string[]; env: Record<string, string>; sqliteHome: string } {
     const args = buildAppServerArgs()
+    const sqliteHome = resolveSQLiteHome(getCodexHomeDir())
+    args.push('-c', `sqlite_home=${JSON.stringify(sqliteHome)}`)
     let extraEnv: Record<string, string> = {}
     const serverPort = parseInt(process.env.CODEXUI_SERVER_PORT ?? '', 10) || undefined
     args.push(...getProviderCompatibilityConfigArgs(serverPort))
@@ -6085,7 +6271,7 @@ class AppServerProcess {
     } catch {
       // No free-mode state or invalid — use defaults
     }
-    return { args, env: extraEnv }
+    return { args, env: extraEnv, sqliteHome }
   }
 
   private getAppServerConfigSignature(config: { args: string[]; env: Record<string, string> }): string {
@@ -6101,25 +6287,40 @@ class AppServerProcess {
     if (!this.process) return
     const config = this.buildAppServerConfig()
     const nextSignature = this.getAppServerConfigSignature(config)
-    if (this.activeConfigSignature === nextSignature) return
+    this.configChangeDeferred = this.activeConfigSignature !== nextSignature
+    if (!this.configChangeDeferred) return
+    // An attached writer can still be flushing even when its turn is idle. Release is
+    // explicit (unsubscribe/close), never inferred from turn completion or a JS deadline.
+    if (this.writerThreadIds.size || this.joinedThreads.size || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size || [...this.pending.values()].some(request => ['thread/resume', 'thread/start', 'turn/start', 'thread/rollback'].includes(request.method))) return
     this.dispose()
   }
 
-  private start(): void {
+  private start(preparedConfig?: ReturnType<AppServerProcess['buildAppServerConfig']>): void {
     if (this.process) return
 
     this.stopping = false
-    const config = this.buildAppServerConfig()
+    this.joinedThreads.clear()
+    this.writerThreadIds.clear()
+    this.timedOutRpcIds.clear()
+    const config = preparedConfig ?? this.buildAppServerConfig()
+    this.activeSQLiteHome = config.sqliteHome
+    this.configChangeDeferred = false
     this.activeConfigSignature = this.getAppServerConfigSignature(config)
+    this.activeCustomCatalogBinding = this.currentCustomCatalogBinding()
+    this.activeCatalogFileIdentity = this.currentCatalogFileIdentity()
+    this.runtimeModelCatalogCache = null
     const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
     const spawnEnv = Object.keys(config.env).length > 0
       ? { ...process.env, ...config.env }
       : undefined
     const proc = spawn(invocation.command, invocation.args, { stdio: ['pipe', 'pipe', 'pipe'], ...(spawnEnv ? { env: spawnEnv } : {}) })
     this.process = proc
+    this.confirmedSQLiteHome = ''
+    this.sqliteHomeVerificationPromise = null
 
     proc.stdout.setEncoding('utf8')
     proc.stdout.on('data', (chunk: string) => {
+      if (this.process !== proc) return
       this.readBuffer += chunk
 
       let lineEnd = this.readBuffer.indexOf('\n')
@@ -6175,6 +6376,19 @@ class AppServerProcess {
       return
     }
 
+    if (typeof message.id === 'number' && !message.method && ('result' in message || message.error)) {
+      const acquisitionMethod = this.timedOutRpcIds.get(message.id) ?? this.pending.get(message.id)?.method
+      this.timedOutRpcIds.delete(message.id)
+      if (!message.error && (acquisitionMethod === 'thread/resume' || acquisitionMethod === 'thread/start')) {
+        const result = asRecord(message.result)
+        const threadId = readNonEmptyString(asRecord(result?.thread)?.id)
+        if (threadId) {
+          const { thread: _thread, initialTurnsPage: _page, ...runtimeMetadata } = result ?? {}
+          this.joinedThreads.set(threadId, runtimeMetadata)
+          this.writerThreadIds.add(threadId)
+        }
+      }
+    }
     if (typeof message.id === 'number' && this.pending.has(message.id)) {
       const pendingRequest = this.pending.get(message.id)
       this.pending.delete(message.id)
@@ -6182,7 +6396,7 @@ class AppServerProcess {
       if (!pendingRequest) return
 
       if (message.error) {
-        pendingRequest.reject(new Error(message.error.message))
+        pendingRequest.reject(Object.assign(new Error(message.error.message), { rpcCode: message.error.code }))
       } else {
         pendingRequest.resolve(message.result)
       }
@@ -6208,6 +6422,7 @@ class AppServerProcess {
     this.captureItemFromNotification(notification)
     const nThreadId = this.extractThreadIdFromParams(notification.params)
     if (nThreadId) {
+      if (notification.method === 'thread/closed') { this.joinedThreads.delete(nThreadId); this.writerThreadIds.delete(nThreadId) }
       this.invalidateLiveStateCache(nThreadId)
       this.threadTurnPageReadCacheByThreadId.delete(nThreadId)
     }
@@ -6491,30 +6706,63 @@ class AppServerProcess {
     })
   }
 
-  private async call(method: string, params: unknown): Promise<unknown> {
+  private async call(method: string, params: unknown, expectedProcess?: ChildProcessWithoutNullStreams, goalLease?: object, goalPermit?: object): Promise<unknown> {
+    const goalRecord = params && typeof params === 'object' ? params as Record<string, unknown> : null
+    const goalThreadId = typeof goalRecord?.threadId === 'string' ? goalRecord.threadId.trim() : ''
+    if (this.goalMutationsByThreadId.has(goalThreadId) && !goalLease && ['turn/start', 'thread/resume', 'thread/rollback', 'thread/archive', 'thread/unsubscribe'].includes(method)) throw new Error('Goal mutation is busy; no competing mutation was sent.')
+    if (['thread/goal/set', 'thread/goal/clear'].includes(method)) {
+      const permit = goalPermit && this.goalWritePermits.get(goalPermit)
+      if (!permit || permit.method !== method || permit.params !== params || permit.generation !== this.process
+        || permit.generation !== expectedProcess || permit.lease !== goalLease
+        || this.goalMutationsByThreadId.get(readNonEmptyString(asRecord(params)?.threadId)) !== goalLease) throw new Error('Goal policy permit is not held')
+      this.goalWritePermits.delete(goalPermit!)
+      permit.assertAllowed()
+    }
+    if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
+    if (this.timedOutRpcIds.size) throw new Error('Codex still has an unresolved timed-out operation; no retry was sent and active writers were preserved.')
+    if (expectedProcess && this.process !== expectedProcess) throw new Error('codex app-server changed before RPC dispatch; retry the request')
     this.start()
     const id = this.nextId++
 
+    const requestProcess = this.process
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-
-      this.sendLine({
-        jsonrpc: '2.0',
-        id,
+      const timer = setTimeout(() => {
+        const pending = this.pending.get(id)
+        if (!pending) return
+        this.pending.delete(id)
+        // Rejecting a JS promise does not cancel Codex's Rust handler. Do not enqueue more
+        // requests or restart an active writer; only its late response/exit can release this.
+        if (method !== 'initialize' && this.process === requestProcess) this.timedOutRpcIds.set(id, method)
+        pending.reject(new Error(`codex app-server ${method} timed out`))
+        if (method === 'initialize' && this.process === requestProcess) this.dispose()
+      }, method === 'initialize' ? 30_000 : 120_000)
+      timer.unref?.()
+      this.pending.set(id, {
         method,
-        params,
-      } satisfies JsonRpcCall)
+        resolve: (value) => { clearTimeout(timer); resolve(value) },
+        reject: (error) => { clearTimeout(timer); reject(error) },
+      })
+      try {
+        const readsWhileDeferred = new Set(['initialize', 'thread/read', 'thread/turns/list', 'thread/list', 'thread/loaded/list', 'config/read', 'turn/interrupt', 'thread/unsubscribe'])
+        if (this.configChangeDeferred && !readsWhileDeferred.has(method)) throw new Error('App-server configuration change is deferred until writer shutdown is confirmed; no mutation was sent.')
+        this.sendLine({ jsonrpc: '2.0', id, method, params } satisfies JsonRpcCall)
+      } catch (error) {
+        this.pending.get(id)?.reject(error)
+        this.pending.delete(id)
+      }
     })
   }
 
   private async ensureInitialized(): Promise<void> {
+    this.start()
+    const initializingProcess = this.process
     if (this.initialized) return
     if (this.initializePromise) {
       await this.initializePromise
       return
     }
 
-    this.initializePromise = this.call('initialize', {
+    const initializePromise = this.call('initialize', {
       clientInfo: {
         name: 'codex-web-local',
         version: '0.1.0',
@@ -6523,22 +6771,368 @@ class AppServerProcess {
         experimentalApi: true,
       },
     }).then(() => {
+      if (this.process !== initializingProcess) throw new Error('codex app-server changed during initialization; retry the request')
       this.sendLine({
         jsonrpc: '2.0',
         method: 'initialized',
       })
       this.initialized = true
     }).finally(() => {
-      this.initializePromise = null
+      if (this.initializePromise === initializePromise) this.initializePromise = null
     })
+    this.initializePromise = initializePromise
 
-    await this.initializePromise
+    await initializePromise
   }
 
-  async rpc(method: string, params: unknown): Promise<unknown> {
-    this.disposeIfConfigChanged()
+  private currentCatalogFileIdentity(): string {
+    const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
+    if (!path) return ''
+    try {
+      const info = statSync(path)
+      if (info.size <= 0 || info.size > 4 * 1024 * 1024) return ''
+      return JSON.stringify([path, info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs])
+    } catch { return '' }
+  }
+
+  private currentCustomCatalogBinding(): string {
+    const state = ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
+    return JSON.stringify({ provider: state?.provider ?? '', enabled: state?.enabled ?? false,
+      baseUrl: state?.customBaseUrl ?? '', wireApi: state?.wireApi ?? 'responses' })
+  }
+
+  readModelCatalogSnapshot(): Promise<RuntimeModelCatalogSnapshot | null> {
+    const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
+    if (!path) return Promise.resolve(null)
+    const valid = () => !!this.process && !this.configChangeDeferred && !this.timedOutRpcIds.size
+      && !this.fileMutationsByThreadId.size && this.activeConfigSignature === this.getAppServerConfigSignature(this.buildAppServerConfig())
+      && this.activeCustomCatalogBinding === this.currentCustomCatalogBinding()
+      && !!this.activeCatalogFileIdentity && this.activeCatalogFileIdentity === this.currentCatalogFileIdentity()
+    if (this.process && !valid()) return Promise.resolve(null)
+    const proc = this.process
+    if (this.runtimeModelCatalogCache?.process === proc && this.runtimeModelCatalogCache.expiresAt > Date.now()) {
+      return this.runtimeModelCatalogCache.pending.then(snapshot => this.process === proc && valid() ? snapshot : null)
+    }
+    const pending = (async () => {
+      this.start()
+      const generation = this.process
+      await this.ensureInitialized()
+      if (!generation || this.process !== generation || !this.initialized || !valid()) return null
+      const payload = asRecord(await this.call('config/read', {}, generation))
+      if (this.process !== generation || !valid()) return null
+      if (asRecord(payload?.config)?.model_catalog_json !== path) return null
+      const modelList = await this.call('model/list', { includeHidden: true, limit: 1000 }, generation)
+      if (this.process !== generation || !valid()) return null
+      const binding = asRecord(JSON.parse(this.activeCustomCatalogBinding))
+      return { config: asRecord(payload?.config) ?? {}, modelList, customBaseUrl: readNonEmptyString(binding?.baseUrl),
+        customWireApi: readNonEmptyString(binding?.wireApi), isCurrent: () => this.process === generation && valid() }
+    })().catch(() => null)
+    this.runtimeModelCatalogCache = { process: this.process, pending, expiresAt: Date.now() + 5000 }
+    return pending
+  }
+
+  rpc(method: string, params: unknown): Promise<unknown> {
+    const record = params && typeof params === 'object' ? params as Record<string, unknown> : null
+    const threadId = typeof record?.threadId === 'string' ? record.threadId : ''
+    if (method !== 'thread/resume' || !threadId) return this.rpcInner(method, params)
+    // Only structurally equivalent callers share a response. Different paging/provider
+    // options wait for the first acquisition, then use the joined writer's bounded reads.
+    const canonical = (value: unknown): unknown => Array.isArray(value)
+      ? value.map(canonical)
+      : value && typeof value === 'object'
+        ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)]))
+        : value
+    const key = JSON.stringify(canonical(record))
+    const existing = this.resumePromisesByRequest.get(key)
+    if (existing) return existing
+    const predecessor = this.resumeTailsByThreadId.get(threadId)
+    const proceed = () => this.rpcInner(method, params)
+    const promise = (predecessor ? predecessor.then(proceed, (error: unknown) => {
+      if (asRecord(error)?.rpcCode !== -32602 || this.timedOutRpcIds.size) throw error
+      return proceed() // Invalid parameters were rejected before acquisition; evaluate this caller.
+    }) : proceed()).finally(() => {
+      if (this.resumePromisesByRequest.get(key) === promise) this.resumePromisesByRequest.delete(key)
+      if (this.resumeTailsByThreadId.get(threadId) === promise) this.resumeTailsByThreadId.delete(threadId)
+    })
+    this.resumePromisesByRequest.set(key, promise)
+    this.resumeTailsByThreadId.set(threadId, promise)
+    return promise
+  }
+
+  private captureGoalIntent(method: string, params: unknown): Readonly<Record<string, unknown>> {
+    const input = asRecord(params)
+    const reject = (message: string): never => { throw Object.assign(new Error(message), { goalPolicyStatus: 400 }) }
+    if (!input || Array.isArray(params)) return reject('Invalid Goal parameters')
+    const intent = Object.freeze({ ...input })
+    if (typeof intent.threadId !== 'string' || !intent.threadId.trim() || intent.threadId !== intent.threadId.trim()) return reject('Goal requires a nonempty exact threadId')
+    if (method !== 'thread/goal/set' && method !== 'thread/goal/clear') return reject('Unsupported Goal mutation')
+    return intent
+  }
+
+  async mutateGoal(method: string, params: unknown, context?: { ownerAuthorized: boolean }): Promise<unknown> {
+    // Capture before the first await. Trusted context is never reconstructed from RPC params.
+    const intent = this.captureGoalIntent(method, params)
+    const ownerAuthorized = context?.ownerAuthorized === true
+    return this.withThreadGoalMutation(intent.threadId as string, async (_rpc, assertAllowed) =>
+      this.mutateGoalUnderLease(method, intent, ownerAuthorized, this.goalMutationsByThreadId.get(intent.threadId as string)!, assertAllowed))
+  }
+
+  private async mutateGoalUnderLease(method: string, intent: Readonly<Record<string, unknown>>, ownerAuthorized: boolean,
+    lease: object, assertLeaseAllowed: () => void): Promise<unknown> {
+    const fail = (status: number, message: string): never => { throw Object.assign(new Error(message), { goalPolicyStatus: status }) }
+    const threadId = intent.threadId as string
+    const generation = this.process!
+    const assertAllowed = (): void => {
+      assertLeaseAllowed()
+      if (this.goalMutationsByThreadId.get(threadId) !== lease || this.process !== generation
+        || [...this.pending.values()].some(request => ['thread/resume', 'thread/start', 'turn/start', 'thread/rollback'].includes(request.method))) {
+        throw new Error('Writer ownership is busy; no Goal mutation was sent.')
+      }
+    }
+    assertAllowed()
+    const explicitBudget = Object.prototype.hasOwnProperty.call(intent, 'tokenBudget')
+    // Only the typed in-process middleware context can authorize budget writes.
+    const allowed = method === 'thread/goal/set' ? ['threadId', 'objective', 'status', 'tokenBudget', 'ownerConfirmed'] : ['threadId', 'ownerConfirmed']
+    if (Object.keys(intent).some(key => !allowed.includes(key))) return fail(explicitBudget && !ownerAuthorized ? 403 : 400, 'Unknown or unauthorized Goal mutation fields')
+    const objectivePresent = Object.prototype.hasOwnProperty.call(intent, 'objective')
+    const objective = typeof intent.objective === 'string' ? intent.objective.trim() : ''
+    if (objectivePresent && !objective) return fail(400, 'A nonempty objective is required to create or replace a Goal')
+    const statuses = ['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']
+    if (Object.prototype.hasOwnProperty.call(intent, 'status') && (typeof intent.status !== 'string' || !statuses.includes(intent.status))) return fail(400, 'Invalid Goal status')
+    const sqliteHome = this.activeSQLiteHome
+    const lastTurnStart = () => this.getStreamEvents(threadId, STREAM_EVENT_BUFFER_LIMIT).filter(event => event.method === 'turn/started').at(-1)
+    const turnStartBefore = lastTurnStart()
+    await assertThreadProjectionIntegrity(getCodexHomeDir(), threadId, sqliteHome)
+    assertAllowed()
+    if (this.activeSQLiteHome !== sqliteHome) throw new Error('SQLite home changed while verifying history; no Goal mutation was sent.')
     await this.ensureInitialized()
-    return this.call(method, params)
+    assertAllowed()
+    if (this.confirmedSQLiteHome !== sqliteHome) {
+      const config = asRecord(asRecord(await this.call('config/read', { includeLayers: false }, generation))?.config)
+      assertAllowed()
+      const effective = readNonEmptyString(config?.sqlite_home)
+      if (!effective || resolve(effective) !== sqliteHome) throw new Error('Cannot verify effective SQLite home; active writer preserved.')
+      this.confirmedSQLiteHome = sqliteHome
+    }
+    const nonnegativeFinite = (value: unknown): boolean => typeof value === 'number' && Number.isFinite(value) && value >= 0
+    const validGoal = (goal: Record<string, unknown>): boolean => goal.threadId === threadId
+      && typeof goal.objective === 'string' && !!goal.objective.trim() && typeof goal.status === 'string' && statuses.includes(goal.status)
+      && typeof goal.tokensUsed === 'number' && Number.isSafeInteger(goal.tokensUsed) && goal.tokensUsed >= 0
+      && nonnegativeFinite(goal.timeUsedSeconds) && nonnegativeFinite(goal.createdAt) && nonnegativeFinite(goal.updatedAt)
+      && (goal.tokenBudget === null || (typeof goal.tokenBudget === 'number' && Number.isSafeInteger(goal.tokenBudget) && goal.tokenBudget > 0))
+    let before: Record<string, unknown> | null = null
+    let nativeParams: Readonly<Record<string, unknown>> = Object.freeze({ threadId })
+    let expectedStatus: unknown
+    let expectedObjective: unknown
+    {
+      const response = asRecord(await this.call('thread/goal/get', { threadId }, generation))
+      assertAllowed()
+      const current = asRecord(response?.goal)
+      if (!response || !Object.prototype.hasOwnProperty.call(response, 'goal') || (response.goal !== null && (!current || !validGoal(current)))) return fail(502, 'Invalid Goal identity, metadata, or accounting; no mutation was sent')
+      before = current ? Object.freeze({ ...current }) : null
+    }
+    if (method === 'thread/goal/set') {
+      if (explicitBudget && !ownerAuthorized) return fail(403, 'Owner authorization is required to adjust a goal budget')
+    if (explicitBudget && (typeof intent.tokenBudget !== 'number' || !Number.isSafeInteger(intent.tokenBudget) || intent.tokenBudget <= 0)) return fail(400, 'tokenBudget must be an explicit finite positive safe integer')
+    if (explicitBudget && intent.ownerConfirmed !== true) return fail(400, 'Explicit owner confirmation is required to set a goal budget')
+      if (!before && (!explicitBudget || !ownerAuthorized || !objective)) return fail(400, 'A new Goal requires an owner-confirmed finite token budget and a nonempty objective')
+      expectedObjective = objectivePresent ? objective : before?.objective
+      expectedStatus = intent.status ?? before?.status ?? 'active'
+      if (!explicitBudget && expectedStatus === 'active' && before?.tokenBudget === null) return fail(400, 'Rearming a Goal requires an owner-confirmed finite token budget')
+      if (explicitBudget && (intent.tokenBudget as number) <= (before?.tokensUsed as number ?? 0)) return fail(400, 'tokenBudget must be greater than tokensUsed')
+      const { ownerConfirmed: _confirmation, ...capturedNative } = intent
+      const native: Record<string, unknown> = { ...capturedNative }
+      if (objectivePresent) native.objective = objective
+      // An unchanged objective in the active editor pause is a status-only write.
+      if (!explicitBudget && intent.status === 'paused' && objectivePresent && objective === before?.objective) delete native.objective
+      nativeParams = Object.freeze(native)
+    }
+    const activePause = method === 'thread/goal/set' && !!before && !explicitBudget && intent.status === 'paused'
+      && (!objectivePresent || objective === before.objective)
+    const idleRead = asRecord(await this.call('thread/read', { threadId, includeTurns: false }, generation))
+    assertAllowed()
+    const thread = asRecord(idleRead?.thread)
+    if (thread?.id !== threadId || (asRecord(thread?.status)?.type !== 'idle' && !(activePause && asRecord(thread?.status)?.type === 'inProgress'))
+      || lastTurnStart() !== turnStartBefore) throw new Error('Thread mutation requires an idle owned writer; no mutation was sent.')
+    const permit = Object.freeze({})
+    this.goalWritePermits.set(permit, { method, params: nativeParams, generation, lease, assertAllowed })
+    let result: unknown
+    try { result = await this.call(method, nativeParams, generation, lease, permit) }
+    finally { this.goalWritePermits.delete(permit) }
+    assertAllowed()
+    const afterResponse = asRecord(await this.call('thread/goal/get', { threadId }, generation))
+    assertAllowed()
+    if (method === 'thread/goal/clear') {
+      if (!afterResponse || !Object.prototype.hasOwnProperty.call(afterResponse, 'goal') || afterResponse.goal !== null) return fail(502, 'Goal clear failed post-write verification; no retry or repair was sent')
+      return result
+    }
+    const after = asRecord(afterResponse?.goal)
+    const cap = explicitBudget ? intent.tokenBudget : before?.tokenBudget
+    const exhaustedNormalization = !explicitBudget && expectedStatus === 'active' && typeof cap === 'number' && cap <= (before?.tokensUsed as number) && after?.status === 'budgetLimited'
+    if (!after || !validGoal(after) || (after.status !== expectedStatus && !exhaustedNormalization)
+      || after.objective !== expectedObjective || after.tokenBudget !== cap
+      || after.tokensUsed !== (before?.tokensUsed ?? 0) || after.timeUsedSeconds !== (before?.timeUsedSeconds ?? 0)
+      || (before && after.createdAt !== before.createdAt)) return fail(502, 'Goal update failed post-write verification; no retry or repair was sent')
+    if (explicitBudget) {
+      await appendGoalBudgetAuditRecord(getCodexHomeDir(), {
+        event: 'goal_budget_adjusted', atIso: new Date().toISOString(), threadId, actor: 'owner', source: 'codex-web',
+        previousStatus: typeof before?.status === 'string' ? before.status : '',
+        previousTotalBudget: typeof before?.tokenBudget === 'number' ? before.tokenBudget : null,
+        previousTokensUsed: before?.tokensUsed as number ?? 0, requestedTotalBudget: intent.tokenBudget as number,
+        resultingStatus: after.status as string, resultingTotalBudget: after.tokenBudget as number, resultingTokensUsed: after.tokensUsed as number,
+      })
+      assertAllowed()
+    }
+    return result
+  }
+
+  async withThreadGoalMutation<T>(threadId: string, mutate: (rpc: (method: string, params: unknown) => Promise<unknown>, assertAllowed: () => void) => Promise<T>): Promise<T> {
+    if (!threadId || threadId !== threadId.trim() || this.goalMutationsByThreadId.has(threadId)) throw new Error('Goal mutation is busy; no competing mutation was sent.')
+    const generation = this.process
+    const lease = {}
+    const assertAllowed = (): void => {
+      this.disposeIfConfigChanged()
+      if (!generation || this.process !== generation || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId)
+        || this.configChangeDeferred || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size
+        || this.goalMutationsByThreadId.get(threadId) !== lease) throw new Error('Goal mutation requires current proven writer ownership; no mutation was sent.')
+    }
+    this.goalMutationsByThreadId.set(threadId, lease)
+    let pendingOperation: Promise<unknown> | null = null
+    try {
+      assertAllowed()
+      let operationPending = false
+      const rpc = async (method: string, params: unknown): Promise<unknown> => {
+        if (!['thread/goal/get', 'thread/goal/set', 'thread/goal/clear'].includes(method) || asRecord(params)?.threadId !== threadId) throw new Error('Goal lease target mismatch')
+        assertAllowed()
+        if (operationPending) throw new Error('Goal mutation is busy; no concurrent scoped operation was sent.')
+        operationPending = true
+        try {
+          const intent = Object.freeze({ ...(asRecord(params) ?? {}) })
+          pendingOperation = ['thread/goal/set', 'thread/goal/clear'].includes(method)
+            ? this.mutateGoalUnderLease(method, this.captureGoalIntent(method, intent), false, lease, assertAllowed)
+            : this.rpcInner(method, intent, lease)
+          const result = await pendingOperation
+          assertAllowed()
+          return result
+        } finally { operationPending = false }
+      }
+      const result = await mutate(rpc, assertAllowed)
+      await pendingOperation
+      assertAllowed()
+      return result
+    } finally {
+      // A callback returning/throwing is not transport cancellation. Drain the bounded RPC
+      // before release so another mutation cannot enter during native write/post-read.
+      try { await (pendingOperation as Promise<unknown> | null)?.catch(() => {}) }
+      finally { if (this.goalMutationsByThreadId.get(threadId) === lease) this.goalMutationsByThreadId.delete(threadId) }
+    }
+  }
+
+  private async rpcInner(method: string, params: unknown, goalLease?: object): Promise<unknown> {
+    if (this.process && this.timedOutRpcIds.size) throw new Error('Codex still has an unresolved timed-out operation; no retry was sent and active writers were preserved.')
+    const record = params && typeof params === 'object' ? params as Record<string, unknown> : null
+    const threadId = typeof record?.threadId === 'string' ? record.threadId.trim() : ''
+    const goalMutation = ['thread/goal/set', 'thread/goal/clear'].includes(method)
+    if (goalMutation) return this.mutateGoal(method, params)
+    if (this.goalMutationsByThreadId.has(threadId) && !goalLease && ['turn/start', 'thread/resume', 'thread/rollback', 'thread/archive', 'thread/unsubscribe'].includes(method)) throw new Error('Goal mutation is busy; no competing mutation was sent.')
+    const directMutation = ['thread/goal/set', 'thread/goal/clear', 'turn/interrupt', 'thread/rollback'].includes(method)
+    const mutationProcess = this.process
+    const assertDirectMutationOwnership = (): void => {
+      if (!directMutation) return
+      if (!threadId || record?.threadId !== threadId || !mutationProcess || this.process !== mutationProcess
+        || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId)) {
+        throw new Error('Thread mutation requires proven writer ownership; no mutation or acquisition was sent.')
+      }
+      this.disposeIfConfigChanged()
+      if (method !== 'turn/interrupt' && this.configChangeDeferred) throw new Error('App-server configuration change is deferred until writer shutdown is confirmed; no mutation was sent.')
+      if (method !== 'turn/interrupt' && [...this.pending.values()].some(request => ['thread/resume', 'thread/start', 'turn/start', 'thread/rollback'].includes(request.method))) {
+        throw new Error('Writer ownership is busy; no mutation was sent.')
+      }
+    }
+    assertDirectMutationOwnership()
+    this.disposeIfConfigChanged()
+    const preparedConfig = this.process ? undefined : this.buildAppServerConfig()
+    const inspectedSQLiteHome = this.process ? this.activeSQLiteHome : preparedConfig?.sqliteHome
+    if (threadId && (directMutation || method === 'thread/resume' || method === 'thread/read' || method === 'thread/turns/list' || method === 'turn/start')) {
+      await assertThreadProjectionIntegrity(getCodexHomeDir(), threadId, inspectedSQLiteHome)
+    }
+    assertDirectMutationOwnership()
+    if (this.process && this.activeSQLiteHome !== inspectedSQLiteHome) throw new Error('SQLite home changed while verifying history; retry the bounded read. No mutation was sent.')
+    const safeWhileDeferred = new Set(['thread/read', 'thread/turns/list', 'thread/list', 'thread/loaded/list', 'config/read', 'turn/interrupt', 'thread/unsubscribe'])
+    if (this.configChangeDeferred && !safeWhileDeferred.has(method) && method !== 'thread/resume') {
+      throw new Error('App-server configuration change is deferred until attached writers are explicitly released; no mutation was sent.')
+    }
+    if (this.configChangeDeferred && method === 'thread/resume' && !this.joinedThreads.has(threadId)) {
+      throw new Error('App-server configuration change is deferred until attached writers are explicitly released; no acquisition was sent.')
+    }
+    if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
+    this.start(preparedConfig)
+    const rpcProcess = this.process!
+    await this.ensureInitialized()
+    assertDirectMutationOwnership()
+    if (threadId && (directMutation || ['thread/resume', 'thread/read', 'thread/turns/list', 'turn/start', 'thread/rollback'].includes(method))) {
+      if (this.confirmedSQLiteHome !== this.activeSQLiteHome) {
+        if (!this.sqliteHomeVerificationPromise) {
+          this.sqliteHomeVerificationPromise = this.call('config/read', { includeLayers: false }, rpcProcess).then(payload => {
+            const effective = readNonEmptyString(asRecord(asRecord(payload)?.config)?.sqlite_home)
+            if (!effective || resolve(effective) !== this.activeSQLiteHome) throw new Error('Cannot verify effective SQLite home: config/requirements differs from inspected directory; active writer preserved.')
+            this.confirmedSQLiteHome = this.activeSQLiteHome
+          }).finally(() => { this.sqliteHomeVerificationPromise = null })
+        }
+        await this.sqliteHomeVerificationPromise
+      }
+    }
+    // The connection already observes this writer. A hot resume cannot apply overrides and
+    // unnecessarily runs another persistence/listener barrier in Codex's serial RPC handler.
+    // Use the supported bounded read APIs without releasing subscriptions or active writers.
+    if (method === 'thread/resume' && threadId && this.joinedThreads.has(threadId)) {
+      if (record?.excludeTurns !== true) throw new Error('Loaded thread history requires bounded pagination; active writer preserved.')
+      const summary = asRecord(await this.call('thread/read', { threadId, includeTurns: false }, rpcProcess))
+      const thread = asRecord(summary?.thread)
+      if (!thread) throw new Error('Thread metadata was not returned; active writer preserved.')
+      const previous = asRecord(this.joinedThreads.get(threadId))
+      const pageParams = asRecord(record?.initialTurnsPage)
+      const initialTurnsPage = pageParams
+        ? await this.call('thread/turns/list', {
+          threadId,
+          ...pageParams,
+          limit: Math.min(THREAD_RESPONSE_TURN_LIMIT, Math.max(1, Number(pageParams.limit) || THREAD_RESPONSE_TURN_LIMIT)),
+        }, rpcProcess)
+        : undefined
+      return {
+        ...previous,
+        thread: { ...thread, turns: [] },
+        model: readNonEmptyString(previous?.model) || readNonEmptyString(thread.model),
+        modelProvider: readNonEmptyString(previous?.modelProvider),
+        initialTurnsPage,
+      }
+    }
+    const page = method === 'thread/resume' ? asRecord(record?.initialTurnsPage) : null
+    let boundedParams = page ? { ...record, initialTurnsPage: { ...page, limit: Math.min(THREAD_RESPONSE_TURN_LIMIT, Math.max(1, Number(page.limit) || THREAD_RESPONSE_TURN_LIMIT)) } } : params
+    if (directMutation && method !== 'turn/interrupt') {
+      assertDirectMutationOwnership()
+      const lastTurnStart = () => this.getStreamEvents(threadId, STREAM_EVENT_BUFFER_LIMIT).filter(event => event.method === 'turn/started').at(-1)
+      const turnStartBeforeRead = lastTurnStart()
+      const idleRead = asRecord(await this.call('thread/read', { threadId, includeTurns: false }, rpcProcess))
+      const thread = asRecord(idleRead?.thread)
+      if (thread?.id !== threadId || asRecord(thread?.status)?.type !== 'idle' || lastTurnStart() !== turnStartBeforeRead) {
+        throw new Error('Thread mutation requires an idle owned writer; no mutation was sent.')
+      }
+    }
+    assertDirectMutationOwnership()
+    const result = await this.call(method, boundedParams, rpcProcess, goalLease)
+    if (this.process !== rpcProcess) throw new Error('codex app-server changed while completing RPC; retry the request')
+    if (method === 'thread/resume' || method === 'thread/start') {
+      const resultThreadId = readNonEmptyString(asRecord(asRecord(result)?.thread)?.id)
+      if (resultThreadId) {
+        const { thread: _thread, initialTurnsPage: _page, turnsBackwardsCursor: _turnsCursor, itemsBackwardsCursor: _itemsCursor, ...runtimeMetadata } = asRecord(result) ?? {}
+        this.joinedThreads.set(resultThreadId, runtimeMetadata)
+        this.writerThreadIds.add(resultThreadId)
+      }
+    } else if (method === 'thread/unsubscribe' || method === 'thread/archive') {
+      this.joinedThreads.delete(threadId)
+    }
+    return result
   }
 
   onNotification(listener: (value: { method: string; params: unknown }) => void): () => void {
@@ -6584,8 +7178,34 @@ class AppServerProcess {
     return Array.from(this.pendingServerRequests.values())
   }
 
+  async withThreadQueueMutation<T>(threadIds: string[], mutate: () => Promise<T>): Promise<T> {
+    if (threadIds.some(id => !this.process || !this.joinedThreads.has(id))) throw new Error('Queue changes require proven writer ownership; read-only queues were preserved.')
+    if (this.configChangeDeferred || this.pending.size || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size) throw new Error('Writer ownership is busy or configuration change is deferred; queues were preserved.')
+    for (const id of threadIds) this.fileMutationsByThreadId.add(id)
+    try { return await mutate() } finally { for (const id of threadIds) this.fileMutationsByThreadId.delete(id) }
+  }
+
+  async withThreadFileMutation<T>(threadId: string, mutate: (assertMutationAllowed: (threadReadResult?: unknown) => void) => Promise<T>): Promise<T> {
+    if (!this.process || !this.joinedThreads.has(threadId)) throw new Error('Thread file changes require proven writer ownership; no files were changed.')
+    if (this.pending.size || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size) throw new Error('Writer ownership is busy or uncertain; no files were changed.')
+    const mutationProcess = this.process
+    this.fileMutationsByThreadId.add(threadId)
+    try {
+      const result = asRecord(await this.rpc('thread/read', { threadId, includeTurns: false }))
+      const assertMutationAllowed = (threadReadResult: unknown = result): void => {
+        const status = asRecord(asRecord(asRecord(threadReadResult)?.thread)?.status)
+        if (this.process !== mutationProcess || !this.joinedThreads.has(threadId) || status?.type !== 'idle') throw new Error('Writer ownership is not idle; no files were changed.')
+        if (this.configChangeDeferred) throw new Error('App-server configuration change is deferred until writer shutdown is confirmed; no files were changed.')
+        if (this.pending.size || this.timedOutRpcIds.size || !this.fileMutationsByThreadId.has(threadId) || this.fileMutationsByThreadId.size !== 1) throw new Error('Writer ownership is busy or uncertain; no files were changed.')
+      }
+      assertMutationAllowed()
+      return await mutate(assertMutationAllowed)
+    } finally { this.fileMutationsByThreadId.delete(threadId) }
+  }
+
   dispose(): void {
     if (!this.process) return
+    if (this.writerThreadIds.size || this.joinedThreads.size || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size || [...this.pending.values()].some(request => ['thread/resume', 'thread/start', 'turn/start', 'thread/rollback'].includes(request.method))) return
 
     const proc = this.process
     this.stopping = true
@@ -6704,7 +7324,10 @@ export class BackendQueueProcessor {
         if (await this.hasQueuedTurns(threadId)) {
           this.scheduleThreadQueueDrain(threadId)
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof TurnProviderMismatchError) {
+          console.warn('[codex] queued turn provider mismatch:', error.message)
+        }
         await this.restoreQueuedTurn(next)
         this.scheduleThreadQueueDrain(threadId)
       }
@@ -6766,44 +7389,7 @@ export class BackendQueueProcessor {
     })
   }
 
-  private async resolveCollaborationModeSettings(mode: CollaborationModeKind): Promise<ResolvedCollaborationModeSettings> {
-    let currentConfig: Record<string, unknown> | null = null
-    try {
-      const configPayload = asRecord(await this.appServer.rpc('config/read', {}))
-      currentConfig = asRecord(configPayload?.config)
-    } catch {
-      currentConfig = null
-    }
-
-    const configuredModel = readNonEmptyString(currentConfig?.model)
-    if (configuredModel) {
-      return {
-        model: configuredModel,
-        reasoningEffort: normalizeCollaborationModeReasoningEffort(normalizeReasoningEffort(currentConfig?.model_reasoning_effort)),
-      }
-    }
-
-    try {
-      const modelsPayload = asRecord(await this.appServer.rpc('model/list', {}))
-      const models = Array.isArray(modelsPayload?.data) ? modelsPayload.data : []
-      for (const row of models) {
-        const record = asRecord(row)
-        const candidate = readNonEmptyString(record?.id) || readNonEmptyString(record?.model)
-        if (candidate) {
-          return {
-            model: candidate,
-            reasoningEffort: normalizeCollaborationModeReasoningEffort(normalizeReasoningEffort(currentConfig?.model_reasoning_effort)),
-          }
-        }
-      }
-    } catch {
-      // Fall through to no collaboration-mode payload.
-    }
-
-    throw new Error(`${mode === 'plan' ? 'Plan' : 'Default'} mode requires an available model.`)
-  }
-
-  private async buildQueuedTurnParams(turn: BackendQueuedTurn): Promise<Record<string, unknown>> {
+  private buildQueuedTurnParams(turn: BackendQueuedTurn, settings: CurrentTurnRoutingSettings): Record<string, unknown> {
     const localImageAttachments: StoredQueuedMessage['fileAttachments'] = []
     for (const imageUrl of turn.message.imageUrls) {
       const localImagePath = extractLocalImagePathFromUrl(imageUrl.trim())
@@ -6842,31 +7428,33 @@ export class BackendQueueProcessor {
     const params: Record<string, unknown> = {
       threadId: turn.threadId,
       input,
-    }
-    if (dedupedFileAttachments.length > 0) {
-      params.attachments = dedupedFileAttachments.map((f) => ({ label: f.label, path: f.path, fsPath: f.fsPath }))
-    }
-
-    try {
-      const settings = await this.resolveCollaborationModeSettings(turn.message.collaborationMode)
-      params.collaborationMode = {
+      model: settings.model,
+      collaborationMode: {
         mode: turn.message.collaborationMode,
         settings: {
           model: settings.model,
           reasoning_effort: settings.reasoningEffort,
           developer_instructions: null,
         },
-      }
-    } catch {
-      // Older app-server versions still accept a plain turn/start without collaborationMode.
+      },
+    }
+    if (dedupedFileAttachments.length > 0) {
+      params.attachments = dedupedFileAttachments.map((f) => ({ label: f.label, path: f.path, fsPath: f.fsPath }))
     }
 
     return params
   }
 
   private async startQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
-    await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
-    await this.appServer.rpc('turn/start', await this.buildQueuedTurnParams(turn))
+    const settings = await resolveCurrentTurnRoutingSettings(this.appServer)
+    const resumed = await this.appServer.rpc('thread/resume', {
+      threadId: turn.threadId,
+      modelProvider: settings.modelProvider,
+      model: settings.model,
+      excludeTurns: true,
+    })
+    assertResumedTurnProvider(resumed, turn.threadId, settings.modelProvider)
+    await this.appServer.rpc('turn/start', this.buildQueuedTurnParams(turn, settings))
   }
 }
 
@@ -6981,6 +7569,10 @@ class MethodCatalog {
     this.notificationCache = methods
     return methods
   }
+}
+
+export type CodexBridgeOptions = {
+  isOwnerAuthorized?: (req: IncomingMessage) => boolean
 }
 
 type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
@@ -7110,7 +7702,7 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
   return { docsById }
 }
 
-export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
+export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): CodexBridgeMiddleware {
   const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
@@ -7640,6 +8232,18 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 	          return
 	        }
 
+	        if (body.method === 'thread/goal/set' || body.method === 'thread/goal/clear') {
+	          try {
+	            const result = await appServer.mutateGoal(body.method, body.params, { ownerAuthorized: options.isOwnerAuthorized?.(req) === true })
+	            setJson(res, 200, { result })
+	          } catch (error) {
+	            const status = asRecord(error)?.goalPolicyStatus
+	            if (typeof status !== 'number') throw error
+	            setJson(res, status, { error: getErrorMessage(error, 'Goal mutation failed') })
+	          }
+	          return
+	        }
+
 	        if (body.method === 'generate-thread-title') {
 	          setJson(res, 200, { result: { title: '' } })
 	          return
@@ -7899,6 +8503,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             return
           }
 
+          await appServer.withThreadFileMutation(threadId, async (assertMutationAllowed) => {
           const threadReadResult = await appServer.rpc('thread/read', { threadId, includeTurns: true })
           const record = asRecord(threadReadResult)
           const thread = asRecord(record?.thread)
@@ -7943,6 +8548,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             return
           }
 
+          // Callback history/session reads can outlive the original writer check.
+          // Revalidate synchronously after those awaits, immediately before project mutation.
+          assertMutationAllowed(threadReadResult)
           if (action === 'redo') {
             const result = await applyTurnFileChanges(cwd, turnInfos, patchIds)
             setJson(res, 200, { ...result, changed: result.applied, message: `Reapplied ${result.applied} file change(s)` })
@@ -7951,8 +8559,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
           const result = await revertTurnFileChanges(cwd, turnInfos, patchIds)
           setJson(res, 200, { ...result, changed: result.reverted, message: `Reverted ${result.reverted} file change(s)` })
+          })
         } catch (error) {
-          setJson(res, 500, { error: getErrorMessage(error, 'Failed to revert file changes') })
+          setJson(res, 409, { error: getErrorMessage(error, 'Failed to revert file changes') })
         }
         return
       }
@@ -8061,7 +8670,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                   const orderedIds = currentModel && ids.includes(currentModel)
                     ? [currentModel, ...ids.filter((id) => id !== currentModel)]
                     : ids
-                  setJson(res, 200, { data: orderedIds, exclusive: true, source: 'custom' })
+                  setJson(res, 200, { data: orderedIds, models: await addRuntimeLocalReasoning(appServer, normalizeProviderModelMetadata(json), 'custom_endpoint', fmState.customBaseUrl), exclusive: true, source: 'custom' })
                   return
                 }
               } catch {
@@ -8694,7 +9303,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           setJson(res, 400, { error: 'Invalid body: expected object' })
           return
         }
-        await writeThreadQueueState(normalizeThreadQueueState(record))
+        const nextQueue = normalizeThreadQueueState(record)
+        try {
+          await withThreadQueueStateUpdate(
+            () => ({ nextState: nextQueue, result: undefined }),
+            (currentState, commit) => {
+              const changedThreadIds = [...new Set([...Object.keys(currentState), ...Object.keys(nextQueue)])].filter(id => JSON.stringify(currentState[id] ?? []) !== JSON.stringify(nextQueue[id] ?? []))
+              return appServer.withThreadQueueMutation(changedThreadIds, commit)
+            },
+          )
+        } catch (error) {
+          setJson(res, 409, { error: getErrorMessage(error, 'Queue writer ownership could not be verified') })
+          return
+        }
         void backendQueueProcessor.scheduleAllQueuedThreads()
         setJson(res, 200, { ok: true })
         return

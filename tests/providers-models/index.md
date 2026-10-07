@@ -37,4 +37,6 @@ Return to the [manual test index](../../tests.md).
 | [Zen automatic per-model routing](zen-hybrid-routing.md) |
 | [9Router server-configured provider](ninerouter-server-configured-provider.md) |
 | [Startup provider refresh deduplication](startup-provider-refresh-deduplication.md) |
-| [NineRouter advertised model capabilities](ninerouter-model-capabilities.md) |
+| [NineRouter model capabilities and context](ninerouter-model-capabilities.md) |
+| [Audited native local Ultra and strict custom metadata](exact-sol-local-ultra.md) |
+| [Writer-owned Goal mutation and finite budget policy](goal-writer-policy.md) |

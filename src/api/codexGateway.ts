@@ -232,6 +232,7 @@ export type ThreadGoalSetInput = {
   objective?: string
   status?: ThreadGoalStatus
   tokenBudget?: number | null
+  ownerConfirmed?: boolean
 }
 
 export type ComposerFileSuggestion = {
@@ -273,15 +274,36 @@ export async function setThreadGoal(threadId: string, input: ThreadGoalSetInput)
   const params: Record<string, unknown> = { threadId: normalizedThreadId }
   if (input.objective?.trim()) params.objective = input.objective.trim()
   if (input.status) params.status = input.status
-  params.tokenBudget = Object.prototype.hasOwnProperty.call(input, 'tokenBudget') ? input.tokenBudget : null
+  if (Object.prototype.hasOwnProperty.call(input, 'tokenBudget')) {
+    if (input.ownerConfirmed !== true) throw new Error('Explicit owner confirmation is required to set a goal budget')
+    params.tokenBudget = input.tokenBudget
+    params.ownerConfirmed = true
+  }
   const payload = await callRpc<{ goal?: unknown }>('thread/goal/set', params)
   const goal = normalizeThreadGoal(payload.goal)
   if (!goal) throw new Error('thread/goal/set response was malformed')
   return goal
 }
 
-export async function resumeThreadGoal(threadId: string): Promise<ThreadGoal> {
-  return setThreadGoal(threadId, { status: 'active', tokenBudget: null })
+// Recovery is a deliberate owner budget adjustment, never an unlimited or usage-reset shortcut.
+export async function resumeThreadGoal(threadId: string, tokenBudget: number, ownerConfirmed = false): Promise<ThreadGoal> {
+  if (!ownerConfirmed) throw new Error('Explicit owner confirmation is required to adjust the total budget')
+  if (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0) {
+    throw new Error('Recovery requires an explicit finite positive integer total budget')
+  }
+  if (!await getGoalBudgetOwnerAuthorization()) throw new Error('Owner authorization is required to adjust the total budget')
+  const before = await getThreadGoal(threadId)
+  if (before && before.threadId !== threadId.trim()) throw new Error('Goal response belongs to a different thread')
+  if (!before || before.status !== 'budgetLimited') throw new Error('Recovery requires an existing budget-limited Goal')
+  if (tokenBudget <= before.tokensUsed) throw new Error('Total token budget must be greater than consumed usage')
+  if (tokenBudget === before.tokenBudget) throw new Error('Owner budget adjustment is required; the unchanged budget cannot resume this Goal')
+  const after = await setThreadGoal(threadId, { status: 'active', tokenBudget, ownerConfirmed })
+  if (after.threadId !== before.threadId || after.status !== 'active' || after.tokenBudget !== tokenBudget
+    || after.objective !== before.objective || after.tokensUsed !== before.tokensUsed
+    || after.timeUsedSeconds !== before.timeUsedSeconds || after.createdAt !== before.createdAt) {
+    throw new Error('Goal recovery failed durable accounting preservation verification')
+  }
+  return after
 }
 
 export async function clearThreadGoal(threadId: string): Promise<boolean> {
@@ -289,6 +311,17 @@ export async function clearThreadGoal(threadId: string): Promise<boolean> {
   if (!normalizedThreadId) return false
   const payload = await callRpc<{ cleared?: unknown }>('thread/goal/clear', { threadId: normalizedThreadId })
   return payload.cleared === true
+}
+
+export async function getGoalBudgetOwnerAuthorization(): Promise<boolean> {
+  try {
+    const response = await fetch('/codex-api/owner/authorization')
+    if (!response.ok) return false
+    const payload = await response.json() as { authorized?: unknown }
+    return payload.authorized === true
+  } catch {
+    return false
+  }
 }
 
 const DEFAULT_COLLABORATION_MODE_OPTIONS: CollaborationModeOption[] = [
@@ -542,7 +575,15 @@ export function pickCodexRateLimitSnapshot(payload: unknown): UiRateLimitSnapsho
   return normalizeRateLimitSnapshot(record.rateLimits ?? record.rate_limits)
 }
 
+const readOnlyThreadIds = new Set<string>()
+function assertThreadMutationAllowed(threadId: string): void {
+  if (readOnlyThreadIds.has(threadId)) throw new Error('This thread is read-only because another active writer owns it; no mutation was sent.')
+}
+
 async function callRpc<T>(method: string, params?: unknown): Promise<T> {
+  const threadId = readString(asRecord(params)?.threadId) ?? ''
+  const reads = new Set(['thread/resume', 'thread/read', 'thread/turns/list', 'thread/fork', 'thread/goal/get'])
+  if (threadId && !reads.has(method)) assertThreadMutationAllowed(threadId)
   try {
     return await rpcCall<T>(method, params)
   } catch (error) {
@@ -757,7 +798,7 @@ async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
   return normalizeThreadSummaryV2(payload)
 }
 
-async function getThreadDetailV2(threadId: string): Promise<{
+async function getThreadDetailV2(threadId: string, options: ThreadResumeOptions = {}): Promise<{
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -771,6 +812,8 @@ async function getThreadDetailV2(threadId: string): Promise<{
     threadId,
     excludeTurns: true,
     initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' },
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
   })
   const turns = [...(payload.initialTurnsPage?.data ?? [])].reverse()
   const normalizedPayload = { thread: { ...payload.thread, turns } } as ThreadReadResponse
@@ -848,9 +891,9 @@ export async function getThreadSummary(threadId: string): Promise<UiThread> {
   }
 }
 
-export async function getThreadDetail(threadId: string): Promise<ResumedThread> {
+export async function getThreadDetail(threadId: string, options: ThreadResumeOptions = {}): Promise<ResumedThread> {
   try {
-    return await getThreadDetailV2(threadId)
+    return await getThreadDetailV2(threadId, options)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load thread ${threadId}`, 'thread/read')
   }
@@ -1482,6 +1525,7 @@ export async function removeAccount(storageId: string): Promise<AccountsListResu
 }
 
 export type ResumedThread = {
+  readOnly?: boolean
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -1495,6 +1539,10 @@ export type ResumedThread = {
 const RESUME_THREAD_COALESCE_TTL_MS = 30_000
 const recentResumeThreadById = new Map<string, Promise<ResumedThread>>()
 
+export function invalidateThreadResumeCache(): void {
+  recentResumeThreadById.clear()
+}
+
 function isMissingLegacyCustomEndpointProvider(error: unknown): boolean {
   return error instanceof Error
     && /model provider [`']custom_endpoint[`'] not found/iu.test(error.message)
@@ -1505,8 +1553,30 @@ function isThreadOwnedByAnotherWriter(error: unknown): boolean {
     && /thread .+ already has an active writer/iu.test(error.message)
 }
 
-export async function resumeThread(threadId: string): Promise<ResumedThread> {
-  const existing = recentResumeThreadById.get(threadId)
+async function getReadOnlyThreadDetailV2(threadId: string): Promise<ResumedThread> {
+  const summary = await callRpc<ThreadReadResponse>('thread/read', { threadId, includeTurns: false })
+  const page = await callRpc<ThreadTurnsListResponse>('thread/turns/list', {
+    threadId, limit: 10, sortDirection: 'desc', itemsView: 'full',
+  })
+  const normalizedPayload = { thread: { ...summary.thread, turns: [...page.data].reverse() } } as ThreadReadResponse
+  return {
+    readOnly: true,
+    model: normalizeThreadModelFromPayload(summary) || readString(asRecord(summary.thread)?.model) || '',
+    modelProvider: normalizeThreadModelProviderFromPayload(summary),
+    messages: normalizeThreadMessagesV2(normalizedPayload),
+    inProgress: readThreadInProgressFromResponse(summary),
+    activeTurnId: readActiveTurnIdFromResponse(summary),
+    hasMoreOlder: Boolean(page.nextCursor),
+    olderCursor: page.nextCursor,
+    turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
+  }
+}
+
+export type ThreadResumeOptions = { model?: string; modelProvider?: string }
+
+export async function resumeThread(threadId: string, options: ThreadResumeOptions = {}): Promise<ResumedThread> {
+  const resumeKey = JSON.stringify([threadId, options.model ?? '', normalizeRuntimeProviderId(options.modelProvider ?? '')])
+  const existing = recentResumeThreadById.get(resumeKey)
   if (existing) return existing
 
   const promise = (async (): Promise<ResumedThread> => {
@@ -1515,42 +1585,24 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
       threadId,
       excludeTurns: true,
       initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' },
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
     }
     try {
       payload = await callRpc<ThreadResumeResponse>('thread/resume', params)
     } catch (error) {
-      if (isThreadOwnedByAnotherWriter(error)) {
-        const summary = await callRpc<ThreadReadResponse>('thread/read', { threadId, includeTurns: false })
-        const page = await callRpc<ThreadTurnsListResponse>('thread/turns/list', {
-          threadId,
-          limit: 10,
-          sortDirection: 'desc',
-          itemsView: 'full',
-        })
-        const normalizedPayload = { thread: { ...summary.thread, turns: [...page.data].reverse() } } as ThreadReadResponse
-        return {
-          model: normalizeThreadModelFromPayload(summary),
-          modelProvider: normalizeThreadModelProviderFromPayload(summary),
-          messages: normalizeThreadMessagesV2(normalizedPayload),
-          inProgress: readThreadInProgressFromResponse(summary),
-          activeTurnId: readActiveTurnIdFromResponse(summary),
-          hasMoreOlder: Boolean(page.nextCursor),
-          olderCursor: page.nextCursor,
-          turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
-        }
-      }
-      if (!isMissingLegacyCustomEndpointProvider(error)) throw error
+      if (isThreadOwnedByAnotherWriter(error)) return getReadOnlyThreadDetailV2(threadId)
+      if (options.modelProvider || !isMissingLegacyCustomEndpointProvider(error)) throw error
       try {
         payload = await callRpc<ThreadResumeResponse>('thread/resume', {
           ...params,
-          // Codex 0.147 removed the legacy custom_endpoint provider name. The
-          // top-level openai_base_url configuration continues to route OpenAI
-          // requests to the configured compatible endpoint.
+          // Legacy callers without an explicit routing policy retain their compatibility retry.
+          // Explicit global provider requests must never silently switch to OpenAI.
           modelProvider: 'openai',
         })
       } catch (retryError) {
         if (!isThreadOwnedByAnotherWriter(retryError)) throw retryError
-        return { ...await getThreadDetailV2(threadId) }
+        return getReadOnlyThreadDetailV2(threadId)
       }
     }
     const turns = [...(payload.initialTurnsPage?.data ?? [])].reverse()
@@ -1568,19 +1620,23 @@ export async function resumeThread(threadId: string): Promise<ResumedThread> {
       olderCursor,
       turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
     }
-  })()
+  })().then(result => {
+    if (result.readOnly === true) readOnlyThreadIds.add(threadId)
+    else readOnlyThreadIds.delete(threadId)
+    return result
+  })
 
-  recentResumeThreadById.set(threadId, promise)
+  recentResumeThreadById.set(resumeKey, promise)
   const hardEvictionTimer = globalThis.setTimeout(() => {
-    if (recentResumeThreadById.get(threadId) === promise) {
-      recentResumeThreadById.delete(threadId)
+    if (recentResumeThreadById.get(resumeKey) === promise) {
+      recentResumeThreadById.delete(resumeKey)
     }
   }, RESUME_THREAD_COALESCE_TTL_MS)
   void promise.finally(() => {
     globalThis.clearTimeout(hardEvictionTimer)
     globalThis.setTimeout(() => {
-      if (recentResumeThreadById.get(threadId) === promise) {
-        recentResumeThreadById.delete(threadId)
+      if (recentResumeThreadById.get(resumeKey) === promise) {
+        recentResumeThreadById.delete(resumeKey)
       }
     }, 2000)
   }).catch(() => undefined)
@@ -1609,6 +1665,7 @@ export async function updateThreadFileChanges(
   scope?: 'single_turn' | 'turn_and_later',
 ): Promise<{ changed: number; errors: string[]; message?: string; revertedPatchIds?: string[]; appliedPatchIds?: string[] }> {
   try {
+    assertThreadMutationAllowed(threadId)
     const response = await fetch('/codex-api/thread/rollback-files', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2046,9 +2103,21 @@ export async function setCustomProvider(
   return await response.json() as { ok: boolean }
 }
 
+function normalizeRuntimeProviderId(providerId: string): string {
+  const normalized = providerId.trim().toLowerCase().replace(/_/g, '-')
+  if (normalized === 'custom' || normalized === 'custom-endpoint') return 'custom_endpoint'
+  if (normalized === 'codex' || normalized === 'openai') return 'openai'
+  if (normalized === 'opencode-zen') return 'opencode_zen'
+  if (normalized === 'openrouter' || normalized === 'openrouter-free') return 'openrouter_free'
+  return providerId.trim()
+}
+
 async function fetchProviderModelIds(providerId?: string): Promise<{ ids: string[], exclusive: boolean; models?: ZenModelMetadata[] } | null> {
   try {
-    const normalizedProviderId = providerId?.trim() ?? ''
+    const providerAlias = providerId?.trim().toLowerCase().replace(/_/g, '-') ?? ''
+    const normalizedProviderId = providerAlias === 'custom' || providerAlias === 'custom-endpoint'
+      ? 'custom_endpoint'
+      : providerId?.trim() ?? ''
     const url = normalizedProviderId
       ? `/codex-api/provider-models?provider=${encodeURIComponent(normalizedProviderId)}`
       : '/codex-api/provider-models'
@@ -2084,6 +2153,12 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
 
   options.onMetadata?.(providerModels?.models ?? [])
 
+  if (options.requireProviderModels && !providerModels) {
+    throw new Error(`Failed to refresh model catalog for ${options.providerId || 'active provider'}`)
+  }
+  if (options.requireProviderModels && providerModels?.ids.length === 0) {
+    throw new Error(`Model catalog for ${options.providerId || 'active provider'} is empty or unavailable`)
+  }
   if (providerModels?.exclusive || options.requireProviderModels) {
     return providerModels?.ids ?? []
   }
@@ -2610,6 +2685,9 @@ export async function getThreadQueueState(): Promise<ThreadQueueState> {
 }
 
 export async function setThreadQueueState(nextState: ThreadQueueState): Promise<void> {
+  // Whole-state replacement can delete an omitted read-only queue too.
+  if (readOnlyThreadIds.size) throw new Error('Queue state contains a read-only thread; no replacement was sent.')
+  for (const threadId of Object.keys(nextState)) assertThreadMutationAllowed(threadId)
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
