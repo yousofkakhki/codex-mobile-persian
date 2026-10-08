@@ -11,6 +11,7 @@ const { EventEmitter } = require('node:events');
 const { createRequire } = require('node:module');
 const { createHash } = require('node:crypto');
 import { test, expect, vi, afterEach } from 'vitest';
+import { applyAppServerPermissionDefaults, readAppServerPermissionIntent, readAppServerPermissionDefaults, prepareAppServerHotPermissionOverrides, mergeAppServerHotPermissionOverrides } from './appServerPermissionDefaults';
 import { Readable, Writable } from 'node:stream';
 import { createCodexBridgeMiddleware } from './codexAppServerBridge';
 import { appendGoalBudgetAuditRecord } from './goalBudgetAudit';
@@ -51,6 +52,11 @@ function fixture(options = {}) {
   }
   const context = vm.createContext({
     spawn: fakeSpawn,
+    applyAppServerPermissionDefaults,
+    readAppServerPermissionIntent,
+    readAppServerPermissionDefaults,
+    prepareAppServerHotPermissionOverrides,
+    mergeAppServerHotPermissionOverrides,
     appendGoalBudgetAuditRecord,
     queueMicrotask,
     resolve: path.resolve,

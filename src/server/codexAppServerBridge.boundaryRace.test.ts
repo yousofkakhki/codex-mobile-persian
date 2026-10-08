@@ -1,6 +1,7 @@
 // @ts-nocheck
 // Exact source routes with synthetic child I/O and memory-only file operations.
 import { test } from 'vitest';
+import { applyAppServerPermissionDefaults, readAppServerPermissionIntent, readAppServerPermissionDefaults, prepareAppServerHotPermissionOverrides, mergeAppServerHotPermissionOverrides } from './appServerPermissionDefaults';
 import { createRequire as makeRequire } from 'node:module';
 const require = makeRequire(import.meta.url);
 const fs=require('node:fs');const vm=require('node:vm');const path=require('node:path');const assert=require('node:assert/strict');const {EventEmitter}=require('node:events');const {createRequire}=require('node:module');const ts=createRequire(path.join(process.cwd(),'package.json'))('typescript');const source=fs.readFileSync(path.join(process.cwd(),'src/server/codexAppServerBridge.ts'),'utf8');const originalClass=source.slice(source.indexOf('class AppServerProcess {'),source.indexOf('\nexport class BackendQueueProcessor',source.indexOf('class AppServerProcess {')));const js=ts.transpileModule(originalClass+'\nglobalThis.ExtractedAppServerProcess=AppServerProcess;', {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.None}}).outputText;
@@ -23,6 +24,11 @@ function fixture(options = {}) {
   }
   const context = vm.createContext({
     spawn: fakeSpawn,
+    applyAppServerPermissionDefaults,
+    readAppServerPermissionIntent,
+    readAppServerPermissionDefaults,
+    prepareAppServerHotPermissionOverrides,
+    mergeAppServerHotPermissionOverrides,
     queueMicrotask,
     resolve: path.resolve,
     THREAD_RESPONSE_TURN_LIMIT: 10,

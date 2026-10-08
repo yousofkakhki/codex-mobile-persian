@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import { EventEmitter } from 'node:events'
 import { createContext, runInContext } from 'node:vm'
 import { appendGoalBudgetAuditRecord } from './goalBudgetAudit'
+import { applyAppServerPermissionDefaults, readAppServerPermissionIntent, readAppServerPermissionDefaults, prepareAppServerHotPermissionOverrides, mergeAppServerHotPermissionOverrides } from './appServerPermissionDefaults'
 const ts = createRequire(import.meta.url)('typescript')
 const source = readFileSync(resolve('src/server/codexAppServerBridge.ts'), 'utf8')
 const begin = source.indexOf('class AppServerProcess {')
@@ -31,6 +32,7 @@ export async function createGoalPolicyFixture(nativeRpc, threadId) {
   } }
   child.kill = () => { throw Error('Fixture must preserve writer') }
   const context = createContext({ spawn: () => child, queueMicrotask, resolve, join,
+    applyAppServerPermissionDefaults, readAppServerPermissionIntent, readAppServerPermissionDefaults, prepareAppServerHotPermissionOverrides, mergeAppServerHotPermissionOverrides,
     THREAD_RESPONSE_TURN_LIMIT: 10, STREAM_EVENT_BUFFER_LIMIT: 200,
     assertThreadProjectionIntegrity: async () => {},
     asRecord: value => value && typeof value === 'object' && !Array.isArray(value) ? value : null,

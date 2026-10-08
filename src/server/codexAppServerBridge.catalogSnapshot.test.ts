@@ -11,6 +11,7 @@ const { EventEmitter } = require('node:events');
 const { createRequire } = require('node:module');
 const { createHash } = require('node:crypto');
 import { test } from 'vitest';
+import { applyAppServerPermissionDefaults, readAppServerPermissionIntent, readAppServerPermissionDefaults, prepareAppServerHotPermissionOverrides, mergeAppServerHotPermissionOverrides } from './appServerPermissionDefaults';
 const repo = process.cwd();
 const sourcePath = path.join(repo, 'src/server/codexAppServerBridge.ts');
 const ts = createRequire(path.join(repo, 'package.json'))('typescript');
@@ -49,6 +50,11 @@ function fixture() {
   }
   const context = vm.createContext({
     spawn: fakeSpawn,
+    applyAppServerPermissionDefaults,
+    readAppServerPermissionIntent,
+    readAppServerPermissionDefaults,
+    prepareAppServerHotPermissionOverrides,
+    mergeAppServerHotPermissionOverrides,
     asRecord: value => value && typeof value === 'object' && !Array.isArray(value) ? value : null,
     readNonEmptyString: value => typeof value === 'string' && value.trim() ? value : '',
     buildAppServerArgs: () => ['app-server', '-c', `fixture_revision=${revision}`],
