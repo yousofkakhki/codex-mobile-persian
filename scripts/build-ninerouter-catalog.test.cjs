@@ -19,3 +19,20 @@ test('fails closed for unrecognized descriptors and binary formats',()=>{
  const binary=Buffer.from('prefix'+JSON.stringify(data,null,2)+'suffix')
  assert.deepEqual(extractBundledCatalog(binary),data)
 })
+test('does not postpone compaction when a gateway advertises a larger context', () => {
+ const bundled={models:[{slug:'gpt-5.6-sol',context_window:272000,auto_compact_token_limit:null}]}
+ const output=buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000}]})
+ assert.equal(output.models[1].context_window,1050000)
+ assert.equal(output.models[1].auto_compact_token_limit,244800)
+ assert.equal(bundled.models[0].auto_compact_token_limit,null)
+})
+test('preserves explicit compaction limits and clamps them to smaller gateway windows', () => {
+ const bundled={models:[{slug:'gpt-5.6-sol',context_window:272000,auto_compact_token_limit:180000}]}
+ const output=buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000},{id:'cx/gpt-5.6-sol',context_length:100000}]})
+ assert.equal(output.models[1].auto_compact_token_limit,180000)
+ assert.equal(output.models[2].auto_compact_token_limit,90000)
+})
+test('rejects descriptors without a valid native context for safe compaction', () => {
+ const bundled={models:[{slug:'gpt-5.6-sol',context_window:null}]}
+ assert.throws(()=>buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000}]}))
+})
