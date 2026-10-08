@@ -58,6 +58,26 @@ If you are using a provider or AI gateway that is already authenticated and do n
 npx @brutalstrikedevs/codexapp --no-login
 ```
 
+### Execution permissions: YOLO by default
+
+The app uses `danger-full-access` with approval policy `never` by default. These defaults are applied explicitly to new threads, cold resumes and the next user-started turn of an already loaded thread, so older saved permissions do not unexpectedly restore command-approval prompts. Merely opening an already loaded thread remains a bounded read; it does not change an active turn or restart its writer.
+
+**Warning:** this disables Codex command approval and sandbox isolation. The agent can access the filesystem and network with the privileges of the account running the app. This is not permission to ignore project instructions, business/publication approvals, authentication or Goal budgets.
+
+To run with restricted defaults instead:
+
+```bash
+npx @brutalstrikedevs/codexapp --sandbox-mode workspace-write --approval-policy on-request
+```
+
+The equivalent environment overrides are `CODEXUI_SANDBOX_MODE=workspace-write` and `CODEXUI_APPROVAL_POLICY=on-request`. Explicit per-request sandbox, approval or named-permission-profile choices are preserved rather than replaced by YOLO defaults. Accepted explicit choices remain sticky for that loaded writer; closing it or replacing the app-server ends this in-memory intent tracking. A restrictive saved thread remains restricted when resumed with an explicit restrictive choice; an ordinary cold resume without a choice follows the app's configured defaults. To retain restrictions across process restarts without repeating per-request choices, configure restricted deployment defaults.
+
+Changing defaults does not answer requests that are already awaiting approval. Input sent while a turn is running can steer that turn; it does not replace the active permission snapshot. The updated policy applies when a new turn is constructed. Existing V2 children retain their current permissions; the app does not bypass their native ownership rules. Newly spawned children use the permission snapshot of the parent turn that creates them, so a mid-turn change requires a fresh parent turn before new children can inherit it.
+
+Bundled community OpenRouter credentials are not included in this source. Supply an operator-owned key through provider settings to use OpenRouter; key-pool rotation is unavailable. Source cleanup does not revoke credentials or remove their exposure from older Git history.
+
+See the [permission regression checklist](tests/cli-network-platform/default-yolo-thread-permissions.md) for isolated verification and cleanup.
+
 ### Linux 🐧
 ```bash
 node -v   # should be 22.16.0+

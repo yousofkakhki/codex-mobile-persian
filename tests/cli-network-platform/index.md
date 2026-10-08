@@ -18,9 +18,10 @@ Return to the [manual test index](../../tests.md).
 | [Feature: Tunnel auto mode follows Tailscale IP detection](tunnel-auto-mode-follows-tailscale-ip-detection.md) |
 | [Feature: Reverse tunnel login is required unless request is trusted local or Tailscale](reverse-tunnel-login-is-required-unless-request-is-trusted-local-or-tailscale.md) |
 | [Feature: Cloudflare tunnel QR omits password auto-login path](cloudflare-tunnel-qr-omits-password-auto-login-path.md) |
-| [Feature: Default runtime uses workspace-write sandbox with on-request approvals](default-runtime-uses-workspace-write-sandbox-with-on-request-approvals.md) |
+| [Regression: Explicit restricted runtime uses workspace-write with on-request approvals](default-runtime-uses-workspace-write-sandbox-with-on-request-approvals.md) |
 | [Feature: Windows npx install no longer depends on legacy PTY package](windows-npx-install-no-longer-depends-on-legacy-pty-package.md) |
 | [Feature: Default runtime uses unrestricted sandbox and no approvals](default-runtime-uses-unrestricted-sandbox-and-no-approvals.md) |
+| [Feature: Default YOLO covers new, resumed and subsequent turns](default-yolo-thread-permissions.md) |
 | [Feature: npm run dev exports unrestricted runtime defaults](npm-run-dev-exports-unrestricted-runtime-defaults.md) |
 | [Feature: npm run dev2 uses a random Codex home](npm-run-dev2-uses-random-codex-home.md) |
 | [Feature: npm run dev uses CLI server on Android](npm-run-dev-uses-cli-server-on-android.md) |
