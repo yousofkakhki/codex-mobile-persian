@@ -63,13 +63,19 @@ function buildCatalog(bundled, advertised, nativeCatalog) {
     if (nativeEfforts === false || nativeEfforts && !nativeEfforts.has(nativeWire)) continue
     const template = nativeExact ?? bySlug.get(slug) ?? (family ? bySlug.get(`gpt-5.6-${family[1]}`) : null)
     if (!template) continue
+    const nativeContext = template.context_window
+    if (!Number.isSafeInteger(nativeContext) || nativeContext <= 0) continue
+    const nativeCompactionLimit = Number.isSafeInteger(template.auto_compact_token_limit)
+      && template.auto_compact_token_limit > 0
+      ? template.auto_compact_token_limit
+      : Math.floor(nativeContext * 0.9)
     const model = structuredClone(template)
     model.slug = row.id
     model.display_name = row.id
     model.context_window = context
     model.max_context_window = context
-    model.auto_compact_token_limit = null
-    model.prefer_websockets = false
+    model.auto_compact_token_limit = Math.min(nativeCompactionLimit, Math.floor(context * 0.9))
+    model.prefer_websockets = false // The local gateway accepts streamed HTTP Responses.
     model.visibility = 'list'
     const explicit = row.supportedReasoningEfforts ?? row.supported_reasoning_efforts ?? row.thinkingLevels
     const efforts = Array.isArray(explicit)
