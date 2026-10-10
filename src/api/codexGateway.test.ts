@@ -200,6 +200,7 @@ describe('getThreadDetail', () => {
       const body = typeof init?.body === 'string'
         ? JSON.parse(init.body) as { method: string; params: Record<string, unknown> }
         : { method: '', params: {} }
+      if (body.method === 'thread/items/list') return new Response(JSON.stringify({ result: { data: [], nextCursor: null, backwardsCursor: null } }), { status: 200 })
       expect(body.method).toBe('thread/resume')
       return new Response(JSON.stringify({
         result: {
@@ -595,7 +596,7 @@ describe('resumeThread', () => {
           turnsBackwardsCursor: 'head-cursor-fallback',
         } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
       }
-      return new Response(JSON.stringify({ result: {} }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      return new Response(JSON.stringify({ result: { data: [], nextCursor: null, backwardsCursor: null } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }))
     const resumed = await resumeThread('paged-thread')
     expect(requests[0]).toEqual({
@@ -603,10 +604,10 @@ describe('resumeThread', () => {
       params: {
         threadId: 'paged-thread',
         excludeTurns: true,
-        initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' },
+        initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' },
       },
     })
-    expect(resumed.olderCursor).toBe('initial-older-page-cursor')
+    expect(resumed.olderCursor).toBe('item-history:{"items":null,"turns":"initial-older-page-cursor"}')
     expect(resumed.hasMoreOlder).toBe(true)
   })
 
@@ -659,7 +660,7 @@ describe('resumeThread', () => {
 
     expect(results.every((result) => result.status === 'rejected')).toBe(true)
     expect(requests).toEqual([
-      { method: 'thread/resume', params: { threadId: 'missing-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
+      { method: 'thread/resume', params: { threadId: 'missing-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' } } },
     ])
   })
 
@@ -676,6 +677,7 @@ describe('resumeThread', () => {
           headers: { 'Content-Type': 'application/json' },
         })
       }
+      if (body.method === 'thread/items/list') return new Response(JSON.stringify({ result: { data: [], nextCursor: null, backwardsCursor: null } }), { status: 200 })
       return new Response(JSON.stringify({
         result: { model: 'gpt-5.6-terra', modelProvider: 'openai', thread: { turns: [] } },
       }), {
@@ -688,8 +690,9 @@ describe('resumeThread', () => {
       modelProvider: 'openai',
     })
     expect(requests).toEqual([
-      { method: 'thread/resume', params: { threadId: 'legacy-custom-endpoint-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
-      { method: 'thread/resume', params: { threadId: 'legacy-custom-endpoint-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' }, modelProvider: 'openai' } },
+      { method: 'thread/resume', params: { threadId: 'legacy-custom-endpoint-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' } } },
+      { method: 'thread/resume', params: { threadId: 'legacy-custom-endpoint-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' }, modelProvider: 'openai' } },
+      { method: 'thread/items/list', params: { threadId: 'legacy-custom-endpoint-thread', limit: 100, sortDirection: 'desc' } },
     ])
   })
 
@@ -715,9 +718,10 @@ describe('resumeThread', () => {
 
     await expect(resumeThread('shared-thread')).resolves.toMatchObject({ modelProvider: 'openai' })
     expect(requests).toEqual([
-      { method: 'thread/resume', params: { threadId: 'shared-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
+      { method: 'thread/resume', params: { threadId: 'shared-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' } } },
       { method: 'thread/read', params: { threadId: 'shared-thread', includeTurns: false } },
-      { method: 'thread/turns/list', params: { threadId: 'shared-thread', limit: 10, sortDirection: 'desc', itemsView: 'full' } },
+      { method: 'thread/turns/list', params: { threadId: 'shared-thread', limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' } },
+      { method: 'thread/items/list', params: { threadId: 'shared-thread', limit: 100, sortDirection: 'desc' } },
     ])
   })
 
@@ -741,8 +745,8 @@ describe('resumeThread', () => {
     const retried = resumeThread('stalled-thread')
     expect(retried).not.toBe(first)
     expect(requests).toEqual([
-      { method: 'thread/resume', params: { threadId: 'stalled-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
-      { method: 'thread/resume', params: { threadId: 'stalled-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' } } },
+      { method: 'thread/resume', params: { threadId: 'stalled-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' } } },
+      { method: 'thread/resume', params: { threadId: 'stalled-thread', excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' } } },
     ])
   })
 })

@@ -18,11 +18,15 @@ import type {
   ThreadListResponse,
   ThreadReadResponse,
   ThreadResumeResponse,
+  ThreadItemsListResponse,
+  ThreadItemEntry,
   ThreadStartResponse,
   ThreadTurnsListResponse,
+  TurnsPage,
   Turn,
 } from './appServerDtos'
 import { extractErrorMessage, normalizeCodexApiError } from './codexErrors'
+import { mergeThreadTurnOrder } from '../utils/threadHistory'
 import {
   readActiveTurnIdFromResponse,
   normalizeThreadGroupsV2,
@@ -582,7 +586,7 @@ function assertThreadMutationAllowed(threadId: string): void {
 
 async function callRpc<T>(method: string, params?: unknown): Promise<T> {
   const threadId = readString(asRecord(params)?.threadId) ?? ''
-  const reads = new Set(['thread/resume', 'thread/read', 'thread/turns/list', 'thread/fork', 'thread/goal/get'])
+  const reads = new Set(['thread/resume', 'thread/read', 'thread/turns/list', 'thread/items/list', 'thread/fork', 'thread/goal/get'])
   if (threadId && !reads.has(method)) assertThreadMutationAllowed(threadId)
   try {
     return await rpcCall<T>(method, params)
@@ -750,6 +754,90 @@ function normalizeSpeedMode(value: unknown): SpeedMode {
 
 const INITIAL_THREAD_LIST_LIMIT = 50
 const BACKGROUND_THREAD_LIST_LIMIT = 100
+const THREAD_ITEM_PAGE_LIMIT = 100
+const THREAD_HEADER_PAGE_LIMIT = 10
+const ITEM_HISTORY_CURSOR_PREFIX = 'item-history:'
+
+type ItemHistoryCursor = {
+  items: string | null
+  turns: string | null
+}
+
+function encodeItemHistoryCursor(items: string | null, turns: string | null): string | null {
+  return items || turns ? `${ITEM_HISTORY_CURSOR_PREFIX}${JSON.stringify({ items, turns })}` : null
+}
+
+function decodeItemHistoryCursor(cursor: string): ItemHistoryCursor {
+  const parsed = JSON.parse(cursor.slice(ITEM_HISTORY_CURSOR_PREFIX.length)) as ItemHistoryCursor
+  if (!parsed || ![parsed.items, parsed.turns].every(value => value === null || typeof value === 'string')) {
+    throw new Error('Invalid thread item history cursor')
+  }
+  return parsed
+}
+
+function isItemPaginationUnsupported(error: unknown): boolean {
+  return error instanceof Error && /(?:method not found|unknown (?:method|variant)|unsupported method).*thread\/items\/list|thread\/items\/list.*(?:not found|unsupported)|(?:not supported|unsupported).*item pagination|item pagination.*(?:not supported|unsupported)/iu.test(error.message)
+}
+
+function buildItemHistoryTurns(headers: Turn[], entries: ThreadItemEntry[]): Turn[] {
+  const turnsById = new Map(headers.map(turn => [turn.id, { ...turn, items: [] } as Turn]))
+  const itemTurnIds: string[] = []
+  for (const entry of [...entries].reverse()) {
+    let turn = turnsById.get(entry.turnId)
+    if (!turn) {
+      turn = { id: entry.turnId, items: [], itemsView: 'full', status: 'completed', error: null, startedAt: null, completedAt: null, durationMs: null }
+      turnsById.set(entry.turnId, turn)
+    }
+    if (!itemTurnIds.includes(entry.turnId)) itemTurnIds.push(entry.turnId)
+    turn.items.push(entry.item)
+    turn.itemsView = 'full'
+  }
+  return mergeThreadTurnOrder(itemTurnIds, headers.map(turn => turn.id)).map(turnId => turnsById.get(turnId)!)
+}
+
+async function readThreadItemsPage(threadId: string, cursor?: string): Promise<ThreadItemsListResponse> {
+  const page = await callRpc<ThreadItemsListResponse>('thread/items/list', {
+    threadId,
+    limit: THREAD_ITEM_PAGE_LIMIT,
+    sortDirection: 'desc',
+    ...(cursor ? { cursor } : {}),
+  })
+  if (!Array.isArray(page.data)) throw new Error('Thread item page did not include items')
+  return page
+}
+
+async function buildRecentThreadDetail(
+  threadId: string,
+  payload: ThreadResumeResponse | ThreadReadResponse,
+  suppliedHeaders?: TurnsPage,
+): Promise<ResumedThread> {
+  let page = suppliedHeaders ?? ('initialTurnsPage' in payload ? payload.initialTurnsPage : null)
+  let turns = [...(page?.data ?? payload.thread.turns ?? [])].reverse()
+  let olderCursor = page?.nextCursor ?? null
+  try {
+    const itemsPage = await readThreadItemsPage(threadId)
+    turns = buildItemHistoryTurns(turns, itemsPage.data)
+    olderCursor = encodeItemHistoryCursor(itemsPage.nextCursor, page?.nextCursor ?? null)
+  } catch (error) {
+    if (!isItemPaginationUnsupported(error)) throw error
+    page = await callRpc<ThreadTurnsListResponse>('thread/turns/list', {
+      threadId, limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'full',
+    })
+    turns = [...page.data].reverse()
+    olderCursor = page.nextCursor
+  }
+  const normalizedPayload = { thread: { ...payload.thread, turns } } as ThreadReadResponse
+  return {
+    model: normalizeThreadModelFromPayload(payload),
+    modelProvider: normalizeThreadModelProviderFromPayload(payload),
+    messages: normalizeThreadMessagesV2(normalizedPayload),
+    inProgress: readThreadInProgressFromResponse(normalizedPayload),
+    activeTurnId: readActiveTurnIdFromResponse(normalizedPayload),
+    hasMoreOlder: Boolean(olderCursor),
+    olderCursor,
+    turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
+  }
+}
 
 export type ThreadGroupsPage = {
   groups: UiProjectGroup[]
@@ -811,29 +899,35 @@ async function getThreadDetailV2(threadId: string, options: ThreadResumeOptions 
   const payload = await callRpc<ThreadResumeResponse>('thread/resume', {
     threadId,
     excludeTurns: true,
-    initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' },
+    initialTurnsPage: { limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded' },
     ...(options.model ? { model: options.model } : {}),
     ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
   })
-  const turns = [...(payload.initialTurnsPage?.data ?? [])].reverse()
-  const normalizedPayload = { thread: { ...payload.thread, turns } } as ThreadReadResponse
-  const messages = normalizeThreadMessagesV2(normalizedPayload)
-  const olderCursor = payload.initialTurnsPage
-    ? payload.initialTurnsPage.nextCursor
-    : payload.turnsBackwardsCursor
-  return {
-    model: normalizeThreadModelFromPayload(payload),
-    modelProvider: normalizeThreadModelProviderFromPayload(payload),
-    messages,
-    inProgress: readThreadInProgressFromResponse(payload),
-    activeTurnId: readActiveTurnIdFromResponse(payload),
-    hasMoreOlder: Boolean(olderCursor),
-    turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
-    olderCursor,
-  }
+  return buildRecentThreadDetail(threadId, payload)
 }
 
 async function getOlderThreadMessagesV2(threadId: string, cursor: string, limit = 10): Promise<ThreadTurnPage> {
+  if (cursor.startsWith(ITEM_HISTORY_CURSOR_PREFIX)) {
+    const historyCursor = decodeItemHistoryCursor(cursor)
+    const [itemsPage, headersPage] = await Promise.all([
+      historyCursor.items ? readThreadItemsPage(threadId, historyCursor.items) : null,
+      historyCursor.turns ? callRpc<ThreadTurnsListResponse>('thread/turns/list', {
+        threadId, cursor: historyCursor.turns, limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded',
+      }) : null,
+    ])
+    const turns = buildItemHistoryTurns([...(headersPage?.data ?? [])].reverse(), itemsPage?.data ?? [])
+    const normalizedPayload = { thread: { turns } } as ThreadReadResponse
+    const nextCursor = encodeItemHistoryCursor(itemsPage?.nextCursor ?? null, headersPage?.nextCursor ?? null)
+    return {
+      messages: normalizeThreadMessagesV2(normalizedPayload),
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: Boolean(nextCursor),
+      startTurnIndex: 0,
+      turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
+      nextCursor,
+    }
+  }
   const params = new URLSearchParams({ threadId, cursor, limit: String(limit) })
   const response = await fetch(`/codex-api/thread-turn-page?${params.toString()}`)
   if (!response.ok) throw new Error(`Older thread page request failed with ${response.status}`)
@@ -1556,19 +1650,13 @@ function isThreadOwnedByAnotherWriter(error: unknown): boolean {
 async function getReadOnlyThreadDetailV2(threadId: string): Promise<ResumedThread> {
   const summary = await callRpc<ThreadReadResponse>('thread/read', { threadId, includeTurns: false })
   const page = await callRpc<ThreadTurnsListResponse>('thread/turns/list', {
-    threadId, limit: 10, sortDirection: 'desc', itemsView: 'full',
+    threadId, limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded',
   })
-  const normalizedPayload = { thread: { ...summary.thread, turns: [...page.data].reverse() } } as ThreadReadResponse
+  const detail = await buildRecentThreadDetail(threadId, summary, page)
   return {
+    ...detail,
     readOnly: true,
-    model: normalizeThreadModelFromPayload(summary) || readString(asRecord(summary.thread)?.model) || '',
-    modelProvider: normalizeThreadModelProviderFromPayload(summary),
-    messages: normalizeThreadMessagesV2(normalizedPayload),
-    inProgress: readThreadInProgressFromResponse(summary),
-    activeTurnId: readActiveTurnIdFromResponse(summary),
-    hasMoreOlder: Boolean(page.nextCursor),
-    olderCursor: page.nextCursor,
-    turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
+    model: detail.model || readString(asRecord(summary.thread)?.model) || '',
   }
 }
 
@@ -1584,7 +1672,7 @@ export async function resumeThread(threadId: string, options: ThreadResumeOption
     const params = {
       threadId,
       excludeTurns: true,
-      initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' },
+      initialTurnsPage: { limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded' },
       ...(options.model ? { model: options.model } : {}),
       ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
     }
@@ -1605,21 +1693,7 @@ export async function resumeThread(threadId: string, options: ThreadResumeOption
         return getReadOnlyThreadDetailV2(threadId)
       }
     }
-    const turns = [...(payload.initialTurnsPage?.data ?? [])].reverse()
-    const normalizedPayload = { thread: { ...payload.thread, turns } } as ThreadReadResponse
-    const olderCursor = payload.initialTurnsPage
-      ? payload.initialTurnsPage.nextCursor
-      : payload.turnsBackwardsCursor
-    return {
-      model: normalizeThreadModelFromPayload(payload),
-      modelProvider: normalizeThreadModelProviderFromPayload(payload),
-      messages: normalizeThreadMessagesV2(normalizedPayload),
-      inProgress: readThreadInProgressFromResponse(payload),
-      activeTurnId: readActiveTurnIdFromResponse(payload),
-      hasMoreOlder: Boolean(olderCursor),
-      olderCursor,
-      turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
-    }
+    return buildRecentThreadDetail(threadId, payload)
   })().then(result => {
     if (result.readOnly === true) readOnlyThreadIds.add(threadId)
     else readOnlyThreadIds.delete(threadId)

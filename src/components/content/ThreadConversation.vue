@@ -3,7 +3,7 @@
     <p v-if="isLoading" class="conversation-loading">Loading messages...</p>
 
     <p
-      v-else-if="messages.length === 0 && pendingRequests.length === 0 && !liveOverlay"
+      v-else-if="messages.length === 0 && pendingRequests.length === 0 && !liveOverlay && !hasMorePersistedAbove"
       class="conversation-empty"
     >
       No messages in this thread yet.
