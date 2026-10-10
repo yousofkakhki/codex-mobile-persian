@@ -242,7 +242,7 @@ export type ComposerFileSuggestion = {
   path: string
 }
 
-function normalizeThreadGoal(value: unknown): ThreadGoal | null {
+export function normalizeThreadGoal(value: unknown): ThreadGoal | null {
   const record = asRecord(value)
   if (!record) return null
   const threadId = readString(record.threadId)
@@ -277,7 +277,8 @@ export async function setThreadGoal(threadId: string, input: ThreadGoalSetInput)
   const params: Record<string, unknown> = { threadId: normalizedThreadId }
   if (input.objective?.trim()) params.objective = input.objective.trim()
   if (input.status) params.status = input.status
-  params.tokenBudget = Object.prototype.hasOwnProperty.call(input, 'tokenBudget') ? input.tokenBudget : null
+  if (Object.prototype.hasOwnProperty.call(input, 'tokenBudget')) params.tokenBudget = input.tokenBudget
+  else if (input.objective?.trim()) params.tokenBudget = null
   const payload = await callRpc<{ goal?: unknown }>('thread/goal/set', params)
   const goal = normalizeThreadGoal(payload.goal)
   if (!goal) throw new Error('thread/goal/set response was malformed')

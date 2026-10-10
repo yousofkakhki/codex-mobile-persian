@@ -18,6 +18,9 @@ const gatewayMocks = vi.hoisted(() => ({
   getAvailableCollaborationModes: vi.fn(),
   getAvailableModelIds: vi.fn(),
   getCurrentModelConfig: vi.fn(),
+  getThreadGoal: vi.fn(),
+  setThreadGoal: vi.fn(),
+  clearThreadGoal: vi.fn(),
   getPendingServerRequests: vi.fn(),
   getSkillsList: vi.fn(),
   getThreadDetail: vi.fn(),
@@ -792,6 +795,52 @@ describe('thread-scoped speed mode', () => {
     } finally {
       state.stopPolling()
     }
+  })
+})
+
+describe('goal command routing', () => {
+  it('handles goal controls without starting a normal turn or queueing them', async () => {
+    installTestWindow()
+    const state = useDesktopState()
+    state.primeSelectedThread('goal-route')
+    gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'goal-route', objective: 'Synthetic goal', status: 'active' })
+    gatewayMocks.getThreadGoal.mockResolvedValue(null)
+    gatewayMocks.clearThreadGoal.mockResolvedValue(true)
+    await state.sendMessageToSelectedThread('/goal Synthetic goal')
+    await state.sendMessageToSelectedThread('/goal pause')
+    await state.sendMessageToSelectedThread('/goal resume')
+    await state.sendMessageToSelectedThread('/goal')
+    await state.sendMessageToSelectedThread('/goal clear')
+    expect(gatewayMocks.setThreadGoal.mock.calls).toEqual([
+      ['goal-route', { objective: 'Synthetic goal', status: 'active', tokenBudget: null }],
+      ['goal-route', { status: 'paused' }],
+      ['goal-route', { status: 'active' }],
+    ])
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.setThreadQueueState).not.toHaveBeenCalled()
+  })
+
+  it('creates a thread for an objective without a synthetic user turn or interrupt gate', async () => {
+    installTestWindow()
+    const state = useDesktopState()
+    state.primeSelectedThread('')
+    gatewayMocks.startThread.mockResolvedValue({ threadId: 'new-goal', model: 'cx/gpt-6.1-sol', modelProvider: 'ninerouter' })
+    gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'new-goal', objective: 'Synthetic objective', status: 'active' })
+    expect(await state.sendMessageToNewThread('/goal Synthetic objective', '/tmp/fixture')).toBe('new-goal')
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.isSelectedThreadInterruptPending.value).toBe(false)
+    expect(state.messages.value).toEqual([])
+  })
+
+  it('preserves file and skill references inside the goal objective without a normal turn', async () => {
+    installTestWindow()
+    const state = useDesktopState()
+    state.primeSelectedThread('goal-files')
+    gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'goal-files', objective: 'Fixture', status: 'active' })
+    await state.sendMessageToSelectedThread('/goal Inspect the fixture', [], [{ name: 'fixture-skill', path: '/tmp/SKILL.md' }], 'queue', [{ label: 'handoff', path: '/tmp/HANDOFF.md', fsPath: '/tmp/HANDOFF.md' }])
+    expect(gatewayMocks.setThreadGoal.mock.calls.at(-1)?.[1].objective).toContain('File handoff: /tmp/HANDOFF.md')
+    expect(gatewayMocks.setThreadGoal.mock.calls.at(-1)?.[1].objective).toContain('Skill $fixture-skill: /tmp/SKILL.md')
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
   })
 })
 

@@ -613,13 +613,12 @@ async function startServer(options: {
     if (tunnelChild && !tunnelChild.killed) {
       tunnelChild.kill('SIGTERM')
     }
+    const disposing = Promise.resolve(dispose())
     server.close(() => {
-      dispose()
-      process.exit(0)
+      void disposing.then(() => process.exit(0), () => process.exit(1))
     })
     // Force exit after timeout
     setTimeout(() => {
-      dispose()
       process.exit(1)
     }, 5000).unref()
   }

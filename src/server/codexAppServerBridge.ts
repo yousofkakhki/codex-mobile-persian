@@ -50,6 +50,9 @@ import {
   handleCustomEndpointProxyRequest,
 } from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
+import { ActivityStore } from './activityStore.js'
+import { ActivityRecorder } from './activityRecorder.js'
+import { handleActivityRoutes } from './activityRoutes.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
@@ -5251,6 +5254,7 @@ function normalizeThreadQueueState(value: unknown): ThreadQueueState {
 }
 
 let threadQueueMutationChain: Promise<unknown> = Promise.resolve()
+let recordQueueActivity: ((previous: ThreadQueueState, next: ThreadQueueState) => void) | null = null
 
 async function readThreadQueueState(): Promise<ThreadQueueState> {
   const statePath = getCodexGlobalStatePath()
@@ -5288,6 +5292,7 @@ async function withThreadQueueStateUpdate<T>(
     const currentState = await readThreadQueueState()
     const { nextState, result } = await update(currentState)
     await writeThreadQueueStateUnlocked(nextState)
+    recordQueueActivity?.(currentState, nextState)
     return result
   })
   threadQueueMutationChain = run.catch(() => {})
@@ -6043,6 +6048,9 @@ const MERGEABLE_ITEM_TYPES = new Set([
 ])
 
 class AppServerProcess {
+  private activityRecorder: ActivityRecorder | null = null
+
+  setActivityRecorder(recorder: ActivityRecorder): void { this.activityRecorder = recorder }
   private process: ChildProcessWithoutNullStreams | null = null
   private initialized = false
   private initializePromise: Promise<void> | null = null
@@ -6204,6 +6212,7 @@ class AppServerProcess {
   }
 
   private emitNotification(notification: { method: string; params: unknown }): void {
+    this.activityRecorder?.notification(notification)
     this.recordStreamEvent(notification)
     this.captureItemFromNotification(notification)
     const nThreadId = this.extractThreadIdFromParams(notification.params)
@@ -6428,6 +6437,7 @@ class AppServerProcess {
         id: requestId,
         method: pendingRequest.method,
         threadId,
+        decision: reply.error ? 'error' : readNonEmptyString(asRecord(reply.result)?.decision) || 'submitted',
         mode: 'manual',
         resolvedAtIso: new Date().toISOString(),
       },
@@ -6536,9 +6546,17 @@ class AppServerProcess {
   }
 
   async rpc(method: string, params: unknown): Promise<unknown> {
-    this.disposeIfConfigChanged()
-    await this.ensureInitialized()
-    return this.call(method, params)
+    const submission = await this.activityRecorder?.beforeRpc(method, params) ?? null
+    try {
+      this.disposeIfConfigChanged()
+      await this.ensureInitialized()
+      const result = await this.call(method, params)
+      await this.activityRecorder?.afterRpc(method, params, result, submission)
+      return result
+    } catch (failure) {
+      await this.activityRecorder?.rpcFailed(params, submission, failure)
+      throw failure
+    }
   }
 
   onNotification(listener: (value: { method: string; params: unknown }) => void): () => void {
@@ -6984,7 +7002,7 @@ class MethodCatalog {
 }
 
 type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
-  dispose: () => void
+  dispose: () => Promise<void>
   subscribeNotifications: (listener: (value: { method: string; params: unknown; atIso: string }) => void) => () => void
 }
 
@@ -6995,10 +7013,12 @@ type SharedBridgeState = {
   methodCatalog: MethodCatalog
   telegramBridge: TelegramThreadBridge
   backendQueueProcessor: BackendQueueProcessor
+  activityStore: ActivityStore
+  activityRecorder: ActivityRecorder
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v2'
+const SHARED_BRIDGE_VERSION = 'activity-api-v1'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7016,11 +7036,17 @@ function getSharedBridgeState(): SharedBridgeState {
   }
 
   const appServer = new AppServerProcess()
+  const activityStore = new ActivityStore(join(getCodexHomeDir(), 'web-activity-v1'))
+  const activityRecorder = new ActivityRecorder(activityStore)
+  appServer.setActivityRecorder(activityRecorder)
+  recordQueueActivity = (previous, next) => activityRecorder.recordQueue(previous, next)
   const terminalManager = new ThreadTerminalManager()
   const backendQueueProcessor = new BackendQueueProcessor(appServer)
   const created: SharedBridgeState = {
     version: SHARED_BRIDGE_VERSION,
     appServer,
+    activityStore,
+    activityRecorder,
     terminalManager,
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
@@ -7111,7 +7137,7 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
 }
 
 export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
-  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
+  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, activityStore, activityRecorder } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -7762,6 +7788,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
         return
       }
+
+      if (url.pathname.startsWith('/codex-api/thread-activity') && await handleActivityRoutes(req, res, url, activityStore, activityRecorder, appServer)) return
 
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-stream-events') {
         const threadId = url.searchParams.get('threadId')?.trim() ?? ''
@@ -9244,12 +9272,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
     }
   }
 
-  middleware.dispose = () => {
+  middleware.dispose = async () => {
     threadSearchIndex = null
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
     appServer.dispose()
+    await activityRecorder.flush()
   }
   middleware.subscribeNotifications = (
     listener: (value: { method: string; params: unknown; atIso: string }) => void,
@@ -9266,9 +9295,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         atIso: new Date().toISOString(),
       })
     })
+    const unsubscribeActivity = activityStore.subscribe((threadId, entry, coverage) => {
+      listener({ method: 'activity/updated', params: { threadId, entry, coverage }, atIso: new Date().toISOString() })
+    })
     return () => {
       unsubscribeAppServer()
       unsubscribeTerminal()
+      unsubscribeActivity()
     }
   }
 

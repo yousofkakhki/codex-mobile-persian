@@ -19,7 +19,7 @@ export type ServerOptions = {
 
 export type ServerInstance = {
   app: Express
-  dispose: () => void
+  dispose: () => Promise<void>
   attachWebSocket: (server: HttpServer) => void
 }
 

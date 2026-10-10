@@ -9,6 +9,9 @@ import {
   renameThread,
   getAvailableModelIds,
   getCurrentModelConfig,
+  getThreadGoal,
+  setThreadGoal,
+  clearThreadGoal,
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
@@ -64,6 +67,8 @@ import type {
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import { isReasoningEffortSupported as supportsReasoningEffort, getModelReasoningEfforts, normalizeModelIdForProvider } from '../utils/modelCapabilities.js'
 import { mergeThreadTurnOrder } from '../utils/threadHistory'
+import { parseGoalCommand, type GoalCommand } from '../utils/goalCommands'
+import { publishLocalRpcNotification } from '../api/codexRpcClient'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -1584,6 +1589,7 @@ export function useDesktopState() {
   const selectedReasoningEffort = computed<ReasoningEffort | ''>(() => readReasoningEffortForThread(selectedThreadId.value))
   const speedModeByContext = ref<Record<string, SpeedMode>>(loadSpeedModeMap())
   const speedUpdateVersionByContext = new Map<string, number>()
+  const goalUpdateVersionByThreadId = new Map<string, number>()
   const updatingSpeedModeByContext = ref<Record<string, boolean>>({})
   const selectedSpeedMode = computed<SpeedMode>(() => readSpeedModeForThread(selectedThreadId.value))
   const activeProviderId = ref('')
@@ -4245,6 +4251,12 @@ export function useDesktopState() {
 
   function queueEventDrivenSync(notification: RpcNotification): void {
     if (notification.method === 'thread/tokenUsage/updated') return
+    if (notification.method === 'thread/goal/updated' || notification.method === 'thread/goal/cleared') {
+      const id = extractThreadIdFromNotification(notification)
+      if (id) goalUpdateVersionByThreadId.set(id, (goalUpdateVersionByThreadId.get(id) ?? 0) + 1)
+      return
+    }
+    if (notification.method.startsWith('activity/')) return
 
     const method = notification.method
     if (method === 'thread/settings/updated') {
@@ -5172,6 +5184,43 @@ export function useDesktopState() {
     })
   }
 
+  async function executeGoalCommand(threadId: string, command: GoalCommand): Promise<void> {
+    const version = goalUpdateVersionByThreadId.get(threadId) ?? 0
+    try {
+      if (command.action === 'clear') {
+        if (!await clearThreadGoal(threadId)) throw new Error('Goal was not cleared')
+        if (version === (goalUpdateVersionByThreadId.get(threadId) ?? 0)) publishLocalRpcNotification({ method: 'thread/goal/cleared', params: { threadId }, atIso: new Date().toISOString() })
+        return
+      }
+      const goal = command.action === 'show'
+        ? await getThreadGoal(threadId)
+        : await setThreadGoal(threadId, command.action === 'set'
+          ? { objective: command.objective, status: 'active', tokenBudget: null }
+          : { status: command.action === 'pause' ? 'paused' : 'active' })
+      if (version !== (goalUpdateVersionByThreadId.get(threadId) ?? 0)) return
+      publishLocalRpcNotification({
+        method: goal ? 'thread/goal/updated' : 'thread/goal/cleared',
+        params: goal ? { threadId, goal } : { threadId },
+        atIso: new Date().toISOString(),
+      })
+    } catch (failure) {
+      if (selectedThreadId.value === threadId) error.value = failure instanceof Error ? failure.message : 'Failed to manage goal'
+      throw failure
+    }
+  }
+
+  function goalWithResources(command: GoalCommand | null, images: string[], skills: Array<{ name: string; path: string }>, files: FileAttachment[]): GoalCommand | null {
+    if (!command || command.action !== 'set') return command
+    const references = [
+      ...files.map(file => `File ${file.label}: ${file.fsPath}`),
+      ...skills.map(skill => `Skill $${skill.name}: ${skill.path}`),
+      ...images.map(image => `Image: ${extractLocalImagePathFromUrl(image) || image}`),
+    ]
+    const objective = [command.objective, ...references].join('\n')
+    if (objective.length > 4000) throw new Error('Goal objective and attached references must fit within 4,000 characters')
+    return { action: 'set', objective }
+  }
+
   async function sendMessageToSelectedThread(
     text: string,
     imageUrls: string[] = [],
@@ -5186,6 +5235,11 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     const nextText = text.trim()
     if (!threadId || (!nextText && imageUrls.length === 0 && fileAttachments.length === 0)) return
+    const goalCommand = goalWithResources(parseGoalCommand(nextText), imageUrls, skills, fileAttachments)
+    if (goalCommand) {
+      await executeGoalCommand(threadId, goalCommand)
+      return
+    }
 
     if (await maybeReplyToPendingUserInputRequest(threadId, nextText, imageUrls, skills, fileAttachments)) {
       return
@@ -5288,6 +5342,8 @@ export function useDesktopState() {
     if (isUpdatingSpeedMode.value) return ''
 
     const nextText = text.trim()
+    const goalCommand = goalWithResources(parseGoalCommand(nextText), imageUrls, skills, fileAttachments)
+    if (goalCommand && goalCommand.action !== 'set') throw new Error('Open a thread before managing its goal')
     const targetCwd = cwd.trim()
     const selectedModel = readModelIdForThread(NEW_THREAD_COLLABORATION_MODE_CONTEXT).trim()
     const selectedMode = selectedCollaborationMode.value
@@ -5327,13 +5383,20 @@ export function useDesktopState() {
       saveReasoningEffortMap(reasoningEffortByContext.value)
 
       insertOptimisticThread(threadId, targetCwd, nextText || '[Image]')
-      appendOptimisticUserMessage(threadId, nextText, imageUrls, skills, fileAttachments)
-      blockInterruptUntilThreadIsPersisted(threadId)
+      if (!goalCommand) {
+        appendOptimisticUserMessage(threadId, nextText, imageUrls, skills, fileAttachments)
+        blockInterruptUntilThreadIsPersisted(threadId)
+      }
       resumedThreadById.value = {
         ...resumedThreadById.value,
         [threadId]: true,
       }
       setSelectedThreadId(threadId)
+      if (goalCommand) {
+        await executeGoalCommand(threadId, goalCommand)
+        isSendingMessage.value = false
+        return threadId
+      }
       shouldAutoScrollOnNextAgentEvent = true
       setTurnSummaryForThread(threadId, null)
       setTurnActivityForThread(

@@ -557,6 +557,10 @@
             </span>
           </template>
           <template #actions>
+            <div v-if="route.name === 'thread' && selectedThreadId" class="thread-view-tabs" role="tablist" aria-label="Thread view">
+              <button type="button" role="tab" :aria-selected="activityView === 'chat'" :tabindex="activityView === 'chat' ? 0 : -1" @click="threadActivity.setView('chat')" @keydown.right.prevent="focusThreadView('activity')">Chat</button>
+              <button type="button" role="tab" :aria-selected="activityView === 'activity'" :tabindex="activityView === 'activity' ? 0 : -1" @click="threadActivity.setView('activity')" @keydown.left.prevent="focusThreadView('chat')">Activity</button>
+            </div>
             <ComposerDropdown
               v-if="canShowTerminalToggle"
               class="content-header-terminal-command"
@@ -992,8 +996,9 @@
               />
 
               <template v-else>
-                <div class="content-thread">
-                  <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
+                <div class="content-thread" role="tabpanel" :aria-label="activityView === 'activity' ? 'Activity' : 'Chat'">
+                  <ThreadActivity v-if="activityView === 'activity'" :thread-id="selectedThreadId" :entries="activityEntries" :coverage="activityCoverage" :loading="activityLoading" :error="activityError" :has-older="Boolean(activityNextCursor)" :older="threadActivity.older" :recover="threadActivity.recover" :refresh="threadActivity.refresh" />
+                  <ThreadConversation v-else ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
@@ -1040,6 +1045,14 @@
                       <div class="thread-goal-card-copy">
                         <strong>Goal {{ formatGoalStatus(selectedThreadGoal.status) }}</strong>
                         <span>{{ selectedThreadGoal.objective }}</span>
+                        <span class="thread-goal-metrics" aria-label="Goal usage">
+                          Tokens {{ selectedThreadGoal.tokensUsed.toLocaleString() }} / {{ selectedThreadGoal.tokenBudget === null ? 'Unlimited' : selectedThreadGoal.tokenBudget.toLocaleString() }}
+                          · Reported work {{ formatActivityDuration(selectedThreadGoal.timeUsedSeconds) }}
+                          · Elapsed {{ formatActivityDuration(goalElapsedSeconds) }}
+                        </span>
+                        <span class="thread-goal-sync" :class="{ 'is-error': goalEditorError }">
+                          {{ goalEditorError || (goalSyncedAt ? `Last synced ${new Date(goalSyncedAt).toLocaleTimeString()}` : 'Synchronizing goal…') }}
+                        </span>
                       </div>
                     </div>
                     <button class="thread-goal-card-edit" type="button" aria-label="Edit goal" title="Edit goal" @click="openGoalEditor">✎</button>
@@ -1235,6 +1248,8 @@ import IconTablerTerminal from './components/icons/IconTablerTerminal.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
 import { useDesktopState } from './composables/useDesktopState'
 import { useThreadGoalState } from './composables/useThreadGoalState'
+import { useThreadActivity } from './composables/useThreadActivity'
+import { formatActivityDuration } from './utils/activityFormatting'
 import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
@@ -1282,6 +1297,7 @@ import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathFor
 import { copyTextToClipboard } from './utils/clipboard'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
+const ThreadActivity = defineAsyncComponent(() => import('./components/content/ThreadActivity.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
 const ReviewPane = defineAsyncComponent(() => import('./components/content/ReviewPane.vue'))
 const DirectoryHub = defineAsyncComponent(() => import('./components/content/DirectoryHub.vue'))
@@ -2151,8 +2167,18 @@ const terminalHeaderDropdownOptions = computed(() => [
   ...terminalHeaderQuickCommands.value.map((command) => ({ label: command.label, value: command.value })),
 ])
 const goalStatusOptions: ThreadGoalStatus[] = ['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']
-const threadGoalState = useThreadGoalState(selectedThreadId, isHomeRoute)
+const isThreadSurfaceHidden = computed(() => route.name !== 'thread')
+const threadGoalState = useThreadGoalState(selectedThreadId, isThreadSurfaceHidden)
+const threadActivity = useThreadActivity(selectedThreadId, isThreadSurfaceHidden)
+const { view: activityView, entries: activityEntries, coverage: activityCoverage, loading: activityLoading, error: activityError, nextCursor: activityNextCursor } = threadActivity
 const selectedThreadGoal = threadGoalState.goal
+const goalElapsedSeconds = threadGoalState.elapsedSeconds
+const goalSyncedAt = threadGoalState.syncedAt
+async function focusThreadView(value: 'chat' | 'activity'): Promise<void> {
+  threadActivity.setView(value)
+  await nextTick()
+  document.querySelector<HTMLButtonElement>('.thread-view-tabs [aria-selected="true"]')?.focus()
+}
 const isGoalEditorOpen = ref(false)
 const isSavingThreadGoal = threadGoalState.saving
 const goalEditorObjective = ref('')
@@ -2224,6 +2250,8 @@ const telegramStatusText = computed(() => {
 })
 
 onMounted(() => {
+  threadGoalState.start()
+  threadActivity.start()
   document.addEventListener('pointerdown', onDocumentPointerDown)
   window.addEventListener('keydown', onWindowKeyDown)
   document.addEventListener('visibilitychange', onDocumentVisibilityChange)
@@ -2257,6 +2285,8 @@ watch(visibleFeedbackErrors, (values, oldValues) => {
 })
 
 onUnmounted(() => {
+  threadGoalState.stop()
+  threadActivity.stop()
   document.removeEventListener('pointerdown', onDocumentPointerDown)
   window.removeEventListener('keydown', onWindowKeyDown)
   document.removeEventListener('visibilitychange', onDocumentVisibilityChange)
@@ -3539,7 +3569,10 @@ function onSubmitThreadMessage(payload: { text: string; imageUrls: string[]; fil
     void submitFirstMessageForNewThread(text, payload.imageUrls, payload.skills, payload.fileAttachments)
     return
   }
-  void sendMessageToSelectedThread(text, payload.imageUrls, payload.skills, payload.mode, payload.fileAttachments, queueInsertIndex)
+  const submissionThreadId = selectedThreadId.value
+  void sendMessageToSelectedThread(text, payload.imageUrls, payload.skills, payload.mode, payload.fileAttachments, queueInsertIndex).catch(failure => {
+    if (selectedThreadId.value === submissionThreadId) desktopError.value = failure instanceof Error ? failure.message : 'Failed to submit prompt'
+  })
 }
 
 function onEditQueuedMessage(messageId: string): void {
@@ -4835,8 +4868,13 @@ watch(
   () => {
     clearCommitReviewContext()
     isGoalEditorOpen.value = false
-    void refreshSelectedThreadGoal()
   },
+  { immediate: true },
+)
+
+watch(
+  () => [selectedThreadId.value, isThreadSurfaceHidden.value] as const,
+  () => { isGoalEditorOpen.value = false; void refreshSelectedThreadGoal() },
   { immediate: true },
 )
 
