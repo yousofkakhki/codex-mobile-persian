@@ -795,6 +795,88 @@ describe('thread-scoped speed mode', () => {
   })
 })
 
+describe('thread-scoped reasoning effort', () => {
+  function installReasoningThreads() {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'reasoning', threads: [thread('effort-a', '/tmp/reasoning'), thread('effort-b', '/tmp/reasoning')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({
+      model: 'cx/gpt-6.1-sol',
+      providerId: 'ninerouter',
+      reasoningEffort: 'high',
+      speedMode: 'standard',
+    })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['cx/gpt-6.1-sol'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'cx/gpt-6.1-sol',
+      modelProvider: 'ninerouter',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      olderCursor: null,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.startThreadTurn.mockResolvedValue('effort-turn')
+    return useDesktopState()
+  }
+
+  it('keeps the last reasoning effort isolated and persistent per thread', async () => {
+    const state = installReasoningThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    await state.selectThread('effort-a')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    state.setSelectedReasoningEffort('max')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+
+    await state.selectThread('effort-b')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    state.setSelectedReasoningEffort('low')
+    await state.selectThread('effort-a')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    await state.sendMessageToSelectedThread('synthetic max request')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[4]).toBe('max')
+    await state.selectThread('effort-b')
+    await state.sendMessageToSelectedThread('synthetic low request')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[4]).toBe('low')
+    await state.selectThread('effort-a')
+
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    const reloaded = useDesktopState()
+    reloaded.primeSelectedThread('effort-a')
+    expect(reloaded.selectedReasoningEffort.value).toBe('max')
+    reloaded.primeSelectedThread('effort-b')
+    expect(reloaded.selectedReasoningEffort.value).toBe('low')
+    expect(JSON.parse(window.localStorage.getItem('codex-web-local.reasoning-effort-by-context.v1') ?? '{}')).toMatchObject({
+      'effort-a': 'max',
+      'effort-b': 'low',
+    })
+  })
+
+  it('transfers a new-chat effort to the created thread and resets the draft context', async () => {
+    const state = installReasoningThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    state.primeSelectedThread('')
+    state.setSelectedReasoningEffort('max')
+    gatewayMocks.startThread.mockResolvedValue({
+      threadId: 'new-effort-thread',
+      model: 'cx/gpt-6.1-sol',
+      modelProvider: 'ninerouter',
+    })
+
+    await state.sendMessageToNewThread('synthetic effort request', '/tmp/reasoning')
+    await Promise.resolve()
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[4]).toBe('max')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    state.primeSelectedThread('')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+  })
+})
+
 describe('older item-page merging', () => {
   async function installPagedThread() {
     installTestWindow()
