@@ -21,6 +21,7 @@ const gatewayMocks = vi.hoisted(() => ({
   getPendingServerRequests: vi.fn(),
   getSkillsList: vi.fn(),
   getThreadDetail: vi.fn(),
+  getOlderThreadMessages: vi.fn(),
   getThreadGroupsPage: vi.fn(),
   getThreadQueueState: vi.fn(),
   getThreadSummary: vi.fn(),
@@ -671,6 +672,55 @@ describe('startup request deduplication', () => {
     } finally {
       nowSpy.mockRestore()
     }
+  })
+})
+
+describe('older item-page merging', () => {
+  async function installPagedThread() {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [{ projectName: 'project', threads: [thread('paged-thread', '/tmp/project')] }], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'model-x', providerId: 'codex', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['model-x'])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'model-x', modelProvider: 'openai', inProgress: false, activeTurnId: '',
+      messages: [{ id: 'latest', role: 'assistant', text: 'latest item', turnId: 'current', turnIndex: 0 }],
+      hasMoreOlder: true, olderCursor: 'item-history:{"items":"older","turns":null}', turnIndexByTurnId: { current: 0 },
+    })
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('paged-thread')
+    return state
+  }
+
+  it('keeps earlier items from an already known turn and deduplicates overlapping items', async () => {
+    const state = await installPagedThread()
+    gatewayMocks.getOlderThreadMessages.mockResolvedValue({
+      messages: [
+        { id: 'earlier', role: 'user', text: 'earlier item', turnId: 'current', turnIndex: 0 },
+        { id: 'latest', role: 'assistant', text: 'stale duplicate', turnId: 'current', turnIndex: 0 },
+      ],
+      turnIndexByTurnId: { current: 0 }, hasMoreOlder: false, nextCursor: null,
+    })
+    await state.loadOlderMessages('paged-thread')
+    expect(state.messages.value.map(message => message.text)).toEqual(['earlier item', 'latest item'])
+    expect(state.messages.value.map(message => message.turnIndex)).toEqual([0, 0])
+    expect(state.hasMoreOlderMessages.value).toBe(false)
+  })
+
+  it('reindexes existing messages when a page crosses an older turn boundary', async () => {
+    const state = await installPagedThread()
+    gatewayMocks.getOlderThreadMessages.mockResolvedValue({
+      messages: [
+        { id: 'oldest', role: 'user', text: 'older turn', turnId: 'older', turnIndex: 0 },
+        { id: 'earlier', role: 'assistant', text: 'current turn prefix', turnId: 'current', turnIndex: 1 },
+      ],
+      turnIndexByTurnId: { older: 0, current: 1 }, hasMoreOlder: true, nextCursor: 'next-page',
+    })
+    await state.loadOlderMessages('paged-thread')
+    expect(state.messages.value.map(message => [message.id, message.turnIndex])).toEqual([
+      ['oldest', 0], ['earlier', 1], ['latest', 1],
+    ])
+    expect(state.hasMoreOlderMessages.value).toBe(true)
   })
 })
 

@@ -63,6 +63,7 @@ import type {
 } from '../types/codex'
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import { isReasoningEffortSupported as supportsReasoningEffort, getModelReasoningEfforts, normalizeModelIdForProvider } from '../utils/modelCapabilities.js'
+import { mergeThreadTurnOrder } from '../utils/threadHistory'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -720,20 +721,6 @@ function areMessageArraysEqual(first: UiMessage[], second: UiMessage[]): boolean
     if (first[index] !== second[index]) return false
   }
   return true
-}
-
-function shiftMessageTurnIndices(messages: UiMessage[], offset: number): UiMessage[] {
-  if (offset === 0) return messages
-  return messages.map((message) => (
-    typeof message.turnIndex === 'number'
-      ? { ...message, turnIndex: message.turnIndex + offset }
-      : message
-  ))
-}
-
-function shiftTurnIndexLookup(lookup: Record<string, number>, offset: number): Record<string, number> {
-  if (offset === 0) return lookup
-  return Object.fromEntries(Object.entries(lookup).map(([turnId, turnIndex]) => [turnId, turnIndex + offset]))
 }
 
 function mergeMessages(
@@ -4710,25 +4697,29 @@ export function useDesktopState() {
     try {
       const page = await getOlderThreadMessages(threadId, cursor, 10)
       const previousTurnIndexLookup = turnIndexByTurnIdByThreadId.value[threadId] ?? {}
-      const knownTurnIds = new Set(Object.keys(previousTurnIndexLookup))
-      const pageTurnIds = Object.keys(page.turnIndexByTurnId)
-      const newPageTurnIds = pageTurnIds.filter((turnId) => !knownTurnIds.has(turnId))
-      const pageTurnIdSet = new Set(newPageTurnIds)
-      const olderMessages = page.messages.filter((message) => !message.turnId || pageTurnIdSet.has(message.turnId))
       const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-      const shift = newPageTurnIds.length
-      const shiftedPreviousPersisted = shiftMessageTurnIndices(previousPersisted, shift)
-      const shiftedPreviousTurnIndexLookup = shiftTurnIndexLookup(previousTurnIndexLookup, shift)
-      const mergedMessages = mergeMessages(olderMessages, shiftedPreviousPersisted, { preserveMissing: true })
+      const previousMessageIds = new Set(previousPersisted.map(message => message.id))
+      const turnOrder = mergeThreadTurnOrder(
+        Object.keys(page.turnIndexByTurnId).sort((first, second) => page.turnIndexByTurnId[first]! - page.turnIndexByTurnId[second]!),
+        Object.keys(previousTurnIndexLookup).sort((first, second) => previousTurnIndexLookup[first]! - previousTurnIndexLookup[second]!),
+      )
+      const nextTurnIndexLookup = Object.fromEntries(turnOrder.map((turnId, index) => [turnId, index]))
+      const reindexMessage = (message: UiMessage): UiMessage => {
+        const turnIndex = message.turnId ? nextTurnIndexLookup[message.turnId] : undefined
+        return turnIndex === undefined || turnIndex === message.turnIndex ? message : { ...message, turnIndex }
+      }
+      const olderMessages = page.messages.filter(message => !previousMessageIds.has(message.id)).map(reindexMessage)
+      const mergedMessages = mergeMessages(olderMessages, previousPersisted.map(reindexMessage), { preserveMissing: true })
+        .sort((first, second) => (
+          (first.turnIndex ?? Number.MAX_SAFE_INTEGER) - (second.turnIndex ?? Number.MAX_SAFE_INTEGER)
+          || Number(first.messageType === 'turnError') - Number(second.messageType === 'turnError')
+        ))
       setPersistedMessagesForThread(threadId, mergedMessages)
-      const shiftedLiveFileChanges = shiftMessageTurnIndices(liveFileChangeMessagesByThreadId.value[threadId] ?? [], shift)
+      const shiftedLiveFileChanges = (liveFileChangeMessagesByThreadId.value[threadId] ?? []).map(reindexMessage)
       if (shiftedLiveFileChanges.length > 0) {
         setLiveFileChangeMessagesForThread(threadId, shiftedLiveFileChanges)
       }
-      replaceTurnIndexLookupForThread(threadId, {
-        ...page.turnIndexByTurnId,
-        ...shiftedPreviousTurnIndexLookup,
-      })
+      replaceTurnIndexLookupForThread(threadId, nextTurnIndexLookup)
       rebindLiveFileChangeTurnIndices(threadId)
       hasMoreOlderMessagesByThreadId.value = {
         ...hasMoreOlderMessagesByThreadId.value,

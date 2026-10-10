@@ -8,6 +8,8 @@ export type { Thread } from '../../documentation/app-server-schemas/typescript/v
 export type { ThreadItem } from '../../documentation/app-server-schemas/typescript/v2/ThreadItem'
 export type { Turn } from '../../documentation/app-server-schemas/typescript/v2/Turn'
 export type { ThreadTurnsListResponse } from '../../documentation/app-server-schemas/typescript/v2/ThreadTurnsListResponse'
+export type { ThreadItemsListResponse } from '../../documentation/app-server-schemas/typescript/v2/ThreadItemsListResponse'
+export type { ThreadItemEntry } from '../../documentation/app-server-schemas/typescript/v2/ThreadItemEntry'
 export type { TurnsPage } from '../../documentation/app-server-schemas/typescript/v2/TurnsPage'
 export type { UserInput } from '../../documentation/app-server-schemas/typescript/v2/UserInput'
 export type { ModelListResponse } from '../../documentation/app-server-schemas/typescript/v2/ModelListResponse'
