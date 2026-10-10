@@ -48,6 +48,6 @@ Plan mode, reasoning effort, and Fast mode are scoped to the current chat instea
 #### Rollback/Cleanup
 - Turn Plan mode off in any test threads if desired.
 - Restore each disposable thread's original Fast setting. Do not enable paid tiers or send provider requests on production threads just to test this feature.
-- Stop only disposable test containers/processes and remove their isolated homes when no longer needed. Browser persistence uses `codex-web-local.speed-mode-by-context.v1`; clear it only in the isolated test browser profile.
+- Stop only disposable test containers/processes and remove their isolated homes when no longer needed. Browser persistence uses `codex-web-local.speed-mode-by-context.v1` and `codex-web-local.reasoning-effort-by-context.v1`; clear them only in the isolated test browser profile.
 
 ---
