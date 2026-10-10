@@ -3,8 +3,8 @@ import { ref } from 'vue'
 import type { ThreadGoal } from '../api/codexGateway'
 
 const api = vi.hoisted(() => ({ getThreadGoal: vi.fn(), setThreadGoal: vi.fn(), resumeThreadGoal: vi.fn(), clearThreadGoal: vi.fn() }))
-vi.mock('../api/codexGateway', () => api)
-afterEach(() => vi.resetAllMocks())
+vi.mock('../api/codexGateway', () => ({ ...api, normalizeThreadGoal: (value: unknown) => value, subscribeCodexNotifications: vi.fn(() => vi.fn()) }))
+afterEach(() => { vi.resetAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals() })
 const goal = (threadId: string, overrides: Partial<ThreadGoal> = {}): ThreadGoal => ({ threadId, objective: `Goal for ${threadId}`,
   status: 'paused', tokenBudget: 200, tokensUsed: 100, timeUsedSeconds: 15, createdAt: 1, updatedAt: 2, ...overrides })
 function deferred<T>() {
@@ -137,5 +137,37 @@ describe('per-thread Goal reconciliation', () => {
     expect(state.loaded.value).toBe(false)
     expect(state.goal.value).toBeNull()
     expect(state.error.value).toMatch(/different thread/)
+  })
+
+  it('applies live usage and clear events without allowing an older read to overwrite them', async () => {
+    const state = useThreadGoalState(ref('a'), ref(false))
+    const old = deferred<ThreadGoal | null>()
+    api.getThreadGoal.mockReturnValueOnce(old.promise)
+    const loading = state.refresh()
+    state.applyNotification({ method: 'thread/goal/updated', params: { threadId: 'a', goal: { ...goal('a'), tokensUsed: 42, status: 'active' } }, atIso: '' })
+    old.resolve(goal('a'))
+    await loading
+    expect(state.goal.value?.tokensUsed).toBe(42)
+    state.applyNotification({ method: 'thread/goal/updated', params: { threadId: 'b', goal: goal('b') }, atIso: '' })
+    expect(state.goal.value?.threadId).toBe('a')
+    state.applyNotification({ method: 'thread/goal/cleared', params: { threadId: 'a' }, atIso: '' })
+    expect(state.goal.value).toBeNull()
+  })
+
+  it('coalesces reads and polls only a visible stale active goal', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('window', {})
+    vi.stubGlobal('document', { visibilityState: 'visible' })
+    const state = useThreadGoalState(ref('a'), ref(false))
+    api.getThreadGoal.mockResolvedValue({ ...goal('a'), status: 'active' })
+    await Promise.all([state.refresh(), state.refresh()])
+    expect(api.getThreadGoal).toHaveBeenCalledTimes(1)
+    state.start()
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(api.getThreadGoal).toHaveBeenCalledTimes(2)
+    vi.stubGlobal('document', { visibilityState: 'hidden' })
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(api.getThreadGoal).toHaveBeenCalledTimes(2)
+    state.stop()
   })
 })

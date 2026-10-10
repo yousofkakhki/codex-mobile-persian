@@ -63,6 +63,9 @@ import {
 } from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
 import { appendGoalBudgetAuditRecord } from './goalBudgetAudit.js'
+import { ActivityStore } from './activityStore.js'
+import { ActivityRecorder } from './activityRecorder.js'
+import { handleActivityRoutes } from './activityRoutes.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
@@ -5424,6 +5427,7 @@ function normalizeThreadQueueState(value: unknown): ThreadQueueState {
 }
 
 let threadQueueMutationChain: Promise<unknown> = Promise.resolve()
+let recordQueueActivity: ((previous: ThreadQueueState, next: ThreadQueueState) => void) | null = null
 
 async function readThreadQueueState(): Promise<ThreadQueueState> {
   const statePath = getCodexGlobalStatePath()
@@ -5463,6 +5467,7 @@ async function withThreadQueueStateUpdate<T>(
     const commit = async (): Promise<T> => {
       const { nextState, result } = await update(currentState)
       await writeThreadQueueStateUnlocked(nextState)
+      recordQueueActivity?.(currentState, nextState)
       return result
     }
     return guard ? guard(currentState, commit) : commit()
@@ -6222,6 +6227,9 @@ const MERGEABLE_ITEM_TYPES = new Set([
 type AppServerPermissionRequest = { threadId: string; intent: AppServerPermissionIntent; generation: ChildProcessWithoutNullStreams; epoch: number; order: number; dimensionOrder?: { approvalPolicy: number; sandbox: number }; pendingHotPermissions?: AppServerTurnPermissionOverrides; settings?: AppServerTurnPermissionOverrides; settingsAcknowledged?: boolean; settingsRejected?: boolean; settingsObservation?: Record<string, unknown>; settingsObservationRevision?: number; settingsNoop?: { settings: Record<string, unknown>; revision: number } }
 
 class AppServerProcess {
+  private activityRecorder: ActivityRecorder | null = null
+
+  setActivityRecorder(recorder: ActivityRecorder): void { this.activityRecorder = recorder }
   private process: ChildProcessWithoutNullStreams | null = null
   private initialized = false
   private initializePromise: Promise<void> | null = null
@@ -6604,6 +6612,7 @@ class AppServerProcess {
   }
 
   private emitNotification(notification: { method: string; params: unknown }): void {
+    this.activityRecorder?.notification(notification)
     this.recordStreamEvent(notification)
     this.captureItemFromNotification(notification)
     const nThreadId = this.extractThreadIdFromParams(notification.params)
@@ -6841,6 +6850,7 @@ class AppServerProcess {
         id: requestId,
         method: pendingRequest.method,
         threadId,
+        decision: reply.error ? 'error' : readNonEmptyString(asRecord(reply.result)?.decision) || 'submitted',
         mode: 'manual',
         resolvedAtIso: new Date().toISOString(),
       },
@@ -7169,7 +7179,14 @@ class AppServerProcess {
     const permit = Object.freeze({})
     this.goalWritePermits.set(permit, { method, params: nativeParams, generation, lease, assertAllowed })
     let result: unknown
-    try { result = await this.call(method, nativeParams, generation, lease, permit) }
+    const submission = await this.activityRecorder?.beforeRpc(method, nativeParams) ?? null
+    try {
+      result = await this.call(method, nativeParams, generation, lease, permit)
+      if (this.process === generation) await this.activityRecorder?.afterRpc(method, nativeParams, result, submission)
+    } catch (failure) {
+      await this.activityRecorder?.rpcFailed(nativeParams, submission, failure)
+      throw failure
+    }
     finally { this.goalWritePermits.delete(permit) }
     assertAllowed()
     const afterResponse = asRecord(await this.call('thread/goal/get', { threadId }, generation))
@@ -7365,7 +7382,15 @@ class AppServerProcess {
         // Inherited fields keep the order of the original choice, not this turn's dispatch.
         dimensionOrder: { approvalPolicy: callerPermissionIntent.approvalPolicy ? permissionOrder : stagedPermissionOrder?.approvalPolicy ?? permissionOrder, sandbox: callerPermissionIntent.sandbox ? permissionOrder : stagedPermissionOrder?.sandbox ?? permissionOrder },
         settings: method === 'thread/settings/update' ? JSON.parse(JSON.stringify(permissionParams)) as AppServerTurnPermissionOverrides : undefined } : undefined
-    const result = await this.call(method, boundedParams, rpcProcess, goalLease, undefined, permissionRequest)
+    const submission = await this.activityRecorder?.beforeRpc(method, boundedParams) ?? null
+    let result: unknown
+    try {
+      result = await this.call(method, boundedParams, rpcProcess, goalLease, undefined, permissionRequest)
+      if (this.process === rpcProcess) await this.activityRecorder?.afterRpc(method, boundedParams, result, submission)
+    } catch (failure) {
+      await this.activityRecorder?.rpcFailed(boundedParams, submission, failure)
+      throw failure
+    }
     if (this.process !== rpcProcess) throw new Error('codex app-server changed while completing RPC; retry the request')
     if (permissionRequest?.threadId && (this.permissionEpochByThreadId.get(permissionRequest.threadId) ?? 0) !== permissionRequest.epoch) {
       throw new Error('Thread closed while completing permission RPC; no permission choice was retained.')
@@ -7828,7 +7853,7 @@ export type CodexBridgeOptions = {
 }
 
 type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
-  dispose: () => void
+  dispose: () => Promise<void>
   subscribeNotifications: (listener: (value: { method: string; params: unknown; atIso: string }) => void) => () => void
 }
 
@@ -7839,10 +7864,12 @@ type SharedBridgeState = {
   methodCatalog: MethodCatalog
   telegramBridge: TelegramThreadBridge
   backendQueueProcessor: BackendQueueProcessor
+  activityStore: ActivityStore
+  activityRecorder: ActivityRecorder
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'experimental-api-v2'
+const SHARED_BRIDGE_VERSION = 'activity-api-v1'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7860,11 +7887,17 @@ function getSharedBridgeState(): SharedBridgeState {
   }
 
   const appServer = new AppServerProcess()
+  const activityStore = new ActivityStore(join(getCodexHomeDir(), 'web-activity-v1'))
+  const activityRecorder = new ActivityRecorder(activityStore)
+  appServer.setActivityRecorder(activityRecorder)
+  recordQueueActivity = (previous, next) => activityRecorder.recordQueue(previous, next)
   const terminalManager = new ThreadTerminalManager()
   const backendQueueProcessor = new BackendQueueProcessor(appServer)
   const created: SharedBridgeState = {
     version: SHARED_BRIDGE_VERSION,
     appServer,
+    activityStore,
+    activityRecorder,
     terminalManager,
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
@@ -7955,7 +7988,7 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
 }
 
 export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): CodexBridgeMiddleware {
-  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
+  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, activityStore, activityRecorder } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -8618,6 +8651,8 @@ export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): C
         }
         return
       }
+
+      if (url.pathname.startsWith('/codex-api/thread-activity') && await handleActivityRoutes(req, res, url, activityStore, activityRecorder, appServer)) return
 
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-stream-events') {
         const threadId = url.searchParams.get('threadId')?.trim() ?? ''
@@ -10117,12 +10152,13 @@ export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): C
     }
   }
 
-  middleware.dispose = () => {
+  middleware.dispose = async () => {
     threadSearchIndex = null
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
     appServer.dispose()
+    await activityRecorder.flush()
   }
   middleware.subscribeNotifications = (
     listener: (value: { method: string; params: unknown; atIso: string }) => void,
@@ -10139,9 +10175,13 @@ export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): C
         atIso: new Date().toISOString(),
       })
     })
+    const unsubscribeActivity = activityStore.subscribe((threadId, entry, coverage) => {
+      listener({ method: 'activity/updated', params: { threadId, entry, coverage }, atIso: new Date().toISOString() })
+    })
     return () => {
       unsubscribeAppServer()
       unsubscribeTerminal()
+      unsubscribeActivity()
     }
   }
 

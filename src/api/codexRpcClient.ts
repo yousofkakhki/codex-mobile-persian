@@ -187,7 +187,7 @@ function emitReadyNotification(
   })
 }
 
-export function subscribeRpcNotifications(onNotification: (value: RpcNotification) => void): () => void {
+function openRpcNotificationStream(onNotification: (value: RpcNotification) => void): () => void {
   if (typeof window === 'undefined') {
     return () => {}
   }
@@ -343,6 +343,36 @@ export function subscribeRpcNotifications(onNotification: (value: RpcNotificatio
     clearReconnectTimer()
     cleanup?.()
     setRpcConnectionState('offline')
+  }
+}
+
+const notificationSubscribers = new Set<(value: RpcNotification) => void>()
+let stopSharedNotificationStream: (() => void) | null = null
+
+export function publishLocalRpcNotification(notification: RpcNotification): void {
+  for (const subscriber of notificationSubscribers) {
+    try {
+      subscriber(notification)
+    } catch {}
+  }
+}
+
+export function subscribeRpcNotifications(onNotification: (value: RpcNotification) => void): () => void {
+  if (typeof window === 'undefined') return () => {}
+  const subscriber = (notification: RpcNotification) => onNotification(notification)
+  notificationSubscribers.add(subscriber)
+  if (!stopSharedNotificationStream) {
+    stopSharedNotificationStream = openRpcNotificationStream(publishLocalRpcNotification)
+  }
+  let unsubscribed = false
+  return () => {
+    if (unsubscribed) return
+    unsubscribed = true
+    notificationSubscribers.delete(subscriber)
+    if (notificationSubscribers.size === 0) {
+      stopSharedNotificationStream?.()
+      stopSharedNotificationStream = null
+    }
   }
 }
 

@@ -243,7 +243,7 @@ export type ComposerFileSuggestion = {
   path: string
 }
 
-function normalizeThreadGoal(value: unknown): ThreadGoal | null {
+export function normalizeThreadGoal(value: unknown): ThreadGoal | null {
   const record = asRecord(value)
   if (!record) return null
   const threadId = readString(record.threadId)
