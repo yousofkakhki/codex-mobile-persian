@@ -1,7 +1,7 @@
 ### Composer mode scoping and Fast mode support
 
 #### Feature/Change Name
-Plan mode and Fast mode are scoped to the current chat instead of becoming defaults for every chat. Fast mode is available for supported GPT 5.4, GPT 5.5, GPT 5.6, and GPT-6 model IDs; Ultra reasoning is available for GPT-6 Astra.
+Plan mode, reasoning effort, and Fast mode are scoped to the current chat instead of becoming defaults for every chat. Fast mode is available for supported GPT 5.4, GPT 5.5, GPT 5.6, and GPT-6 model IDs; Ultra reasoning is available for GPT-6 Astra.
 
 #### Prerequisites/Setup
 1. Dev server running (`pnpm run dev`)
@@ -27,6 +27,9 @@ Plan mode and Fast mode are scoped to the current chat instead of becoming defau
 15. Send synthetic next turns from A and B and inspect their `turn/start` tiers. Fast sends `priority`; Standard sends `default`, even when global configuration enables Fast.
 16. With a delayed fixture response, toggle A's speed and switch to B before the save completes. Confirm a failed A save rolls back only A, and a stale history response cannot overwrite a newer toggle.
 17. Restart only an isolated test app-server, then reload the saved threads. Confirm `thread/resume` reapplies each saved tier. Never restart a production server with active work for this check.
+18. In thread A, select `Max` in the reasoning-effort dropdown. Open thread B, select `Low`, then return to A and confirm it still shows `Max`.
+19. Refresh the page and confirm A still shows `Max` and B still shows `Low`. Change the model in one thread to a model that does not support the saved effort and confirm it falls back to a supported value only for that thread.
+20. In Start new thread, select `Max` and send a synthetic first message. Confirm the created thread uses `Max`, while the next new-chat draft starts from the configured default rather than reusing the previous thread's value.
 
 #### Expected Results
 - Enabling Plan mode in one existing thread does not enable it in other existing threads.
@@ -35,6 +38,8 @@ Plan mode and Fast mode are scoped to the current chat instead of becoming defau
 - Ultra reasoning is available only for GPT-6 Astra.
 - Fast mode remains hidden for unsupported model families.
 - Changing Fast in one thread does not change any other thread or global Codex configuration.
+- Changing reasoning effort in one thread does not change any other thread or the configured global default.
+- Reasoning effort choices persist across thread switches and page refreshes. Model changes validate and adjust only the affected thread's stored choice.
 - Saved choices persist across page refresh and are reapplied on thread resume. Standard explicitly overrides an inherited Fast default.
 - A new-chat Fast selection applies only to the created chat, not later new-chat drafts.
 - Speed changes affect subsequent turns, not the response currently running. Queued turns inherit the loaded native thread setting; offline backend queue recovery without a browser resume is not covered by this check.
