@@ -35,7 +35,7 @@ const gatewayMocks = vi.hoisted(() => ({
   resumeThread: vi.fn(),
   revertThreadFileChanges: vi.fn(),
   rollbackThread: vi.fn(),
-  setCodexSpeedMode: vi.fn(),
+  setThreadSpeedMode: vi.fn(),
   setThreadQueueState: vi.fn(),
   setWorkspaceRootsState: vi.fn(),
   startThread: vi.fn(),
@@ -675,6 +675,126 @@ describe('startup request deduplication', () => {
   })
 })
 
+describe('thread-scoped speed mode', () => {
+  function installSpeedThreads() {
+    installTestWindow()
+    const nativeModes = new Map<string, 'standard' | 'fast'>([['speed-a', 'standard'], ['speed-b', 'standard']])
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [{ projectName: 'speed', threads: [thread('speed-a', '/tmp/speed'), thread('speed-b', '/tmp/speed')] }], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/gpt-6.1-sol', providerId: 'ninerouter', reasoningEffort: 'high', speedMode: 'fast' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['cx/gpt-6.1-sol'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.startThreadTurn.mockResolvedValue('speed-turn')
+    const detail = (id: string) => ({ model: 'cx/gpt-6.1-sol', modelProvider: 'ninerouter', speedMode: nativeModes.get(id) ?? 'standard', messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, olderCursor: null, turnIndexByTurnId: {} })
+    gatewayMocks.resumeThread.mockImplementation(async id => detail(id))
+    gatewayMocks.getThreadDetail.mockImplementation(async id => detail(id))
+    gatewayMocks.setThreadSpeedMode.mockImplementation(async (id, mode) => { nativeModes.set(id, mode) })
+    return { state: useDesktopState(), nativeModes, detail }
+  }
+
+  it('keeps Fast isolated by thread and ignores the global Fast default on switches', async () => {
+    const { state } = installSpeedThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('speed-a')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+    await state.updateSelectedSpeedMode('fast')
+    expect(gatewayMocks.setThreadSpeedMode).toHaveBeenCalledWith('speed-a', 'fast')
+    await state.selectThread('speed-b')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+    await state.selectThread('speed-a')
+    expect(state.selectedSpeedMode.value).toBe('fast')
+    const reloaded = useDesktopState()
+    reloaded.primeSelectedThread('speed-a')
+    expect(reloaded.selectedSpeedMode.value).toBe('fast')
+    reloaded.primeSelectedThread('speed-b')
+    expect(reloaded.selectedSpeedMode.value).toBe('standard')
+  })
+
+  it('does not roll back another thread when a late save fails', async () => {
+    const { state } = installSpeedThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('speed-a')
+    let rejectSave!: (error: Error) => void
+    gatewayMocks.setThreadSpeedMode.mockImplementation(id => id === 'speed-a' ? new Promise((_resolve, reject) => { rejectSave = reject }) : Promise.resolve())
+    const saving = state.updateSelectedSpeedMode('fast')
+    expect(state.isUpdatingSpeedMode.value).toBe(true)
+    await state.selectThread('speed-b')
+    expect(state.isUpdatingSpeedMode.value).toBe(false)
+    await state.updateSelectedSpeedMode('fast')
+    rejectSave(new Error('failed A save'))
+    await saving
+    expect(state.selectedSpeedMode.value).toBe('fast')
+    expect(state.error.value).toBe('')
+    await state.selectThread('speed-a')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+  })
+
+  it('ignores a stale history response after a local Fast toggle', async () => {
+    const { state, detail } = installSpeedThreads()
+    state.primeSelectedThread('speed-a')
+    let finishLoad!: (value: unknown) => void
+    const stale = detail('speed-a')
+    gatewayMocks.resumeThread.mockImplementation(() => new Promise(resolve => { finishLoad = resolve }))
+    const loading = state.loadMessages('speed-a')
+    await state.updateSelectedSpeedMode('fast')
+    finishLoad(stale)
+    await loading
+    expect(state.selectedSpeedMode.value).toBe('fast')
+  })
+
+  it('keeps the new-chat choice local and applies it only to the created thread', async () => {
+    const { state, nativeModes } = installSpeedThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    state.primeSelectedThread('')
+    await state.updateSelectedSpeedMode('fast')
+    expect(gatewayMocks.setThreadSpeedMode).not.toHaveBeenCalled()
+    gatewayMocks.startThread.mockImplementation(async (_cwd, _model, mode) => {
+      nativeModes.set('new-speed-thread', mode)
+      return { threadId: 'new-speed-thread', model: 'cx/gpt-6.1-sol', modelProvider: 'ninerouter' }
+    })
+    await state.sendMessageToNewThread('synthetic draft', '/tmp/speed')
+    await Promise.resolve()
+    expect(gatewayMocks.startThread).toHaveBeenCalledWith('/tmp/speed', 'cx/gpt-6.1-sol', 'fast')
+    expect(state.selectedSpeedMode.value).toBe('fast')
+    state.primeSelectedThread('')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+  })
+
+  it('sends the selected thread mode explicitly on its next turn', async () => {
+    const { state } = installSpeedThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('speed-a')
+    await state.updateSelectedSpeedMode('fast')
+    await state.sendMessageToSelectedThread('synthetic fast request')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.at(-1)).toBe('fast')
+    await state.selectThread('speed-b')
+    await state.sendMessageToSelectedThread('synthetic standard request')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.at(-1)).toBe('standard')
+  })
+
+  it('syncs native settings notifications only to their own thread', async () => {
+    const { state } = installSpeedThreads()
+    gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('speed-a')
+    let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation(handler => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    state.startPolling()
+    try {
+      notificationHandler({ method: 'thread/settings/updated', params: { threadId: 'speed-b', threadSettings: { serviceTier: 'priority' } } })
+      expect(state.selectedSpeedMode.value).toBe('standard')
+      state.primeSelectedThread('speed-b')
+      expect(state.selectedSpeedMode.value).toBe('fast')
+      notificationHandler({ method: 'thread/settings/updated', params: { threadId: 'speed-b', threadSettings: { serviceTier: 'default' } } })
+      expect(state.selectedSpeedMode.value).toBe('standard')
+    } finally {
+      state.stopPolling()
+    }
+  })
+})
+
 describe('older item-page merging', () => {
   async function installPagedThread() {
     installTestWindow()
@@ -1261,7 +1381,7 @@ describe('provider model selection', () => {
     await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
     await state.sendMessageToNewThread('hi', '/tmp/project')
 
-    expect(gatewayMocks.startThread).toHaveBeenCalledWith('/tmp/project', 'gpt-5.5')
+    expect(gatewayMocks.startThread).toHaveBeenCalledWith('/tmp/project', 'gpt-5.5', 'standard')
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
       'codex-thread',
       'hi',
@@ -1271,6 +1391,7 @@ describe('provider model selection', () => {
       undefined,
       [],
       'default',
+      'standard',
     )
     expect(state.readModelIdForThread('codex-thread')).toBe('gpt-5.5')
     expect(state.messages.value.some((message) => (
@@ -1360,7 +1481,7 @@ describe('provider model selection', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('mini-thread')
+    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('mini-thread', 'standard')
     expect(state.messages.value.map((message) => `${message.role}:${message.text}`)).toEqual([
       'user:hi',
       'system:Worked for <1s',

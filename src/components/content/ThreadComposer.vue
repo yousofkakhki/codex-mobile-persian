@@ -809,11 +809,12 @@ const speedModeDescription = computed(() => {
   if (props.isUpdatingSpeedMode) {
     return t('Saving speed setting...')
   }
-  return props.selectedSpeedMode === 'fast'
+  const usageDescription = props.selectedSpeedMode === 'fast'
     ? getFastModeCreditMultiplier(props.selectedModel) === 2
       ? t('About 1.5x faster, with credits used at 2x')
       : t('About 1.5x faster, with credits used at 2.5x')
     : t('Default speed with normal credit usage')
+  return `${t('Only this chat. Applies to the next turn.')} ${usageDescription}`
 })
 const inProgressMode = computed<'steer' | 'queue'>(() =>
   props.inProgressSubmitMode === 'steer' ? 'steer' : 'queue',

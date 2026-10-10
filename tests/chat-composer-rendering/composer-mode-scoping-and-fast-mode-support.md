@@ -1,7 +1,7 @@
 ### Composer mode scoping and Fast mode support
 
 #### Feature/Change Name
-Plan mode is scoped to the current chat instead of becoming the default for every chat. Fast mode is available for supported GPT 5.4, GPT 5.5, GPT 5.6, and GPT-6 model IDs; Ultra reasoning is available for GPT-6 Astra.
+Plan mode and Fast mode are scoped to the current chat instead of becoming defaults for every chat. Fast mode is available for supported GPT 5.4, GPT 5.5, GPT 5.6, and GPT-6 model IDs; Ultra reasoning is available for GPT-6 Astra.
 
 #### Prerequisites/Setup
 1. Dev server running (`pnpm run dev`)
@@ -20,6 +20,13 @@ Plan mode is scoped to the current chat instead of becoming the default for ever
 8. Select a different model and confirm Ultra is unavailable.
 9. Select an unsupported model family and confirm the Fast mode switch is hidden.
 10. Switch to dark theme and repeat steps 1-9.
+11. Using synthetic RPC fixtures or disposable threads, enable Fast mode in thread A. Confirm `thread/settings/update` sends A's ID and `serviceTier: "priority"`, without any `config/batchWrite` request.
+12. Open thread B, confirm its Fast setting is unchanged, then return to A and confirm Fast is still enabled.
+13. Refresh the page and confirm A remains Fast. Disable Fast in A and confirm the request sends `serviceTier: "default"`. Repeat in dark theme.
+14. In Start new thread, enable Fast and send a synthetic first message. Confirm the created thread is Fast, but another new-chat draft starts in Standard mode.
+15. Send synthetic next turns from A and B and inspect their `turn/start` tiers. Fast sends `priority`; Standard sends `default`, even when global configuration enables Fast.
+16. With a delayed fixture response, toggle A's speed and switch to B before the save completes. Confirm a failed A save rolls back only A, and a stale history response cannot overwrite a newer toggle.
+17. Restart only an isolated test app-server, then reload the saved threads. Confirm `thread/resume` reapplies each saved tier. Never restart a production server with active work for this check.
 
 #### Expected Results
 - Enabling Plan mode in one existing thread does not enable it in other existing threads.
@@ -27,9 +34,15 @@ Plan mode is scoped to the current chat instead of becoming the default for ever
 - Fast mode is visible only for supported GPT 5.4, GPT 5.5, GPT 5.6, and GPT-6 model IDs, including dashed variants.
 - Ultra reasoning is available only for GPT-6 Astra.
 - Fast mode remains hidden for unsupported model families.
+- Changing Fast in one thread does not change any other thread or global Codex configuration.
+- Saved choices persist across page refresh and are reapplied on thread resume. Standard explicitly overrides an inherited Fast default.
+- A new-chat Fast selection applies only to the created chat, not later new-chat drafts.
+- Speed changes affect subsequent turns, not the response currently running. Queued turns inherit the loaded native thread setting; offline backend queue recovery without a browser resume is not covered by this check.
 - Composer controls and menus remain readable in light and dark themes.
 
 #### Rollback/Cleanup
 - Turn Plan mode off in any test threads if desired.
+- Restore each disposable thread's original Fast setting. Do not enable paid tiers or send provider requests on production threads just to test this feature.
+- Stop only disposable test containers/processes and remove their isolated homes when no longer needed. Browser persistence uses `codex-web-local.speed-mode-by-context.v1`; clear it only in the isolated test browser profile.
 
 ---
