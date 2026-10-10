@@ -23,7 +23,7 @@ import {
   getThreadQueueState,
   getThreadSummary,
   getWorkspaceRootsState,
-  setCodexSpeedMode,
+  setThreadSpeedMode,
   setThreadQueueState,
   setWorkspaceRootsState,
   getThreadTitleCache,
@@ -82,6 +82,7 @@ const THREAD_TOKEN_USAGE_STORAGE_KEY = 'codex-web-local.thread-token-usage.v1'
 const THREAD_TERMINAL_OPEN_STORAGE_KEY = 'codex-web-local.thread-terminal-open.v1'
 const SELECTED_THREAD_STORAGE_KEY = 'codex-web-local.selected-thread-id.v1'
 const SELECTED_MODEL_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.selected-model-by-context.v1'
+const SPEED_MODE_BY_CONTEXT_STORAGE_KEY = 'codex-web-local.speed-mode-by-context.v1'
 const LEGACY_SELECTED_MODEL_STORAGE_KEY = 'codex-web-local.selected-model-id.v1'
 const PROJECT_ORDER_STORAGE_KEY = 'codex-web-local.project-order.v1'
 const PROJECT_DISPLAY_NAME_STORAGE_KEY = 'codex-web-local.project-display-name.v1'
@@ -270,6 +271,26 @@ function loadSelectedModelMap(): Record<string, string> {
     next[NEW_THREAD_COLLABORATION_MODE_CONTEXT] = legacyModelId
   }
   return next
+}
+
+function loadSpeedModeMap(): Record<string, SpeedMode> {
+  const modes = createStringKeyedRecord<SpeedMode>()
+  if (typeof window === 'undefined') return modes
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SPEED_MODE_BY_CONTEXT_STORAGE_KEY) || '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return modes
+    for (const [contextId, mode] of Object.entries(parsed)) {
+      if (contextId && (mode === 'standard' || mode === 'fast')) modes[contextId] = mode
+    }
+  } catch {}
+  return modes
+}
+
+function saveSpeedModeMap(modes: Record<string, SpeedMode>): void {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(SPEED_MODE_BY_CONTEXT_STORAGE_KEY, JSON.stringify(modes))
+  } catch {}
 }
 
 function readSelectedModel(
@@ -1512,6 +1533,7 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[]
     effort: ReasoningEffort | ''
     collaborationMode: CollaborationModeKind
+    speedMode: SpeedMode
     fallbackRetried: boolean
   }
   const queuedMessagesByThreadId = ref<Record<string, QueuedMessage[]>>({})
@@ -1533,7 +1555,10 @@ export function useDesktopState() {
   )
   const selectedModelId = ref(readSelectedModel(selectedModelIdByContext.value, selectedThreadId.value))
   const selectedReasoningEffort = ref<ReasoningEffort | ''>('medium')
-  const selectedSpeedMode = ref<SpeedMode>('standard')
+  const speedModeByContext = ref<Record<string, SpeedMode>>(loadSpeedModeMap())
+  const speedUpdateVersionByContext = new Map<string, number>()
+  const updatingSpeedModeByContext = ref<Record<string, boolean>>({})
+  const selectedSpeedMode = computed<SpeedMode>(() => readSpeedModeForThread(selectedThreadId.value))
   const activeProviderId = ref('')
   const modelCatalogError = ref('')
   const codexCliMissingError = ref('')
@@ -1581,7 +1606,7 @@ export function useDesktopState() {
   const isThreadListFullyLoaded = ref(false)
   const isSendingMessage = ref(false)
   const isInterruptingTurn = ref(false)
-  const isUpdatingSpeedMode = ref(false)
+  const isUpdatingSpeedMode = computed(() => updatingSpeedModeByContext.value[toThreadContextId(selectedThreadId.value)] === true)
   const isRollingBack = ref(false)
 
   const error = ref('')
@@ -2000,11 +2025,11 @@ export function useDesktopState() {
       setTurnSummaryForThread(threadId, null)
       setTurnActivityForThread(threadId, {
         label: 'Thinking',
-        details: buildPendingTurnDetails(MODEL_FALLBACK_ID, pending.effort, pending.collaborationMode),
+        details: buildPendingTurnDetails(MODEL_FALLBACK_ID, pending.effort, pending.collaborationMode, pending.speedMode),
       })
       setThreadInProgress(threadId, true)
 
-      await ensureGlobalProviderForTurn(threadId)
+      await ensureGlobalProviderForTurn(threadId, pending.speedMode)
 
       await startThreadTurn(
         threadId,
@@ -2015,6 +2040,7 @@ export function useDesktopState() {
         pending.skills.length > 0 ? pending.skills : undefined,
         pending.fileAttachments,
         pending.collaborationMode,
+        pending.speedMode,
       )
 
       scheduleRateLimitRefresh()
@@ -2053,24 +2079,43 @@ export function useDesktopState() {
     return supportsReasoningEffort(modelId, effort, availableModelMetadata.value.find(model => model.id === modelId))
   }
 
+  function readSpeedModeForThread(threadId: string): SpeedMode {
+    return speedModeByContext.value[toThreadContextId(threadId)] ?? 'standard'
+  }
+
+  function saveSpeedModeForContext(contextId: string, mode: SpeedMode): void {
+    if (speedModeByContext.value[contextId] === mode) return
+    const next = cloneStringKeyedRecord(speedModeByContext.value)
+    next[contextId] = mode
+    speedModeByContext.value = next
+    saveSpeedModeMap(next)
+  }
+
   async function updateSelectedSpeedMode(mode: SpeedMode): Promise<void> {
+    const threadId = selectedThreadId.value.trim()
+    const contextId = toThreadContextId(threadId)
     const nextMode: SpeedMode = mode === 'fast' ? 'fast' : 'standard'
-    if (isUpdatingSpeedMode.value || selectedSpeedMode.value === nextMode) {
+    if (updatingSpeedModeByContext.value[contextId] || readSpeedModeForThread(threadId) === nextMode) {
       return
     }
 
-    const previousMode = selectedSpeedMode.value
-    selectedSpeedMode.value = nextMode
-    isUpdatingSpeedMode.value = true
+    const previousMode = speedModeByContext.value[contextId]
+    speedUpdateVersionByContext.set(contextId, (speedUpdateVersionByContext.get(contextId) ?? 0) + 1)
+    saveSpeedModeForContext(contextId, nextMode)
+    if (!threadId) return
+    updatingSpeedModeByContext.value = { ...updatingSpeedModeByContext.value, [contextId]: true }
     error.value = ''
 
     try {
-      await setCodexSpeedMode(nextMode)
+      await setThreadSpeedMode(threadId, nextMode)
     } catch (unknownError) {
-      selectedSpeedMode.value = previousMode
-      error.value = unknownError instanceof Error ? unknownError.message : 'Failed to update Fast mode'
+      speedModeByContext.value = previousMode === undefined
+        ? omitKey(speedModeByContext.value, contextId)
+        : { ...speedModeByContext.value, [contextId]: previousMode }
+      saveSpeedModeMap(speedModeByContext.value)
+      if (selectedThreadId.value === threadId) error.value = unknownError instanceof Error ? unknownError.message : 'Failed to update Fast mode'
     } finally {
-      isUpdatingSpeedMode.value = false
+      updatingSpeedModeByContext.value = omitKey(updatingSpeedModeByContext.value, contextId)
     }
   }
 
@@ -2090,11 +2135,12 @@ export function useDesktopState() {
     modelId: string,
     effort: ReasoningEffort | '',
     collaborationMode: CollaborationModeKind = selectedCollaborationMode.value,
+    speedMode: SpeedMode = selectedSpeedMode.value,
   ): string[] {
     const modelLabel = modelId.trim() || 'default'
     const effortLabel = effort || 'default'
     const modeLabel = collaborationMode === 'plan' ? 'Plan' : 'Default'
-    const speedLabel = selectedSpeedMode.value === 'fast' ? 'Fast' : 'Standard'
+    const speedLabel = speedMode === 'fast' ? 'Fast' : 'Standard'
     return [`Mode: ${modeLabel}`, `Model: ${modelLabel}`, `Thinking: ${effortLabel}`, `Speed: ${speedLabel}`]
   }
 
@@ -2186,7 +2232,6 @@ export function useDesktopState() {
       } else {
         ensureSelectedReasoningEffortSupportsModel(activeModelId)
       }
-      selectedSpeedMode.value = currentConfig.speedMode
     } catch (unknownError) {
       if (isCodexCliMissingError(unknownError)) {
         codexCliMissingError.value = CODEX_CLI_MISSING_MESSAGE
@@ -4159,6 +4204,16 @@ export function useDesktopState() {
     if (notification.method === 'thread/tokenUsage/updated') return
 
     const method = notification.method
+    if (method === 'thread/settings/updated') {
+      const params = asRecord(notification.params)
+      const settings = asRecord(params?.threadSettings)
+      const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
+      const contextId = toThreadContextId(threadId)
+      if (threadId && settings && 'serviceTier' in settings && !updatingSpeedModeByContext.value[contextId]) {
+        speedUpdateVersionByContext.set(contextId, (speedUpdateVersionByContext.get(contextId) ?? 0) + 1)
+        saveSpeedModeForContext(contextId, settings.serviceTier === 'priority' || settings.serviceTier === 'fast' ? 'fast' : 'standard')
+      }
+    }
     const shouldRefreshMessages =
       method === 'turn/started' ||
       method === 'turn/completed' ||
@@ -4552,6 +4607,8 @@ export function useDesktopState() {
     if (!threadId) {
       return
     }
+    const speedContextId = toThreadContextId(threadId)
+    const speedVersion = speedUpdateVersionByContext.get(speedContextId) ?? 0
     const recentLoadFailure =
       Date.now() - (lastMessageLoadFailureAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
     if (turnErrorByThreadId.value[threadId]?.transient && (options.silent === true || recentLoadFailure)) {
@@ -4593,12 +4650,20 @@ export function useDesktopState() {
 
       if (!activeProviderId.value) await refreshModelPreferences({ includeProviderModels: true })
       const needsResume = resumedThreadById.value[threadId] !== true
+      const savedSpeedMode = speedModeByContext.value[speedContextId]
       const resumeOptions = activeProviderId.value && !modelCatalogError.value && availableModelIds.value.length > 0
-        ? { modelProvider: readProviderIdForThread(threadId), model: readProviderCompatibleSelectedModel(readModelIdForThread(threadId)) }
-        : undefined
+        ? { modelProvider: readProviderIdForThread(threadId), model: readProviderCompatibleSelectedModel(readModelIdForThread(threadId)), ...(savedSpeedMode ? { speedMode: savedSpeedMode } : {}) }
+        : savedSpeedMode
       const resumedThread = needsResume ? await resumeThread(threadId, resumeOptions) : null
-      const detail = resumedThread ?? await getThreadDetail(threadId)
+      const detail = resumedThread ?? await getThreadDetail(threadId, savedSpeedMode)
       if (resumedThread) readOnlyThreadById.value = { ...readOnlyThreadById.value, [threadId]: resumedThread.readOnly === true }
+      if (
+        detail.speedMode !== undefined &&
+        !updatingSpeedModeByContext.value[speedContextId] &&
+        speedVersion === (speedUpdateVersionByContext.get(speedContextId) ?? 0)
+      ) {
+        saveSpeedModeForContext(speedContextId, detail.speedMode)
+      }
 
       if (detail.modelProvider) {
         setThreadModelProviderId(threadId, detail.modelProvider)
@@ -5208,6 +5273,7 @@ export function useDesktopState() {
     const targetCwd = cwd.trim()
     const selectedModel = readModelIdForThread(NEW_THREAD_COLLABORATION_MODE_CONTEXT).trim()
     const selectedMode = selectedCollaborationMode.value
+    const selectedSpeed = selectedSpeedMode.value
     if (!nextText && imageUrls.length === 0 && fileAttachments.length === 0) return ''
 
     isSendingMessage.value = true
@@ -5216,7 +5282,7 @@ export function useDesktopState() {
 
     try {
       try {
-        const startedThread = await startThread(targetCwd || undefined, selectedModel || undefined)
+        const startedThread = await startThread(targetCwd || undefined, selectedModel || undefined, selectedSpeed)
         threadId = startedThread.threadId
         setThreadModelId(threadId, startedThread.model)
         setThreadModelProviderId(threadId, startedThread.modelProvider || activeProviderId.value)
@@ -5224,7 +5290,7 @@ export function useDesktopState() {
       } catch (unknownError) {
         if (canUseChatGptFallback('') && selectedModel && selectedModel !== MODEL_FALLBACK_ID && isUnsupportedChatGptModelError(unknownError)) {
           await applyFallbackModelSelection()
-          const fallbackThread = await startThread(targetCwd || undefined, MODEL_FALLBACK_ID)
+          const fallbackThread = await startThread(targetCwd || undefined, MODEL_FALLBACK_ID, selectedSpeed)
           threadId = fallbackThread.threadId
           setThreadModelId(threadId, fallbackThread.model)
           setThreadModelProviderId(threadId, fallbackThread.modelProvider || activeProviderId.value)
@@ -5234,6 +5300,9 @@ export function useDesktopState() {
         }
       }
       if (!threadId) return ''
+      saveSpeedModeForContext(toThreadContextId(threadId), selectedSpeed)
+      speedModeByContext.value = omitKey(speedModeByContext.value, NEW_THREAD_COLLABORATION_MODE_CONTEXT)
+      saveSpeedModeMap(speedModeByContext.value)
 
       insertOptimisticThread(threadId, targetCwd, nextText || '[Image]')
       appendOptimisticUserMessage(threadId, nextText, imageUrls, skills, fileAttachments)
@@ -5291,7 +5360,7 @@ export function useDesktopState() {
     }
   }
 
-  async function ensureGlobalProviderForTurn(threadId: string): Promise<void> {
+  async function ensureGlobalProviderForTurn(threadId: string, speedMode?: SpeedMode): Promise<void> {
     assertThreadWritable(threadId)
     if (modelCatalogError.value) throw new Error(modelCatalogError.value)
     if (!activeProviderId.value) await refreshModelPreferences({ includeProviderModels: true })
@@ -5302,7 +5371,7 @@ export function useDesktopState() {
     if (!modelId) throw new Error('No compatible model is available for the global provider')
     if (modelId !== readModelIdForThread(threadId)) setSelectedModelIdForThread(threadId, modelId)
     if (resumedThreadById.value[threadId] === true && threadModelProviderByThreadId.value[threadId] === providerId) return
-    const resumed = await resumeThread(threadId, { modelProvider: providerId, model: modelId })
+    const resumed = await resumeThread(threadId, { modelProvider: providerId, model: modelId, ...(speedMode ? { speedMode } : {}) })
     if (routingGeneration !== providerRoutingGeneration || providerId !== readProviderIdForThread(threadId)) {
       throw new Error('Global provider changed while resuming; retry the message')
     }
@@ -5324,6 +5393,7 @@ export function useDesktopState() {
     collaborationModeOverride?: CollaborationModeKind,
   ): Promise<void> {
     const requestedReasoningEffort = selectedReasoningEffort.value
+    const speedMode = readSpeedModeForThread(threadId)
     let reasoningEffort = isReasoningEffortSupported(
       readModelIdForThread(threadId),
       requestedReasoningEffort,
@@ -5354,11 +5424,12 @@ export function useDesktopState() {
       fileAttachments: normalizedFileAttachments,
       effort: reasoningEffort,
       collaborationMode,
+      speedMode,
       fallbackRetried: false,
     })
 
     try {
-      await ensureGlobalProviderForTurn(threadId)
+      await ensureGlobalProviderForTurn(threadId, speedMode)
       const modelId = readModelIdForThread(threadId)
       const nextReasoningEffort = isReasoningEffortSupported(modelId, requestedReasoningEffort)
         ? requestedReasoningEffort
@@ -5372,6 +5443,7 @@ export function useDesktopState() {
           fileAttachments: normalizedFileAttachments,
           effort: reasoningEffort,
           collaborationMode,
+          speedMode,
           fallbackRetried: false,
         })
       }
@@ -5387,6 +5459,7 @@ export function useDesktopState() {
           skills.length > 0 ? skills : undefined,
           fileAttachments,
           collaborationMode,
+          speedMode,
         )
       } catch (unknownError) {
         if (canUseChatGptFallback(threadId) && modelId && modelId !== MODEL_FALLBACK_ID && isUnsupportedChatGptModelError(unknownError)) {
@@ -5401,6 +5474,7 @@ export function useDesktopState() {
             fileAttachments: normalizedFileAttachments,
             effort: fallbackReasoningEffort,
             collaborationMode,
+            speedMode,
             fallbackRetried: true,
           })
           startedTurnId = await startThreadTurn(
@@ -5412,6 +5486,7 @@ export function useDesktopState() {
             skills.length > 0 ? skills : undefined,
             fileAttachments,
             collaborationMode,
+            speedMode,
           )
         } else {
           throw unknownError

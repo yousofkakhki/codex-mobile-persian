@@ -5,6 +5,7 @@ export type UiLanguage = 'en' | 'zh-CN'
 const UI_LANGUAGE_STORAGE_KEY = 'codex-web-local.ui-language.v1'
 
 const zhCN: Record<string, string> = {
+  'Only this chat. Applies to the next turn.': '仅当前聊天。对下一轮生效。',
   'English': 'English',
   'Simplified Chinese': '简体中文',
   'Search threads': '搜索线程',

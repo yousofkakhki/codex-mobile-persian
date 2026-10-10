@@ -28,6 +28,7 @@ function resumed(headers: unknown[], nextCursor: string | null = null) {
   return {
     thread: { id: 'thread', turns: [], status: { type: 'active', activeFlags: [] } },
     model: 'cx/gpt-6.1-sol', modelProvider: 'ninerouter',
+    serviceTier: 'priority',
     initialTurnsPage: { data: headers, nextCursor, backwardsCursor: null },
   }
 }
@@ -48,6 +49,7 @@ describe('item-paged thread history', () => {
     expect(detail.activeTurnId).toBe(latestTurn)
     expect(detail.inProgress).toBe(true)
     expect(detail.modelProvider).toBe('ninerouter')
+    expect(detail.speedMode).toBe('fast')
     expect(detail.olderCursor).toBe('item-history:{"items":"items+older/1","turns":null}')
   })
 

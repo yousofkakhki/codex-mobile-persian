@@ -4,7 +4,7 @@ import ts from 'typescript'
 import { ref } from 'vue'
 import type { ThreadGoal } from './codexGateway'
 import * as gateway from './codexGateway'
-import { clearThreadGoal, getAvailableModelIds, getGoalBudgetOwnerAuthorization, getOlderThreadMessages, getThreadDetail, getThreadGoal, resumeThread, setCodexSpeedMode, setThreadGoal, startThreadTurn } from './codexGateway'
+import { clearThreadGoal, getAvailableModelIds, getGoalBudgetOwnerAuthorization, getOlderThreadMessages, getThreadDetail, getThreadGoal, resumeThread, setThreadSpeedMode, setThreadGoal, startThreadTurn } from './codexGateway'
 
 function mockRpcFetch(): { requests: Array<{ method: string, params: Record<string, unknown> }> } {
   const requests: Array<{ method: string, params: Record<string, unknown> }> = []
@@ -18,6 +18,7 @@ function mockRpcFetch(): { requests: Array<{ method: string, params: Record<stri
 
     return new Response(JSON.stringify({
       result: {
+        data: [], nextCursor: null, backwardsCursor: null,
         thread: { turns: [], status: 'idle' },
         model: 'model-x',
         modelProvider: 'openai',
@@ -81,25 +82,49 @@ describe('startThreadTurn collaboration mode payloads', () => {
   })
 })
 
-describe('setCodexSpeedMode', () => {
+describe('setThreadSpeedMode', () => {
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  it('disables the persisted Fast feature when switching back to Standard', async () => {
+  it('writes only the selected thread tier and explicitly disables inherited Fast', async () => {
     const { requests } = mockRpcFetch()
 
-    await setCodexSpeedMode('fast')
-    await setCodexSpeedMode('standard')
+    await setThreadSpeedMode('thread-fast', 'fast')
+    await setThreadSpeedMode('thread-standard', 'standard')
 
-    expect((requests[0].params as { edits: unknown }).edits).toEqual([
-      { keyPath: 'features.fast_mode', value: true, mergeStrategy: 'upsert' },
-      { keyPath: 'service_tier', value: 'fast', mergeStrategy: 'upsert' },
+    expect(requests).toEqual([
+      { method: 'thread/settings/update', params: { threadId: 'thread-fast', serviceTier: 'priority' } },
+      { method: 'thread/settings/update', params: { threadId: 'thread-standard', serviceTier: 'default' } },
     ])
-    expect((requests[1].params as { edits: unknown }).edits).toEqual([
-      { keyPath: 'features.fast_mode', value: false, mergeStrategy: 'upsert' },
-      { keyPath: 'service_tier', value: null, mergeStrategy: 'replace' },
+  })
+
+  it('sends per-turn tiers explicitly without any global config write', async () => {
+    const { requests } = mockRpcFetch()
+    await startThreadTurn('fast-a', 'synthetic fast', [], 'cx/gpt-6.1-sol', 'high', [], [], 'default', 'fast')
+    await startThreadTurn('standard-b', 'synthetic standard', [], 'cx/gpt-6.1-sol', 'high', [], [], 'default', 'standard')
+    expect(requests.map(request => [request.method, request.params.serviceTier])).toEqual([
+      ['turn/start', 'priority'], ['turn/start', 'default'],
     ])
+  })
+
+  it('reapplies saved Standard and Fast choices during resume after a server restart', async () => {
+    const { requests } = mockRpcFetch()
+    await resumeThread('resume-standard-mode', 'standard')
+    await resumeThread('resume-fast-mode', 'fast')
+    expect(requests.filter(request => request.method === 'thread/resume').map(request => request.params.serviceTier)).toEqual(['default', 'priority'])
+  })
+
+  it('coalesces only matching resume tiers and invalidates resumes after a setting update', async () => {
+    const { requests } = mockRpcFetch()
+    await Promise.all([
+      resumeThread('resume-cache-mode', 'standard'),
+      resumeThread('resume-cache-mode', 'standard'),
+    ])
+    await resumeThread('resume-cache-mode', 'fast')
+    await setThreadSpeedMode('resume-cache-mode', 'standard')
+    await resumeThread('resume-cache-mode', 'standard')
+    expect(requests.filter(request => request.method === 'thread/resume').map(request => request.params.serviceTier)).toEqual(['default', 'priority', 'default'])
   })
 })
 

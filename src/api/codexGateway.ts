@@ -747,12 +747,16 @@ function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
 }
 
 function normalizeSpeedMode(value: unknown): SpeedMode {
-  return typeof value === 'string' && value.trim().toLowerCase() === 'fast'
+  return typeof value === 'string' && ['fast', 'priority'].includes(value.trim().toLowerCase())
     ? 'fast'
     : 'standard'
 }
 
 const INITIAL_THREAD_LIST_LIMIT = 50
+export function getSpeedModeServiceTier(mode: SpeedMode): 'priority' | 'default' {
+  return mode === 'fast' ? 'priority' : 'default'
+}
+
 const BACKGROUND_THREAD_LIST_LIMIT = 100
 const THREAD_ITEM_PAGE_LIMIT = 100
 const THREAD_HEADER_PAGE_LIMIT = 10
@@ -836,6 +840,7 @@ async function buildRecentThreadDetail(
     hasMoreOlder: Boolean(olderCursor),
     olderCursor,
     turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
+    ...('serviceTier' in payload ? { speedMode: normalizeSpeedMode(payload.serviceTier) } : {}),
   }
 }
 
@@ -886,7 +891,7 @@ async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
   return normalizeThreadSummaryV2(payload)
 }
 
-async function getThreadDetailV2(threadId: string, options: ThreadResumeOptions = {}): Promise<{
+async function getThreadDetailV2(threadId: string, optionsOrSpeed: ThreadResumeOptions | SpeedMode = {}): Promise<{
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -896,12 +901,14 @@ async function getThreadDetailV2(threadId: string, options: ThreadResumeOptions 
   turnIndexByTurnId: ThreadTurnIndexById
   olderCursor: string | null
 }> {
+  const options = typeof optionsOrSpeed === 'string' ? { speedMode: optionsOrSpeed } : optionsOrSpeed
   const payload = await callRpc<ThreadResumeResponse>('thread/resume', {
     threadId,
     excludeTurns: true,
     initialTurnsPage: { limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded' },
     ...(options.model ? { model: options.model } : {}),
     ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
+    ...(options.speedMode ? { serviceTier: getSpeedModeServiceTier(options.speedMode) } : {}),
   })
   return buildRecentThreadDetail(threadId, payload)
 }
@@ -985,7 +992,7 @@ export async function getThreadSummary(threadId: string): Promise<UiThread> {
   }
 }
 
-export async function getThreadDetail(threadId: string, options: ThreadResumeOptions = {}): Promise<ResumedThread> {
+export async function getThreadDetail(threadId: string, options: ThreadResumeOptions | SpeedMode = {}): Promise<ResumedThread> {
   try {
     return await getThreadDetailV2(threadId, options)
   } catch (error) {
@@ -1622,6 +1629,7 @@ export type ResumedThread = {
   readOnly?: boolean
   model: string
   modelProvider: string
+  speedMode?: SpeedMode
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
@@ -1660,10 +1668,11 @@ async function getReadOnlyThreadDetailV2(threadId: string): Promise<ResumedThrea
   }
 }
 
-export type ThreadResumeOptions = { model?: string; modelProvider?: string }
+export type ThreadResumeOptions = { model?: string; modelProvider?: string; speedMode?: SpeedMode }
 
-export async function resumeThread(threadId: string, options: ThreadResumeOptions = {}): Promise<ResumedThread> {
-  const resumeKey = JSON.stringify([threadId, options.model ?? '', normalizeRuntimeProviderId(options.modelProvider ?? '')])
+export async function resumeThread(threadId: string, optionsOrSpeed: ThreadResumeOptions | SpeedMode = {}): Promise<ResumedThread> {
+  const options = typeof optionsOrSpeed === 'string' ? { speedMode: optionsOrSpeed } : optionsOrSpeed
+  const resumeKey = JSON.stringify([threadId, options.model ?? '', normalizeRuntimeProviderId(options.modelProvider ?? ''), options.speedMode ?? null])
   const existing = recentResumeThreadById.get(resumeKey)
   if (existing) return existing
 
@@ -1675,6 +1684,7 @@ export async function resumeThread(threadId: string, options: ThreadResumeOption
       initialTurnsPage: { limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded' },
       ...(options.model ? { model: options.model } : {}),
       ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
+      ...(options.speedMode ? { serviceTier: getSpeedModeServiceTier(options.speedMode) } : {}),
     }
     try {
       payload = await callRpc<ThreadResumeResponse>('thread/resume', params)
@@ -1840,9 +1850,9 @@ export type ForkedThread = {
   messages: UiMessage[]
 }
 
-export async function startThread(cwd?: string, model?: string): Promise<StartedThread> {
+export async function startThread(cwd?: string, model?: string, speedMode: SpeedMode = 'standard'): Promise<StartedThread> {
   try {
-    const params: Record<string, unknown> = {}
+    const params: Record<string, unknown> = { serviceTier: getSpeedModeServiceTier(speedMode) }
     if (typeof cwd === 'string' && cwd.trim().length > 0) {
       params.cwd = cwd.trim()
     }
@@ -2014,6 +2024,7 @@ export async function startThreadTurn(
   skills?: Array<{ name: string; path: string }>,
   fileAttachments: FileAttachmentParam[] = [],
   collaborationMode?: CollaborationModeKind,
+  speedMode: SpeedMode = 'standard',
 ): Promise<string> {
   try {
     const normalizedModel = model?.trim() ?? ''
@@ -2058,6 +2069,7 @@ export async function startThreadTurn(
     const params: Record<string, unknown> = {
       threadId,
       input,
+      serviceTier: getSpeedModeServiceTier(speedMode),
     }
     if (attachments.length > 0) params.attachments = attachments
     if (normalizedModel) {
@@ -2103,24 +2115,15 @@ export async function setDefaultModel(model: string): Promise<void> {
   await callRpc('setDefaultModel', { model })
 }
 
-export async function setCodexSpeedMode(mode: SpeedMode): Promise<void> {
-  const normalizedMode: SpeedMode = mode === 'fast' ? 'fast' : 'standard'
-  await callRpc('config/batchWrite', {
-    edits: [
-      {
-        keyPath: 'features.fast_mode',
-        value: normalizedMode === 'fast',
-        mergeStrategy: 'upsert',
-      },
-      {
-        keyPath: 'service_tier',
-        value: normalizedMode === 'fast' ? 'fast' : null,
-        mergeStrategy: normalizedMode === 'fast' ? 'upsert' : 'replace',
-      },
-    ],
-    filePath: null,
-    expectedVersion: null,
+export async function setThreadSpeedMode(threadId: string, mode: SpeedMode): Promise<void> {
+  if (!threadId.trim()) throw new Error('A thread is required to save its speed setting')
+  await callRpc('thread/settings/update', {
+    threadId: threadId.trim(),
+    serviceTier: getSpeedModeServiceTier(mode),
   })
+  for (const cacheKey of recentResumeThreadById.keys()) {
+    if ((JSON.parse(cacheKey) as unknown[])[0] === threadId.trim()) recentResumeThreadById.delete(cacheKey)
+  }
 }
 
 export interface FreeModeStatus {
