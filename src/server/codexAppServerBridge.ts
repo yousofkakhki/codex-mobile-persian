@@ -6274,6 +6274,7 @@ class AppServerProcess {
   private readonly pendingPermissionSettingsById = new Map<number, AppServerPermissionRequest>()
   // Subscription removal acknowledges no writer shutdown; protect until thread/closed.
   private readonly writerThreadIds = new Set<string>()
+  private readonly writerMetadataByThreadId = new Map<string, Record<string, unknown>>()
   private readonly timedOutRpcIds = new Map<number, string>()
   private readonly resumePromisesByRequest = new Map<string, Promise<unknown>>()
   private readonly resumeTailsByThreadId = new Map<string, Promise<unknown>>()
@@ -6344,6 +6345,7 @@ class AppServerProcess {
     this.permissionSettingsRevisionByThreadId.clear()
     this.possiblePermissionChangesById.clear()
     this.writerThreadIds.clear()
+    this.writerMetadataByThreadId.clear()
     this.timedOutRpcIds.clear()
     const config = preparedConfig ?? this.buildAppServerConfig()
     this.activeSQLiteHome = config.sqliteHome
@@ -6442,6 +6444,13 @@ class AppServerProcess {
         }
       }
       this.timedOutRpcIds.delete(message.id)
+      if (!message.error && (acquisitionMethod === 'thread/resume' || acquisitionMethod === 'thread/start')) {
+        const acquiredThreadId = readNonEmptyString(asRecord(asRecord(message.result)?.thread)?.id)
+        // A successful native acquisition owns a writer even if caller identity or
+        // permission validation rejects its result. Protect the actual returned ID
+        // before resolving the promise; only a subsequent confirmed close releases it.
+        if (acquiredThreadId) this.writerThreadIds.add(acquiredThreadId)
+      }
       if (!message.error && currentPermissionRequest && (acquisitionMethod === 'thread/resume' || acquisitionMethod === 'thread/start')) {
         const result = asRecord(message.result)
         const threadId = readNonEmptyString(asRecord(result?.thread)?.id)
@@ -6451,6 +6460,7 @@ class AppServerProcess {
           permissionRequest.epoch = this.permissionEpochByThreadId.get(threadId) ?? 0
           const { thread: _thread, initialTurnsPage: _page, turnsBackwardsCursor: _turnsCursor, itemsBackwardsCursor: _itemsCursor, ...runtimeMetadata } = result ?? {}
           this.joinedThreads.set(threadId, runtimeMetadata)
+          this.writerMetadataByThreadId.set(threadId, runtimeMetadata)
           if (permissionRequest) {
             this.permissionIntentByThreadId.set(threadId, permissionRequest.intent)
             this.acceptedPermissionOrderByThreadId.set(threadId, { approvalPolicy: permissionRequest.intent.approvalPolicy ? permissionRequest.order : 0, sandbox: permissionRequest.intent.sandbox ? permissionRequest.order : 0 })
@@ -6460,7 +6470,7 @@ class AppServerProcess {
         }
       }
       if (!message.error && currentPermissionRequest && acquisitionMethod === 'turn/start' && permissionRequest?.threadId
-        && this.joinedThreads.has(permissionRequest.threadId) && this.writerThreadIds.has(permissionRequest.threadId)) {
+        && this.writerThreadIds.has(permissionRequest.threadId)) {
         if (this.pendingHotPermissionsByThreadId.get(permissionRequest.threadId) === permissionRequest.pendingHotPermissions) {
           this.pendingHotPermissionsByThreadId.delete(permissionRequest.threadId)
           this.hotPermissionOrderByThreadId.delete(permissionRequest.threadId)
@@ -6628,6 +6638,7 @@ class AppServerProcess {
         this.permissionIntentByThreadId.delete(nThreadId)
         this.pendingHotPermissionsByThreadId.delete(nThreadId)
         this.writerThreadIds.delete(nThreadId)
+        this.writerMetadataByThreadId.delete(nThreadId)
       }
       if (notification.method === 'thread/settings/updated' || notification.method === 'error') this.observePermissionSettings(notification, nThreadId)
       this.invalidateLiveStateCache(nThreadId)
@@ -7174,7 +7185,9 @@ class AppServerProcess {
     const idleRead = asRecord(await this.call('thread/read', { threadId, includeTurns: false }, generation))
     assertAllowed()
     const thread = asRecord(idleRead?.thread)
-    if (thread?.id !== threadId || (asRecord(thread?.status)?.type !== 'idle' && !(activePause && asRecord(thread?.status)?.type === 'inProgress'))
+    const threadStatus = asRecord(thread?.status)?.type
+    const activeWriterPause = activePause && (threadStatus === 'active' || threadStatus === 'inProgress')
+    if (thread?.id !== threadId || (threadStatus !== 'idle' && !activeWriterPause)
       || lastTurnStart() !== turnStartBefore) throw new Error('Thread mutation requires an idle owned writer; no mutation was sent.')
     const permit = Object.freeze({})
     this.goalWritePermits.set(permit, { method, params: nativeParams, generation, lease, assertAllowed })
@@ -7200,9 +7213,16 @@ class AppServerProcess {
     const after = asRecord(afterResponse?.goal)
     const cap = explicitBudget ? intent.tokenBudget : before?.tokenBudget
     const exhaustedNormalization = !explicitBudget && expectedStatus === 'active' && typeof cap === 'number' && cap <= (before?.tokensUsed as number) && after?.status === 'budgetLimited'
+    // A status-only active pause can overlap the existing turn's native usage
+    // flush. Preserve nondecreasing accounting only for that narrow exception;
+    // idle edits/creation/budget writes still require exact accounting equality.
+    const accountingPreserved = activeWriterPause && before && after
+      ? typeof after.tokensUsed === 'number' && after.tokensUsed >= (before.tokensUsed as number)
+        && typeof after.timeUsedSeconds === 'number' && after.timeUsedSeconds >= (before.timeUsedSeconds as number)
+      : after?.tokensUsed === (before?.tokensUsed ?? 0) && after?.timeUsedSeconds === (before?.timeUsedSeconds ?? 0)
     if (!after || !validGoal(after) || (after.status !== expectedStatus && !exhaustedNormalization)
       || after.objective !== expectedObjective || after.tokenBudget !== cap
-      || after.tokensUsed !== (before?.tokensUsed ?? 0) || after.timeUsedSeconds !== (before?.timeUsedSeconds ?? 0)
+      || !accountingPreserved
       || (before && after.createdAt !== before.createdAt)) return fail(502, 'Goal update failed post-write verification; no retry or repair was sent')
     if (explicitBudget) {
       await appendGoalBudgetAuditRecord(getCodexHomeDir(), {
@@ -7259,17 +7279,30 @@ class AppServerProcess {
     }
   }
 
+  private resumeInitialTurnsPage(input: unknown): Record<string, unknown> | null {
+    const page = asRecord(input)
+    if (!page) return null
+    // Pinned V2 initial pages have no identity or cursor. Never spread caller
+    // fields into a read target, even when the transport ignores unknown fields.
+    return {
+      limit: Math.min(THREAD_RESPONSE_TURN_LIMIT, Math.max(1, Number(page.limit) || THREAD_RESPONSE_TURN_LIMIT)),
+      ...(page.sortDirection !== undefined ? { sortDirection: page.sortDirection } : {}),
+      ...(page.itemsView !== undefined ? { itemsView: page.itemsView } : {}),
+    }
+  }
+
   private async rpcInner(method: string, params: unknown, goalLease?: object): Promise<unknown> {
     if (this.process && this.timedOutRpcIds.size) throw new Error('Codex still has an unresolved timed-out operation; no retry was sent and active writers were preserved.')
     const record = params && typeof params === 'object' ? params as Record<string, unknown> : null
     const threadId = typeof record?.threadId === 'string' ? record.threadId.trim() : ''
-    const hotPermissionProcess = method === 'thread/resume' && this.joinedThreads.has(threadId) ? this.process : null
-    const permissionEpoch = this.permissionEpochByThreadId.get(threadId) ?? 0
+    const permissionProcess = this.process
+    const hotPermissionProcess = method === 'thread/resume' && this.writerThreadIds.has(threadId) ? this.process : null
+    let permissionEpoch = this.permissionEpochByThreadId.get(threadId) ?? 0
     const permissionOrder = ['thread/start', 'thread/resume', 'turn/start', 'thread/settings/update'].includes(method) ? this.nextPermissionOrder++ : 0
     const assertHotPermissionOwnership = (): void => {
       if (hotPermissionProcess && (this.process !== hotPermissionProcess
         || (this.permissionEpochByThreadId.get(threadId) ?? 0) !== permissionEpoch
-        || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId))) {
+        || !this.writerThreadIds.has(threadId))) {
         throw new Error('Hot permission writer changed while reading; no permission choice was staged.')
       }
     }
@@ -7304,13 +7337,17 @@ class AppServerProcess {
     if (this.configChangeDeferred && !safeWhileDeferred.has(method) && method !== 'thread/resume') {
       throw new Error('App-server configuration change is deferred until attached writers are explicitly released; no mutation was sent.')
     }
-    if (this.configChangeDeferred && method === 'thread/resume' && !this.joinedThreads.has(threadId)) {
+    if (this.configChangeDeferred && method === 'thread/resume' && !this.writerThreadIds.has(threadId)) {
       throw new Error('App-server configuration change is deferred until attached writers are explicitly released; no acquisition was sent.')
     }
     if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'thread/items/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
     this.start(preparedConfig)
     const rpcProcess = this.process!
+    // start resets permission epochs for its new child. Never inherit a retired
+    // generation's closure epoch, or rebase a closure within the same child.
+    if (rpcProcess !== permissionProcess) permissionEpoch = this.permissionEpochByThreadId.get(threadId) ?? 0
     await this.ensureInitialized()
+    if (this.process !== rpcProcess || !this.initialized) throw new Error('codex app-server changed during RPC initialization; retry the request')
     assertHotPermissionOwnership()
     assertDirectMutationOwnership()
     if (threadId && (directMutation || ['thread/resume', 'thread/read', 'thread/turns/list', 'thread/items/list', 'turn/start', 'thread/rollback'].includes(method))) {
@@ -7332,22 +7369,24 @@ class AppServerProcess {
     // The connection already observes this writer. A hot resume cannot apply overrides and
     // unnecessarily runs another persistence/listener barrier in Codex's serial RPC handler.
     // Use the supported bounded read APIs without releasing subscriptions or active writers.
-    if (method === 'thread/resume' && threadId && this.joinedThreads.has(threadId)) {
+    if (method === 'thread/resume' && threadId && this.writerThreadIds.has(threadId)) {
       if (record?.excludeTurns !== true) throw new Error('Loaded thread history requires bounded pagination; active writer preserved.')
       const pendingPermissions = prepareAppServerHotPermissionOverrides(params)
       const summary = asRecord(await this.call('thread/read', { threadId, includeTurns: false }, rpcProcess))
       assertHotPermissionOwnership()
       const thread = asRecord(summary?.thread)
       if (!thread) throw new Error('Thread metadata was not returned; active writer preserved.')
-      const previous = asRecord(this.joinedThreads.get(threadId))
-      const pageParams = asRecord(record?.initialTurnsPage)
-      const initialTurnsPage = pageParams
-        ? await this.call('thread/turns/list', {
-          threadId,
-          ...pageParams,
-          limit: Math.min(THREAD_RESPONSE_TURN_LIMIT, Math.max(1, Number(pageParams.limit) || THREAD_RESPONSE_TURN_LIMIT)),
-        }, rpcProcess)
-        : undefined
+      const previous = asRecord(this.joinedThreads.get(threadId)) ?? this.writerMetadataByThreadId.get(threadId)
+      const pageParams = this.resumeInitialTurnsPage(record?.initialTurnsPage)
+      let initialTurnsPage: unknown
+      if (pageParams) {
+        // Reinspect the exact final target at the page boundary after the summary
+        // await; the earlier resume preflight cannot cover a later projection.
+        await assertThreadProjectionIntegrity(getCodexHomeDir(), threadId, inspectedSQLiteHome)
+        assertHotPermissionOwnership()
+        if (this.activeSQLiteHome !== inspectedSQLiteHome) throw new Error('SQLite home changed before bounded page read; active writer preserved.')
+        initialTurnsPage = await this.call('thread/turns/list', { ...pageParams, threadId }, rpcProcess)
+      }
       assertHotPermissionOwnership()
       this.stageHotPermissionOverrides(threadId, pendingPermissions, permissionOrder)
       return {
@@ -7358,14 +7397,14 @@ class AppServerProcess {
         initialTurnsPage,
       }
     }
-    const page = method === 'thread/resume' ? asRecord(record?.initialTurnsPage) : null
-    let boundedParams = page ? { ...record, initialTurnsPage: { ...page, limit: Math.min(THREAD_RESPONSE_TURN_LIMIT, Math.max(1, Number(page.limit) || THREAD_RESPONSE_TURN_LIMIT)) } } : params
+    const page = method === 'thread/resume' ? this.resumeInitialTurnsPage(record?.initialTurnsPage) : null
+    let boundedParams = page ? { ...record, initialTurnsPage: page } : params
     const pendingHotPermissions = method === 'turn/start' ? this.pendingHotPermissionsByThreadId.get(threadId) : undefined
     const permissionParams = pendingHotPermissions ? mergeAppServerHotPermissionOverrides(pendingHotPermissions, record!) : boundedParams
     boundedParams = applyAppServerPermissionDefaults(method, permissionParams,
       method === 'turn/start' ? this.permissionIntentByThreadId.get(threadId) : undefined,
       this.activePermissionDefaults,
-      method === 'turn/start' && threadId ? asRecord(this.joinedThreads.get(threadId))?.sandbox : undefined)
+      method === 'turn/start' && threadId ? (asRecord(this.joinedThreads.get(threadId)) ?? this.writerMetadataByThreadId.get(threadId))?.sandbox : undefined)
     if (directMutation && method !== 'turn/interrupt') {
       assertDirectMutationOwnership()
       const lastTurnStart = () => this.getStreamEvents(threadId, STREAM_EVENT_BUFFER_LIMIT).filter(event => event.method === 'turn/started').at(-1)
