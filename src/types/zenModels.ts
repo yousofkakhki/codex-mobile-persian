@@ -2,7 +2,7 @@ export type ZenModelMetadata = {
   id: string
   name: string
   upstreamApi: 'responses' | 'chat-completions' | 'unknown'
-  routingSource: 'sdk-metadata' | 'provider-catalog'
+  routingSource: 'sdk-metadata' | 'provider-catalog' | 'codex-runtime-catalog' | 'unknown'
   contextWindow?: number | null
   configuredContextWindow?: number | null
   maxOutputTokens?: number | null

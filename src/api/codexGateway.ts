@@ -27,6 +27,7 @@ import type {
 } from './appServerDtos'
 import { extractErrorMessage, normalizeCodexApiError } from './codexErrors'
 import { mergeThreadTurnOrder } from '../utils/threadHistory'
+import { getModelReasoningEfforts } from '../utils/modelCapabilities'
 import {
   readActiveTurnIdFromResponse,
   normalizeThreadGroupsV2,
@@ -901,6 +902,7 @@ async function getThreadDetailV2(threadId: string, optionsOrSpeed: ThreadResumeO
   turnIndexByTurnId: ThreadTurnIndexById
   olderCursor: string | null
 }> {
+  const revision = threadAcquisitionRevision
   const options = typeof optionsOrSpeed === 'string' ? { speedMode: optionsOrSpeed } : optionsOrSpeed
   const payload = await callRpc<ThreadResumeResponse>('thread/resume', {
     threadId,
@@ -910,7 +912,10 @@ async function getThreadDetailV2(threadId: string, optionsOrSpeed: ThreadResumeO
     ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
     ...(options.speedMode ? { serviceTier: getSpeedModeServiceTier(options.speedMode) } : {}),
   })
-  return buildRecentThreadDetail(threadId, payload)
+  assertCurrentThreadAcquisition(revision)
+  const detail = await buildRecentThreadDetail(threadId, payload)
+  assertCurrentThreadAcquisition(revision)
+  return detail
 }
 
 async function getOlderThreadMessagesV2(threadId: string, cursor: string, limit = 10): Promise<ThreadTurnPage> {
@@ -1640,8 +1645,14 @@ export type ResumedThread = {
 
 const RESUME_THREAD_COALESCE_TTL_MS = 30_000
 const recentResumeThreadById = new Map<string, Promise<ResumedThread>>()
+let threadAcquisitionRevision = 0
+
+function assertCurrentThreadAcquisition(revision: number): void {
+  if (revision !== threadAcquisitionRevision) throw new Error('Global provider changed while acquiring a thread; retry the message')
+}
 
 export function invalidateThreadResumeCache(): void {
+  threadAcquisitionRevision += 1
   recentResumeThreadById.clear()
 }
 
@@ -1671,10 +1682,15 @@ async function getReadOnlyThreadDetailV2(threadId: string): Promise<ResumedThrea
 export type ThreadResumeOptions = { model?: string; modelProvider?: string; speedMode?: SpeedMode }
 
 export async function resumeThread(threadId: string, optionsOrSpeed: ThreadResumeOptions | SpeedMode = {}): Promise<ResumedThread> {
+  const revision = threadAcquisitionRevision
   const options = typeof optionsOrSpeed === 'string' ? { speedMode: optionsOrSpeed } : optionsOrSpeed
   const resumeKey = JSON.stringify([threadId, options.model ?? '', normalizeRuntimeProviderId(options.modelProvider ?? ''), options.speedMode ?? null])
   const existing = recentResumeThreadById.get(resumeKey)
-  if (existing) return existing
+  if (existing) {
+    const result = await existing
+    assertCurrentThreadAcquisition(revision)
+    return result
+  }
 
   const promise = (async (): Promise<ResumedThread> => {
     let payload: ThreadResumeResponse
@@ -1689,6 +1705,7 @@ export async function resumeThread(threadId: string, optionsOrSpeed: ThreadResum
     try {
       payload = await callRpc<ThreadResumeResponse>('thread/resume', params)
     } catch (error) {
+      assertCurrentThreadAcquisition(revision)
       if (isThreadOwnedByAnotherWriter(error)) return getReadOnlyThreadDetailV2(threadId)
       if (options.modelProvider || !isMissingLegacyCustomEndpointProvider(error)) throw error
       try {
@@ -1699,12 +1716,15 @@ export async function resumeThread(threadId: string, optionsOrSpeed: ThreadResum
           modelProvider: 'openai',
         })
       } catch (retryError) {
+        assertCurrentThreadAcquisition(revision)
         if (!isThreadOwnedByAnotherWriter(retryError)) throw retryError
         return getReadOnlyThreadDetailV2(threadId)
       }
     }
+    assertCurrentThreadAcquisition(revision)
     return buildRecentThreadDetail(threadId, payload)
   })().then(result => {
+    assertCurrentThreadAcquisition(revision)
     if (result.readOnly === true) readOnlyThreadIds.add(threadId)
     else readOnlyThreadIds.delete(threadId)
     return result
@@ -1724,7 +1744,9 @@ export async function resumeThread(threadId: string, optionsOrSpeed: ThreadResum
       }
     }, 2000)
   }).catch(() => undefined)
-  return promise
+  const result = await promise
+  assertCurrentThreadAcquisition(revision)
+  return result
 }
 
 export async function archiveThread(threadId: string): Promise<void> {
@@ -1851,6 +1873,7 @@ export type ForkedThread = {
 }
 
 export async function startThread(cwd?: string, model?: string, speedMode: SpeedMode = 'standard'): Promise<StartedThread> {
+  const revision = threadAcquisitionRevision
   try {
     const params: Record<string, unknown> = { serviceTier: getSpeedModeServiceTier(speedMode) }
     if (typeof cwd === 'string' && cwd.trim().length > 0) {
@@ -1860,6 +1883,7 @@ export async function startThread(cwd?: string, model?: string, speedMode: Speed
       params.model = model.trim()
     }
     const payload = await callRpc<ThreadStartResponse>('thread/start', params)
+    assertCurrentThreadAcquisition(revision)
     const threadId = normalizeThreadIdFromPayload(payload)
     if (!threadId) {
       throw new Error('thread/start did not return a thread id')
@@ -1881,12 +1905,14 @@ export async function forkThread(
   cwd?: string,
   model?: string,
 ): Promise<StartedThread | ForkedThread> {
+  const revision = threadAcquisitionRevision
   if (arguments.length <= 1) {
     try {
       const payload = await callRpc<ThreadForkResponse & ThreadReadResponse & { thread?: { id?: string; cwd?: string } }>('thread/fork', {
         threadId,
         persistExtendedHistory: true,
       })
+      assertCurrentThreadAcquisition(revision)
       const forkedThreadId = normalizeThreadIdFromPayload(payload)
       if (!forkedThreadId) {
         throw new Error('thread/fork did not return a thread id')
@@ -1917,6 +1943,7 @@ export async function forkThread(
       params.model = model.trim()
     }
     const payload = await callRpc<ThreadForkResponse>('thread/fork', params)
+    assertCurrentThreadAcquisition(revision)
     const nextThreadId = normalizeThreadIdFromPayload(payload)
     if (!nextThreadId) {
       throw new Error('thread/fork did not return a thread id')
@@ -2026,6 +2053,7 @@ export async function startThreadTurn(
   collaborationMode?: CollaborationModeKind,
   speedMode: SpeedMode = 'standard',
 ): Promise<string> {
+  const revision = threadAcquisitionRevision
   try {
     const normalizedModel = model?.trim() ?? ''
     const localImageAttachments: FileAttachmentParam[] = []
@@ -2089,6 +2117,7 @@ export async function startThreadTurn(
         },
       }
     }
+    assertCurrentThreadAcquisition(revision)
     const payload = await callRpc<{ turn?: Turn }>('turn/start', params)
     return typeof payload?.turn?.id === 'string' ? payload.turn.id.trim() : ''
   } catch (error) {
@@ -2181,18 +2210,21 @@ export async function setCustomProvider(
 }
 
 function normalizeRuntimeProviderId(providerId: string): string {
-  const normalized = providerId.trim().toLowerCase().replace(/_/g, '-')
-  if (normalized === 'custom' || normalized === 'custom-endpoint') return 'custom_endpoint'
-  if (normalized === 'codex' || normalized === 'openai') return 'openai'
-  if (normalized === 'opencode-zen') return 'opencode_zen'
-  if (normalized === 'openrouter' || normalized === 'openrouter-free') return 'openrouter_free'
-  return providerId.trim()
+  const exact = providerId.trim()
+  switch (exact.toLowerCase()) {
+    case 'custom': case 'custom-endpoint': case 'custom_endpoint': return 'custom_endpoint'
+    case 'codex': case 'openai': return 'openai'
+    case 'opencode-zen': case 'opencode_zen': return 'opencode_zen'
+    case 'openrouter': case 'openrouter-free': case 'openrouter_free': return 'openrouter_free'
+    case 'ninerouter': return 'ninerouter'
+    default: return exact
+  }
 }
 
 async function fetchProviderModelIds(providerId?: string): Promise<{ ids: string[], exclusive: boolean; models?: ZenModelMetadata[] } | null> {
   try {
-    const providerAlias = providerId?.trim().toLowerCase().replace(/_/g, '-') ?? ''
-    const normalizedProviderId = providerAlias === 'custom' || providerAlias === 'custom-endpoint'
+    const providerAlias = providerId?.trim().toLowerCase() ?? ''
+    const normalizedProviderId = ['custom', 'custom-endpoint', 'custom_endpoint'].includes(providerAlias)
       ? 'custom_endpoint'
       : providerId?.trim() ?? ''
     const url = normalizedProviderId
@@ -2215,7 +2247,10 @@ async function fetchProviderModelIds(providerId?: string): Promise<{ ids: string
           .filter((candidate, index, candidates): candidate is string =>
             candidate.length > 0 && candidates.indexOf(candidate) === index),
         exclusive: providerPayload.exclusive === true,
-        models: providerPayload.models,
+        // Executor provenance is minted only from native model/list below.
+        // Provider catalogs retain their wire route/restrictions, not that tag.
+        models: providerPayload.models?.map(model => model.routingSource === 'codex-runtime-catalog'
+          ? { ...model, routingSource: 'provider-catalog' as const } : model),
       }
     }
   } catch {
@@ -2228,8 +2263,6 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
   const shouldIncludeProviderModels = options.includeProviderModels !== false
   const providerModels = shouldIncludeProviderModels ? await fetchProviderModelIds(options.providerId) : null
 
-  options.onMetadata?.(providerModels?.models ?? [])
-
   if (options.requireProviderModels && !providerModels) {
     throw new Error(`Failed to refresh model catalog for ${options.providerId || 'active provider'}`)
   }
@@ -2237,16 +2270,61 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
     throw new Error(`Model catalog for ${options.providerId || 'active provider'} is empty or unavailable`)
   }
   if (providerModels?.exclusive || options.requireProviderModels) {
+    options.onMetadata?.(providerModels?.models ?? [])
     return providerModels?.ids ?? []
   }
 
   const payload = await callRpc<ModelListResponse>('model/list', {})
   const ids: string[] = []
+  const metadata = [...(providerModels?.models ?? [])]
+  const nativeIds = payload.data.map(row => row.id || row.model)
   for (const row of payload.data) {
     const candidate = row.id || row.model
     if (!candidate || ids.includes(candidate)) continue
     ids.push(candidate)
+    // Exact native declarations and provider restrictions constrain each other.
+    // cx/ local Ultra still requires the bridge's gated runtime evidence.
+    const metadataIndex = metadata.findIndex(model => model.id === candidate)
+    const existing = metadata[metadataIndex]
+    const nonreasoning = asRecord(row)?.reasoning === false || asRecord(asRecord(row)?.capabilities)?.reasoning === false
+    const noTools = asRecord(row)?.supportsTools === false || asRecord(asRecord(row)?.capabilities)?.tools === false
+    const hasNativeReasoning = Object.prototype.hasOwnProperty.call(row, 'supportedReasoningEfforts') || nonreasoning
+    if (!hasNativeReasoning && !noTools) continue
+    const raw = row.supportedReasoningEfforts
+    const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+    const efforts = Array.isArray(raw) ? raw.map(option => asRecord(option)?.reasoningEffort) : []
+    const valid = Array.isArray(raw) && efforts.every(effort => typeof effort === 'string' && allowed.includes(effort))
+      && (row.model === undefined || row.model === candidate)
+      && nativeIds.filter(id => id === candidate).length === 1
+    const nativeOptions = valid && !nonreasoning
+      ? efforts.filter(effort => effort !== 'ultra' || !candidate.startsWith('cx/') || existing?.reasoningSource === 'codex-runtime-catalog') : []
+    if (existing) {
+      const authoritative = existing.reasoningSource === 'provider-catalog' || existing.reasoningSource === 'codex-runtime-catalog'
+      metadata[metadataIndex] = {
+        ...existing,
+        ...(nonreasoning ? { supportsReasoning: false } : {}),
+        ...(noTools ? { supportsTools: false } : {}),
+        ...(hasNativeReasoning ? {
+          reasoningSource: authoritative ? existing.reasoningSource : 'codex-runtime-catalog',
+          reasoningOptions: authoritative || existing.supportsReasoning === false
+            ? getModelReasoningEfforts(candidate, existing).filter(effort => nativeOptions.includes(effort)) : nativeOptions,
+        } : {}),
+      }
+      continue
+    }
+    metadata.push({
+      id: candidate, name: row.displayName || candidate,
+      // model/list proves an executor route, not a custom provider wire API.
+      // Malformed/mismatched descriptors cannot affirm a selectable route.
+      upstreamApi: 'unknown', routingSource: valid ? 'codex-runtime-catalog' : 'unknown',
+      ...(hasNativeReasoning ? { reasoningSource: 'codex-runtime-catalog' as const } : {}),
+      supportsReasoning: nonreasoning ? false : null,
+      reasoningOptions: nativeOptions,
+      supportsTools: noTools ? false : null, inputModalities: row.inputModalities ?? null,
+      free: false, discoveredAt: new Date().toISOString(),
+    })
   }
+  options.onMetadata?.(metadata)
 
   if (!shouldIncludeProviderModels || !providerModels) return ids
 

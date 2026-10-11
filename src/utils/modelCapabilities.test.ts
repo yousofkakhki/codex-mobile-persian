@@ -24,7 +24,7 @@ describe('model capabilities', () => {
   })
 
   it('recognizes extended-context Astra and 6.1 Fast aliases without broadening unrelated models', () => {
-    expect(isUltraReasoningModel('cx/gpt-6-astra[1m]')).toBe(true)
+    expect(isUltraReasoningModel('cx/gpt-6-astra[1m]', { id: 'cx/gpt-6-astra[1m]', reasoningSource: 'codex-runtime-catalog', reasoningOptions: ['max', 'ultra'] })).toBe(true)
     expect(isFastModeSupported('cx/gpt-6.1-sol')).toBe(true)
     expect(isFastModeSupported('cx/gpt-6-luna[1m]')).toBe(true)
     expect(isUltraReasoningModel('cx/gpt-6.1-sol')).toBe(false)
@@ -50,11 +50,13 @@ describe('model capabilities', () => {
     expect(normalizeModelIdForProvider('gpt-5.6-luna', 'openai')).toBe('gpt-5.6-luna')
   })
 
-  it('exposes Ultra only for GPT-6 Astra aliases', () => {
-    expect(isUltraReasoningModel('cx/gpt-6-astra')).toBe(true)
-    expect(isUltraReasoningModel('gpt-6-astra-2026-09-01')).toBe(true)
+  it('exposes Ultra only with affirmative exact capability metadata, never Astra suffix inference', () => {
+    const metadata = { id: 'cx/gpt-6-astra', reasoningSource: 'codex-runtime-catalog' as const, reasoningOptions: ['max', 'ultra'] }
+    expect(isUltraReasoningModel('cx/gpt-6-astra', metadata)).toBe(true)
+    expect(isUltraReasoningModel('gpt-6-astra-2026-09-01')).toBe(false)
     expect(isUltraReasoningModel('cx/gpt-5.6-luna')).toBe(false)
-    expect(isReasoningEffortSupported('cx/gpt-6-astra', 'ultra')).toBe(true)
+    expect(isReasoningEffortSupported('cx/gpt-6-astra', 'ultra', metadata)).toBe(true)
+    expect(isReasoningEffortSupported('cx/gpt-6-astra', 'ultra')).toBe(false)
     expect(isReasoningEffortSupported('cx/gpt-5.6-luna', 'ultra')).toBe(false)
   })
 

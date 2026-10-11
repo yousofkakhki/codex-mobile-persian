@@ -738,9 +738,9 @@ const modelOptions = computed(() =>
     const metadata = modelMetadataById.value.get(modelId)
     return {
       value: modelId, label: formatModelLabel(modelId),
-      badge: metadata ? metadata.upstreamApi === 'responses' ? 'Responses' : metadata.upstreamApi === 'chat-completions' ? 'Chat' : 'Unknown API' : undefined,
-      disabled: metadata?.supportsTools === false || metadata?.upstreamApi === 'unknown',
-      description: metadata?.supportsTools === false ? 'Not compatible with agent tools' : metadata?.upstreamApi === 'unknown' ? 'No supported API route' : metadata?.routingSource === 'provider-catalog'
+      badge: metadata?.routingSource === 'codex-runtime-catalog' ? 'Codex runtime' : metadata ? metadata.upstreamApi === 'responses' ? 'Responses' : metadata.upstreamApi === 'chat-completions' ? 'Chat' : 'Unknown API' : undefined,
+      disabled: metadata?.supportsTools === false || (metadata?.upstreamApi === 'unknown' && metadata.routingSource !== 'codex-runtime-catalog'),
+      description: metadata?.supportsTools === false ? 'Not compatible with agent tools' : metadata?.routingSource === 'codex-runtime-catalog' ? 'Native executor catalog · wire API not inferred' : metadata?.upstreamApi === 'unknown' ? 'No supported API route' : metadata?.routingSource === 'provider-catalog'
         ? `Provider advertised${metadata.contextWindow ? ` · ${metadata.contextWindow.toLocaleString()} context tokens` : ''}${metadata.maxOutputTokens ? ` · ${metadata.maxOutputTokens.toLocaleString()} max output` : ''}${metadata.reasoningSource === 'codex-family-fallback' ? ' · Reasoning: Codex-family fallback, not provider-declared' : ''}`
         : metadata ? 'Automatic routing · SDK-inferred, not access-tested' : undefined,
     }

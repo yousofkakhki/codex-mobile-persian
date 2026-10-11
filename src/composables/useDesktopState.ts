@@ -9,9 +9,6 @@ import {
   renameThread,
   getAvailableModelIds,
   getCurrentModelConfig,
-  getThreadGoal,
-  setThreadGoal,
-  clearThreadGoal,
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
@@ -68,8 +65,6 @@ import type {
 import { getPathParent, isProjectlessChatPath, normalizePathForUi, toProjectName } from '../pathUtils.js'
 import { isReasoningEffortSupported as supportsReasoningEffort, getModelReasoningEfforts, normalizeModelIdForProvider } from '../utils/modelCapabilities.js'
 import { mergeThreadTurnOrder } from '../utils/threadHistory'
-import { parseGoalCommand, type GoalCommand } from '../utils/goalCommands'
-import { publishLocalRpcNotification } from '../api/codexRpcClient'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -227,10 +222,17 @@ function pruneThreadContextStateMap<T>(
 }
 
 function normalizeProviderContextId(providerId: string): string {
-  const normalized = providerId.trim().toLowerCase().replace(/_/g, '-')
-  if (!normalized || normalized === 'openai') return 'codex'
-  if (normalized === 'custom') return 'custom-endpoint'
-  return normalized
+  const exact = providerId.trim()
+  // Storage slots share only documented aliases; arbitrary registry IDs are
+  // authoritative and must not lose case/underscore identity on the wire.
+  switch (exact.toLowerCase()) {
+    case '': case 'openai': case 'codex': return 'codex'
+    case 'custom': case 'custom-endpoint': case 'custom_endpoint': return 'custom-endpoint'
+    case 'opencode-zen': case 'opencode_zen': return 'opencode-zen'
+    case 'openrouter': case 'openrouter-free': case 'openrouter_free': return 'openrouter-free'
+    case 'ninerouter': return 'ninerouter'
+    default: return exact
+  }
 }
 
 function isNewThreadContextId(contextId: string): boolean {
@@ -1591,7 +1593,6 @@ export function useDesktopState() {
   const selectedReasoningEffort = computed<ReasoningEffort | ''>(() => readReasoningEffortForThread(selectedThreadId.value))
   const speedModeByContext = ref<Record<string, SpeedMode>>(loadSpeedModeMap())
   const speedUpdateVersionByContext = new Map<string, number>()
-  const goalUpdateVersionByThreadId = new Map<string, number>()
   const updatingSpeedModeByContext = ref<Record<string, boolean>>({})
   const selectedSpeedMode = computed<SpeedMode>(() => readSpeedModeForThread(selectedThreadId.value))
   const activeProviderId = ref('')
@@ -2033,6 +2034,7 @@ export function useDesktopState() {
     if (fallbackRetryInFlightThreadIds.has(threadId)) return
     const pending = pendingTurnRequestByThreadId.value[threadId]
     if (!pending || pending.fallbackRetried || !canUseChatGptFallback(threadId)) return
+    const routingGeneration = providerRoutingGeneration
 
     fallbackRetryInFlightThreadIds.add(threadId)
     setPendingTurnRequest(threadId, {
@@ -2042,9 +2044,11 @@ export function useDesktopState() {
 
     try {
       await applyFallbackModelSelection(threadId)
+      assertCurrentRouting(routingGeneration)
       // Remove the failed user turn before replaying on fallback model to avoid duplicated user messages.
       try {
         const rolledBackMessages = await rollbackThread(threadId, 1)
+        assertCurrentRouting(routingGeneration)
         setPersistedMessagesForThread(threadId, rolledBackMessages)
         clearLivePlansForThread(threadId)
         setLiveAgentMessagesForThread(threadId, [])
@@ -2055,6 +2059,7 @@ export function useDesktopState() {
       } catch {
         // If rollback fails, continue with retry rather than dropping the turn.
       }
+      assertCurrentRouting(routingGeneration)
       setTurnErrorForThread(threadId, null)
       error.value = ''
       setTurnSummaryForThread(threadId, null)
@@ -2065,6 +2070,8 @@ export function useDesktopState() {
       setThreadInProgress(threadId, true)
 
       await ensureGlobalProviderForTurn(threadId, pending.speedMode)
+      assertCurrentRouting(routingGeneration)
+      assertThreadWritable(threadId)
 
       await startThreadTurn(
         threadId,
@@ -4260,8 +4267,6 @@ export function useDesktopState() {
   function queueEventDrivenSync(notification: RpcNotification): void {
     if (notification.method === 'thread/tokenUsage/updated') return
     if (notification.method === 'thread/goal/updated' || notification.method === 'thread/goal/cleared') {
-      const id = extractThreadIdFromNotification(notification)
-      if (id) goalUpdateVersionByThreadId.set(id, (goalUpdateVersionByThreadId.get(id) ?? 0) + 1)
       return
     }
     if (notification.method.startsWith('activity/')) return
@@ -4711,7 +4716,11 @@ export function useDesktopState() {
         return
       }
 
+      const routingGeneration = providerRoutingGeneration
+      if (modelCatalogError.value) throw new Error(modelCatalogError.value)
       if (!activeProviderId.value) await refreshModelPreferences({ includeProviderModels: true })
+      if (routingGeneration !== providerRoutingGeneration) return
+      if (modelCatalogError.value) throw new Error(modelCatalogError.value)
       const needsResume = resumedThreadById.value[threadId] !== true
       const savedSpeedMode = speedModeByContext.value[speedContextId]
       const resumeOptions = activeProviderId.value && !modelCatalogError.value && availableModelIds.value.length > 0
@@ -4719,6 +4728,8 @@ export function useDesktopState() {
         : savedSpeedMode
       const resumedThread = needsResume ? await resumeThread(threadId, resumeOptions) : null
       const detail = resumedThread ?? await getThreadDetail(threadId, savedSpeedMode)
+      if (routingGeneration !== providerRoutingGeneration) return
+      if (modelCatalogError.value) throw new Error(modelCatalogError.value)
       if (resumedThread) readOnlyThreadById.value = { ...readOnlyThreadById.value, [threadId]: resumedThread.readOnly === true }
       if (
         detail.speedMode !== undefined &&
@@ -4973,11 +4984,18 @@ export function useDesktopState() {
     const routingGeneration = providerRoutingGeneration
     const includeSelectedThreadMessages = options.includeSelectedThreadMessages !== false
     const awaitAncillaryRefreshes = options.awaitAncillaryRefreshes === true
+    const refreshCatalogBeforeHistory = options.providerChanged === true && includeSelectedThreadMessages
 
     try {
       await loadPersistedQueueStateIfNeeded()
       await loadThreads({ force: options.forceThreadRefresh === true })
       if (routingGeneration !== providerRoutingGeneration) return
+      if (refreshCatalogBeforeHistory) {
+        // A provider change invalidates acquisition synchronously. Complete its
+        // catalog before the requested history load, not after a guard rejects it.
+        await refreshAncillaryState({ providerChanged: true, includeProviderModels: true })
+        if (routingGeneration !== providerRoutingGeneration) return
+      }
       if (includeSelectedThreadMessages) {
         try {
           await loadMessages(selectedThreadId.value)
@@ -4986,6 +5004,7 @@ export function useDesktopState() {
         }
       }
       if (routingGeneration !== providerRoutingGeneration) return
+      if (refreshCatalogBeforeHistory) return
       if (awaitAncillaryRefreshes) {
         await refreshAncillaryState({
           providerChanged: options.providerChanged,
@@ -5089,7 +5108,9 @@ export function useDesktopState() {
     error.value = ''
 
     try {
+      const routingGeneration = providerRoutingGeneration
       const forkedThread = await forkThread(sourceThreadId, sourceCwd || undefined, selectedModel || undefined)
+      assertCurrentRouting(routingGeneration)
       const nextThreadId = forkedThread.threadId.trim()
       if (!nextThreadId) return ''
 
@@ -5141,7 +5162,9 @@ export function useDesktopState() {
 
     try {
       error.value = ''
+      const routingGeneration = providerRoutingGeneration
       const forked = await forkThread(normalizedThreadId)
+      assertCurrentRouting(routingGeneration)
       const forkedThreadId = forked.threadId.trim()
       if (!forkedThreadId) return ''
 
@@ -5215,51 +5238,6 @@ export function useDesktopState() {
     })
   }
 
-  async function executeGoalCommand(threadId: string, command: GoalCommand): Promise<void> {
-    const version = goalUpdateVersionByThreadId.get(threadId) ?? 0
-    try {
-      assertThreadWritable(threadId)
-      if (command.action === 'set' || command.action === 'resume') {
-        const current = await getThreadGoal(threadId)
-        if (!current || current.threadId !== threadId || current.tokenBudget === null
-          || !Number.isSafeInteger(current.tokenBudget) || current.tokenBudget <= current.tokensUsed) {
-          throw new Error('Use the owner Goal editor to enter and confirm a finite total budget before creating or resuming this Goal.')
-        }
-      }
-      if (command.action === 'clear') {
-        if (!await clearThreadGoal(threadId)) throw new Error('Goal was not cleared')
-        if (version === (goalUpdateVersionByThreadId.get(threadId) ?? 0)) publishLocalRpcNotification({ method: 'thread/goal/cleared', params: { threadId }, atIso: new Date().toISOString() })
-        return
-      }
-      const goal = command.action === 'show'
-        ? await getThreadGoal(threadId)
-        : await setThreadGoal(threadId, command.action === 'set'
-          ? { objective: command.objective, status: 'active' }
-          : { status: command.action === 'pause' ? 'paused' : 'active' })
-      if (version !== (goalUpdateVersionByThreadId.get(threadId) ?? 0)) return
-      publishLocalRpcNotification({
-        method: goal ? 'thread/goal/updated' : 'thread/goal/cleared',
-        params: goal ? { threadId, goal } : { threadId },
-        atIso: new Date().toISOString(),
-      })
-    } catch (failure) {
-      if (selectedThreadId.value === threadId) error.value = failure instanceof Error ? failure.message : 'Failed to manage goal'
-      throw failure
-    }
-  }
-
-  function goalWithResources(command: GoalCommand | null, images: string[], skills: Array<{ name: string; path: string }>, files: FileAttachment[]): GoalCommand | null {
-    if (!command || command.action !== 'set') return command
-    const references = [
-      ...files.map(file => `File ${file.label}: ${file.fsPath}`),
-      ...skills.map(skill => `Skill $${skill.name}: ${skill.path}`),
-      ...images.map(image => `Image: ${extractLocalImagePathFromUrl(image) || image}`),
-    ]
-    const objective = [command.objective, ...references].join('\n')
-    if (objective.length > 4000) throw new Error('Goal objective and attached references must fit within 4,000 characters')
-    return { action: 'set', objective }
-  }
-
   async function sendMessageToSelectedThread(
     text: string,
     imageUrls: string[] = [],
@@ -5274,11 +5252,6 @@ export function useDesktopState() {
     const threadId = selectedThreadId.value
     const nextText = text.trim()
     if (!threadId || (!nextText && imageUrls.length === 0 && fileAttachments.length === 0)) return
-    const goalCommand = goalWithResources(parseGoalCommand(nextText), imageUrls, skills, fileAttachments)
-    if (goalCommand) {
-      await executeGoalCommand(threadId, goalCommand)
-      return
-    }
 
     assertThreadWritable(threadId)
     if (await maybeReplyToPendingUserInputRequest(threadId, nextText, imageUrls, skills, fileAttachments)) {
@@ -5383,8 +5356,6 @@ export function useDesktopState() {
     if (modelCatalogError.value) throw new Error(modelCatalogError.value)
 
     const nextText = text.trim()
-    const goalCommand = goalWithResources(parseGoalCommand(nextText), imageUrls, skills, fileAttachments)
-    if (goalCommand && goalCommand.action !== 'set') throw new Error('Open a thread before managing its goal')
     const targetCwd = cwd.trim()
     const selectedModel = readModelIdForThread(NEW_THREAD_COLLABORATION_MODE_CONTEXT).trim()
     const selectedMode = selectedCollaborationMode.value
@@ -5395,18 +5366,23 @@ export function useDesktopState() {
     isSendingMessage.value = true
     error.value = ''
     let threadId = ''
+    const routingGeneration = providerRoutingGeneration
 
     try {
       try {
         const startedThread = await startThread(targetCwd || undefined, selectedModel || undefined, selectedSpeed)
+        assertCurrentRouting(routingGeneration)
         threadId = startedThread.threadId
         setThreadModelId(threadId, startedThread.model)
         setThreadModelProviderId(threadId, startedThread.modelProvider || activeProviderId.value)
         setSelectedCollaborationModeForThread(threadId, selectedMode)
       } catch (unknownError) {
+        assertCurrentRouting(routingGeneration)
         if (canUseChatGptFallback('') && selectedModel && selectedModel !== MODEL_FALLBACK_ID && isUnsupportedChatGptModelError(unknownError)) {
           await applyFallbackModelSelection()
+          assertCurrentRouting(routingGeneration)
           const fallbackThread = await startThread(targetCwd || undefined, MODEL_FALLBACK_ID, selectedSpeed)
+          assertCurrentRouting(routingGeneration)
           threadId = fallbackThread.threadId
           setThreadModelId(threadId, fallbackThread.model)
           setThreadModelProviderId(threadId, fallbackThread.modelProvider || activeProviderId.value)
@@ -5424,20 +5400,13 @@ export function useDesktopState() {
       saveReasoningEffortMap(reasoningEffortByContext.value)
 
       insertOptimisticThread(threadId, targetCwd, nextText || '[Image]')
-      if (!goalCommand) {
-        appendOptimisticUserMessage(threadId, nextText, imageUrls, skills, fileAttachments)
-        blockInterruptUntilThreadIsPersisted(threadId)
-      }
+      appendOptimisticUserMessage(threadId, nextText, imageUrls, skills, fileAttachments)
+      blockInterruptUntilThreadIsPersisted(threadId)
       resumedThreadById.value = {
         ...resumedThreadById.value,
         [threadId]: true,
       }
       setSelectedThreadId(threadId)
-      if (goalCommand) {
-        await executeGoalCommand(threadId, goalCommand)
-        isSendingMessage.value = false
-        return threadId
-      }
       shouldAutoScrollOnNextAgentEvent = true
       setTurnSummaryForThread(threadId, null)
       setTurnActivityForThread(
@@ -5486,12 +5455,17 @@ export function useDesktopState() {
     }
   }
 
+  function assertCurrentRouting(generation: number): void {
+    if (generation !== providerRoutingGeneration) throw new Error('Global provider changed while acquiring a thread; retry the message')
+    if (modelCatalogError.value) throw new Error(modelCatalogError.value)
+  }
+
   async function ensureGlobalProviderForTurn(threadId: string, speedMode?: SpeedMode): Promise<void> {
+    const routingGeneration = providerRoutingGeneration
     assertThreadWritable(threadId)
     if (modelCatalogError.value) throw new Error(modelCatalogError.value)
     if (!activeProviderId.value) await refreshModelPreferences({ includeProviderModels: true })
-    if (modelCatalogError.value) throw new Error(modelCatalogError.value)
-    const routingGeneration = providerRoutingGeneration
+    assertCurrentRouting(routingGeneration)
     const providerId = readProviderIdForThread(threadId)
     const modelId = readProviderCompatibleSelectedModel(readModelIdForThread(threadId))
     if (!modelId) throw new Error('No compatible model is available for the global provider')
@@ -5518,6 +5492,7 @@ export function useDesktopState() {
     fileAttachments: FileAttachment[] = [],
     collaborationModeOverride?: CollaborationModeKind,
   ): Promise<void> {
+    const routingGeneration = providerRoutingGeneration
     const requestedReasoningEffort = readReasoningEffortForThread(threadId)
     const speedMode = readSpeedModeForThread(threadId)
     let reasoningEffort = isReasoningEffortSupported(
@@ -5556,6 +5531,8 @@ export function useDesktopState() {
 
     try {
       await ensureGlobalProviderForTurn(threadId, speedMode)
+      assertCurrentRouting(routingGeneration)
+      assertThreadWritable(threadId)
       const modelId = readModelIdForThread(threadId)
       const nextReasoningEffort = isReasoningEffortSupported(modelId, requestedReasoningEffort)
         ? requestedReasoningEffort
@@ -5588,8 +5565,10 @@ export function useDesktopState() {
           speedMode,
         )
       } catch (unknownError) {
+        assertCurrentRouting(routingGeneration)
         if (canUseChatGptFallback(threadId) && modelId && modelId !== MODEL_FALLBACK_ID && isUnsupportedChatGptModelError(unknownError)) {
           await applyFallbackModelSelection(threadId)
+          assertCurrentRouting(routingGeneration)
           const fallbackReasoningEffort = isReasoningEffortSupported(MODEL_FALLBACK_ID, requestedReasoningEffort)
             ? requestedReasoningEffort
             : ''

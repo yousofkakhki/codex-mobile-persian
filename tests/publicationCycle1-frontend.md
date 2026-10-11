@@ -1,0 +1,40 @@
+# Publication cycle 1 — frontend blockers
+
+Scope: PUB-ULTRA-01, PUB-ROUTE-01, PUB-PROVIDER-01, PUB-GOAL-02 only. Baseline commit `a28308eeec70720e142071c9d1ab591884b2ec7b`, tree `81069d1a2d30642e4c56d6604ce395abe32fc75d`.
+
+## Contract and corrections
+
+- **PUB-ULTRA-01:** Ultra is never inferred from an Astra name, family or suffix. Exact provider/native-runtime metadata supplies the affirmative efforts. Native/provider explicit empty or malformed effort lists are restrictive; false reasoning wins. Local `cx/` Ultra remains bound to the existing bridge's reviewed native descriptor, literal audited route, provider wire restriction, effective feature, endpoint and generation gates. Raw native `model/list` metadata is retained for exact non-`cx/` native models rather than relying on the removed name fallback; it never proves `cx/` local mode. A valid exact native descriptor affirms **executor provenance**, not the provider wire API: the gateway keeps `upstreamApi: unknown`, mints `routingSource: codex-runtime-catalog`, and the actual composer labels it as native. Provider payloads cannot mint that route tag; unknown provider APIs, malformed/mismatched descriptors and explicit tools=false remain disabled. Missing reasoning stays unknown/non-Ultra while empty/malformed native declarations stay restrictive. Max is distinct, not rewritten to Ultra or its wire effort.
+- **PUB-ROUTE-01:** Capture a monotonic routing revision before asynchronous history resume, new-thread start, both fork forms, send-time acquisition and notification-driven fallback acquisition. Reject stale responses before readiness/selection/dispatch. The gateway applies the same revision check to cold and warm/coalesced resumes, direct detail resume, start and fork, retaining bounded history and legacy/read-only behavior. A/B/A identity restoration does not restore an older acquisition revision. A requested selected-history refresh waits for the newly invalidated catalog before acquisition (including non-awaited ancillary mode); failed catalogs still block acquisition. This ordering preserves legitimate history loading without weakening the route guards.
+- **PUB-PROVIDER-01:** Arbitrary authoritative provider IDs preserve case and underscores in discovery, model-selection storage and resume validation. Only enumerated known aliases normalize. `Case_Gateway`, `case-gateway` and `CASE_gateway` are distinct. Do not reuse generic display normalization at a wire-identity boundary.
+- **PUB-GOAL-02:** The accepted `tests/chat-composer-rendering/goal-slash-commands.md` contract remains unchanged. The composer supplies literal `/goal ...` text, and the shared message handler uses normal turns, attachments, queuing and interrupt-persistence behavior. It never intercepts literal messages into Goal RPCs. The separate owner-confirmed finite-budget editor, Goal status controls and Stop behavior are unchanged; normal literal text is not a promise that a model will execute a Goal operation.
+
+## Exact-seam TDD
+
+Additive regressions are `src/utils/publicationCycle1.capabilities.test.ts`, `src/composables/publicationCycle1.desktop.test.ts`, `src/api/publicationCycle1.gateway.test.ts`, and `src/utils/publicationCycle1.composer.test.ts`. The last test compiles the actual `ThreadComposer.vue` and consumes the real gateway metadata; child controls only replace unrelated component/service bindings. Relevant recorded pre-fix failures are under ignored `output/publicationCycle1/verify-*-red*/`; exact command, times, isolation and output hashes are retained in the final report. The cold/warm gateway test uses the real fetch/RPC serialization seam; desktop tests use the real composable with synthetic API boundaries. No provider or customer prompt is sent.
+
+The immutable reviewer observations were read from `publication-independent-review-ecq70m5e/tree`. They are **not** relabeled as green safety tests: several passing original observations reproduce unsafe behavior. Fresh assertions reverse only the assigned unsafe outcomes. The earlier-before-latest paging observation remains an explicitly unchanged adjacent behavior, including existing duplicate-item reconciliation; Activity-hidden fanout is untouched and not a safety acceptance claim.
+
+### Canonical test alignment after independent RED
+
+1. `src/utils/modelCapabilities.test.ts`: the extended-context Astra affirmative now supplies exact native-runtime metadata. The old Astra-family test now requires exact affirmative metadata and rejects an unaudited date suffix/name-only Ultra. Fast-mode, context, metadata rendering, restrictive-provider and linear-lookup assertions are unchanged.
+2. `src/composables/useDesktopState.test.ts`: the three imported local-Goal interception cases now assert the accepted normal literal-turn contract, untouched attachments and the ordinary interrupt-persistence gate. The two imported finite-policy slash cases now assert that literal text neither reads nor mutates existing/missing Goal state. Budget policy continues to be covered by the untouched owner editor/backend tests, not a new slash interceptor.
+3. The normal new-turn interrupt gate is asserted **before** the deferred synthetic turn resolves and is released by the established active-turn evidence; a settled active turn is not incorrectly required to remain blocked.
+
+No protected reviewer assertions or preservation-manifest paths were edited. Production changes are limited to `modelCapabilities.ts`, `useDesktopState.ts`, `codexGateway.ts`, the three-line model-option gating/display in `ThreadComposer.vue`, and the additive `ZenModelMetadata.routingSource` union in `types/zenModels.ts`. The parser-only `goalCommands` utility remains harmless and unreferenced by production runtime dispatch.
+
+## Isolated verification
+
+Use installed dependencies and verified minimum Node 22.16.0. The private copy of `isolated-verification.py` runs with fresh HOME/CODEX_HOME/XDG/TMPDIR and `unshare --mount --net`, read-only shared runtime/source/dependency mounts, and loopback only. Unset CODEX_SQLITE_HOME for canonical per-home fixtures. Disable Vitest caches with `--no-cache --configLoader runner`; disable typecheck incrementality with `vue-tsc --noEmit --incremental false -p tsconfig.json`.
+
+Deep private TMPDIR paths exceed Chromium Unix socket limits. The final runner bind-mounts the per-run scratch tmp directory at `/mnt` **only inside its private mount namespace** and sets TMPDIR there. Every write still lands beneath the assigned clone; host `/mnt` and shared trees are untouched. No test or browser-source assertion was weakened.
+
+Run the full suite with actual pinned `native-combined/runtime-snapshot.json` and `native-combined/gateway-catalog.json` read-only fixture inputs so both native-metadata acceptance cases execute. This replays captured catalog evidence, not new native execution or live provider proof. Retain the experimental Node SQLite warnings rather than suppressing them. Each run must stay below 50 MiB with at least 2 GiB disk free.
+
+## Exact-source evidence
+
+`output/publicationCycle1/source-hashes-final.json` binds the final source, tests, protected paths and unchanged immutable witnesses. `focused-final.json` and `per-id-assertions-final.json` record every executed named safety assertion and its assigned ID; the adjacent paging observation is listed separately. `full-suite-exact-final.json` and isolated typecheck logs are final acceptance evidence, superseding earlier runs made before the last gateway/composer correction. The final local report adds exact commit/tree and hashes of these artifacts after the scoped commit.
+
+## Handoff boundary
+
+The parent will align the single conflicting local-RPC slash section in `tests/chat-composer-rendering/thread-activity-and-live-goal-usage.md`; this frontend worker leaves it unchanged as assigned. Local commit only. No push, main merge, install, deployment, service change, native process launch, production RPC, or real provider/message operation is authorized by these tests. Fresh independent rereview remains the parent's publication gate.

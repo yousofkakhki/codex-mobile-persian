@@ -800,53 +800,57 @@ describe('thread-scoped speed mode', () => {
   })
 })
 
-describe('goal command routing', () => {
-  it('handles goal controls without starting a normal turn or queueing them', async () => {
+describe('literal Goal message routing (accepted composer contract)', () => {
+  function installLiteralRoute() {
     installTestWindow()
-    const state = useDesktopState()
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'fixture-model', providerId: 'custom_endpoint', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['fixture-model'])
+    gatewayMocks.resumeThread.mockResolvedValue({ model: 'fixture-model', modelProvider: 'custom_endpoint', messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, olderCursor: null, turnIndexByTurnId: {} })
+    gatewayMocks.startThreadTurn.mockResolvedValue('fixture-turn')
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    return useDesktopState()
+  }
+
+  it('sends literal Goal controls through normal turns without Goal RPCs or local queue interception', async () => {
+    const state = installLiteralRoute()
     state.primeSelectedThread('goal-route')
-    gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'goal-route', objective: 'Synthetic goal', status: 'active' })
-    gatewayMocks.getThreadGoal.mockResolvedValue({ threadId: 'goal-route', tokenBudget: 100, tokensUsed: 10 })
-    gatewayMocks.clearThreadGoal.mockResolvedValue(true)
-    await state.sendMessageToSelectedThread('/goal Synthetic goal')
-    await state.sendMessageToSelectedThread('/goal pause')
-    await state.sendMessageToSelectedThread('/goal resume')
-    await state.sendMessageToSelectedThread('/goal')
-    await state.sendMessageToSelectedThread('/goal clear')
-    expect(gatewayMocks.setThreadGoal.mock.calls).toEqual([
-      ['goal-route', { objective: 'Synthetic goal', status: 'active' }],
-      ['goal-route', { status: 'paused' }],
-      ['goal-route', { status: 'active' }],
+    for (const text of ['/goal Synthetic goal', '/goal pause', '/goal resume', '/goal', '/goal clear']) {
+      await state.sendMessageToSelectedThread(text)
+    }
+    expect(gatewayMocks.startThreadTurn.mock.calls.map(call => call[1])).toEqual([
+      '/goal Synthetic goal', '/goal pause', '/goal resume', '/goal', '/goal clear',
     ])
-    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadGoal).not.toHaveBeenCalled()
+    expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
+    expect(gatewayMocks.clearThreadGoal).not.toHaveBeenCalled()
     expect(gatewayMocks.setThreadQueueState).not.toHaveBeenCalled()
   })
 
-  it('creates a thread for an objective without a synthetic user turn or interrupt gate', async () => {
-    installTestWindow()
-    const state = useDesktopState()
+  it('creates a normal first literal Goal turn with user text and the normal interrupt-persistence gate', async () => {
+    const state = installLiteralRoute()
     state.primeSelectedThread('')
-    gatewayMocks.startThread.mockResolvedValue({ threadId: 'new-goal', model: 'cx/gpt-6.1-sol', modelProvider: 'ninerouter' })
-    gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'new-goal', objective: 'Synthetic objective', status: 'active' })
-    gatewayMocks.getThreadGoal.mockResolvedValue(null)
-    await expect(state.sendMessageToNewThread('/goal Synthetic objective', '/tmp/fixture')).rejects.toThrow(/owner.*finite.*budget/i)
+    gatewayMocks.startThread.mockResolvedValue({ threadId: 'new-goal', model: 'fixture-model', modelProvider: 'custom_endpoint' })
+    let finishTurn!: (turnId: string) => void
+    gatewayMocks.startThreadTurn.mockImplementationOnce(() => new Promise<string>(resolve => { finishTurn = resolve }))
+    await expect(state.sendMessageToNewThread('/goal Synthetic objective', '/tmp/fixture')).resolves.toBe('new-goal')
+    await vi.waitFor(() => expect(finishTurn).toBeTypeOf('function'))
     expect(state.selectedThreadId.value).toBe('new-goal')
     expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
-    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
-    expect(state.isSelectedThreadInterruptPending.value).toBe(false)
-    expect(state.messages.value).toEqual([])
+    expect(state.isSelectedThreadInterruptPending.value).toBe(true)
+    expect(state.messages.value.some(message => message.role === 'user' && message.text === '/goal Synthetic objective')).toBe(true)
+    finishTurn('fixture-turn')
+    await vi.waitFor(() => expect(state.isSelectedThreadInterruptPending.value).toBe(false))
   })
 
-  it('preserves file and skill references inside the goal objective without a normal turn', async () => {
-    installTestWindow()
-    const state = useDesktopState()
+  it('preserves file and skill parameters with the literal Goal normal turn', async () => {
+    const state = installLiteralRoute()
     state.primeSelectedThread('goal-files')
-    gatewayMocks.getThreadGoal.mockResolvedValue({ threadId: 'goal-files', tokenBudget: 100, tokensUsed: 10 })
-    gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'goal-files', objective: 'Fixture', status: 'active' })
-    await state.sendMessageToSelectedThread('/goal Inspect the fixture', [], [{ name: 'fixture-skill', path: '/tmp/SKILL.md' }], 'queue', [{ label: 'handoff', path: '/tmp/HANDOFF.md', fsPath: '/tmp/HANDOFF.md' }])
-    expect(gatewayMocks.setThreadGoal.mock.calls.at(-1)?.[1].objective).toContain('File handoff: /tmp/HANDOFF.md')
-    expect(gatewayMocks.setThreadGoal.mock.calls.at(-1)?.[1].objective).toContain('Skill $fixture-skill: /tmp/SKILL.md')
-    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    const skills = [{ name: 'fixture-skill', path: '/tmp/SKILL.md' }]
+    const files = [{ label: 'handoff', path: '/tmp/HANDOFF.md', fsPath: '/tmp/HANDOFF.md' }]
+    await state.sendMessageToSelectedThread('/goal Inspect the fixture', [], skills, 'queue', files)
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith('goal-files', '/goal Inspect the fixture', [], 'fixture-model', 'medium', skills, files, 'default', 'standard')
+    expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadGoal).not.toHaveBeenCalled()
   })
 })
 
@@ -1721,22 +1725,19 @@ describe('findAdjacentThreadId', () => {
   })
 })
 
-describe('telemetry Goal slash finite-policy reconciliation', () => {
-  it('updates an existing objective without creating or changing its finite budget', async () => {
-    installTestWindow()
-    const state=useDesktopState();state.primeSelectedThread('goal-finite')
-    gatewayMocks.getThreadGoal.mockResolvedValue({threadId:'goal-finite', objective:'Previous', status:'paused', tokenBudget:100, tokensUsed:10})
-    gatewayMocks.setThreadGoal.mockResolvedValue({threadId:'goal-finite', objective:'Edited', status:'active', tokenBudget:100, tokensUsed:10})
-    await state.sendMessageToSelectedThread('/goal Edited')
-    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledExactlyOnceWith('goal-finite',{objective:'Edited',status:'active'})
-    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
-  })
-  it('requires the owner finite-budget editor instead of sending implicit unlimited Goal creation', async () => {
-    installTestWindow()
-    const state=useDesktopState();state.primeSelectedThread('goal-missing')
-    gatewayMocks.getThreadGoal.mockResolvedValue(null)
-    await expect(state.sendMessageToSelectedThread('/goal Create')).rejects.toThrow(/owner.*finite.*budget/i)
-    expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
-    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
-  })
+describe('literal Goal finite-policy separation', () => {
+  it.each([null, { threadId: 'goal-literal', objective: 'Existing', status: 'paused', tokenBudget: 100, tokensUsed: 10 }])(
+    'does not read or mutate Goal state from a literal message even for existing/missing Goal %j', async goal => {
+      installTestWindow()
+      gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'fixture-model', providerId: 'custom_endpoint', reasoningEffort: 'medium', speedMode: 'standard' })
+      gatewayMocks.getAvailableModelIds.mockResolvedValue(['fixture-model'])
+      gatewayMocks.resumeThread.mockResolvedValue({ model: 'fixture-model', modelProvider: 'custom_endpoint', messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, olderCursor: null, turnIndexByTurnId: {} })
+      gatewayMocks.startThreadTurn.mockResolvedValue('fixture-turn')
+      gatewayMocks.getThreadGoal.mockResolvedValue(goal)
+      const state = useDesktopState(); state.primeSelectedThread('goal-literal')
+      await state.sendMessageToSelectedThread('/goal Edited')
+      expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[1]).toBe('/goal Edited')
+      expect(gatewayMocks.getThreadGoal).not.toHaveBeenCalled()
+      expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
+    })
 })

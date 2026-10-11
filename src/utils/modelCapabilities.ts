@@ -27,8 +27,8 @@ export function normalizeModelIdForProvider(modelId: string, providerId: string)
   return normalizedModelId
 }
 
-export function isUltraReasoningModel(modelId: string): boolean {
-  return /^(?:cx\/)?gpt-6-astra(?:\[1m\])?(?:$|-)/u.test(normalizeModelId(modelId))
+export function isUltraReasoningModel(modelId: string, metadata?: Partial<ZenModelMetadata>): boolean {
+  return getModelReasoningEfforts(modelId, metadata).includes('ultra')
 }
 
 export function isFastModeSupported(modelId: string): boolean {
@@ -42,12 +42,18 @@ export function getFastModeCreditMultiplier(modelId: string): 2 | 2.5 {
 export function getModelReasoningEfforts(modelId: string, metadata?: Partial<ZenModelMetadata>): ReasoningEffort[] {
   if (metadata?.supportsReasoning === false) return []
   const allowed = [...STANDARD_REASONING_EFFORTS, 'ultra'] as ReasoningEffort[]
-  const explicit = metadata?.reasoningOptions?.filter((value): value is ReasoningEffort =>
-    typeof value === 'string' && allowed.includes(value as ReasoningEffort))
-  // An explicit provider empty list is restrictive; empty SDK/unknown metadata
-  // retains legacy defaults because it has never declared supported efforts.
-  if (explicit && (explicit.length > 0 || metadata?.reasoningSource === 'provider-catalog')) return [...new Set(explicit)]
-  return isUltraReasoningModel(modelId) ? [...STANDARD_REASONING_EFFORTS, 'ultra'] : [...STANDARD_REASONING_EFFORTS]
+  const authoritative = metadata?.reasoningSource === 'provider-catalog' || metadata?.reasoningSource === 'codex-runtime-catalog'
+  const raw = metadata?.reasoningOptions
+  // Native/provider declarations are restrictive even when empty or malformed.
+  // SDK placeholders retain legacy non-Ultra choices but never prove local modes.
+  if (authoritative && (!Array.isArray(raw) || raw.some(value => typeof value !== 'string' || !allowed.includes(value as ReasoningEffort)))) return []
+  if (Array.isArray(raw)) {
+    const explicit = raw.filter((value): value is ReasoningEffort =>
+      typeof value === 'string' && allowed.includes(value as ReasoningEffort)
+      && (value !== 'ultra' || (authoritative && (metadata?.id === undefined || metadata.id === modelId))))
+    if (authoritative || raw.length > 0) return [...new Set(explicit)]
+  }
+  return [...STANDARD_REASONING_EFFORTS]
 }
 
 export function resolveModelContextWindow(runtime: number | null | undefined, advertised: number | null | undefined): number | null {
@@ -68,7 +74,5 @@ export function getContextWindowStatus(measured: number | null | undefined, meta
 
 export function isReasoningEffortSupported(modelId: string, effort: ReasoningEffort | '', metadata?: Partial<ZenModelMetadata>): boolean {
   if (!effort) return true
-  if (metadata) return getModelReasoningEfforts(modelId, metadata).includes(effort)
-  if (effort === 'ultra') return isUltraReasoningModel(modelId)
-  return STANDARD_REASONING_EFFORTS.includes(effort)
+  return getModelReasoningEfforts(modelId, metadata).includes(effort)
 }
