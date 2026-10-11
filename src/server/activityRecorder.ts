@@ -49,6 +49,7 @@ export class ActivityRecorder {
   private readonly pending = new Map<string, { input: ActivityInput; chunks: string[] }>()
   private readonly chains = new Map<string, Promise<unknown>>()
   private readonly deleted = new Set<string>()
+  private readonly recoveryEpochs = new Map<string, number>()
   private readonly submittedTurns = new Map<string, string>()
   private readonly pendingSubmissions = new Map<string, string>()
   private readonly recovering = new Map<string, Promise<void>>()
@@ -64,25 +65,40 @@ export class ActivityRecorder {
     return { id, threadId, turnId: null, itemId: null, goalCreatedAt: null, kind, title, status, summary: '', startedAt: new Date().toISOString(), durationMs: null, hasDetail: false, reconstructed: false }
   }
 
-  private run(threadId: string, operation: () => Promise<void>): Promise<void> {
+  private run(threadId: string, operation: () => Promise<void>, current: () => boolean = () => true): Promise<void> {
     const previous = this.chains.get(threadId) ?? Promise.resolve()
-    const next = previous.catch(() => {}).then(async () => { if (!this.deleted.has(threadId)) await operation() })
-      .catch(() => { this.store.reportFailure(threadId) })
+    const next = previous.catch(() => {}).then(async () => { if (!this.deleted.has(threadId) && current()) await operation() })
+      .catch(() => { if (!this.deleted.has(threadId) && current()) this.store.reportFailure(threadId) })
     this.chains.set(threadId, next)
     void next.finally(() => { if (this.chains.get(threadId) === next) this.chains.delete(threadId) })
     return next
   }
 
-  private async write(input: ActivityInput, detail?: string): Promise<void> {
+  private async write(input: ActivityInput, detail?: string, current: () => boolean = () => !this.deleted.has(input.threadId)): Promise<void> {
+    if (!current()) return
     if (detail !== undefined) {
-      await this.store.setDetail(input.threadId, input.id, detail, false, input.kind === 'command')
+      await this.store.setDetail(input.threadId, input.id, detail, false, input.kind === 'command', current)
+      if (!current()) return
       input.hasDetail = Boolean(detail)
       if (!input.summary) input.summary = redactActivityText(detail).slice(0, 240)
     } else {
       const existing = await this.store.lookup(input.threadId, input.id)
+      if (!current()) return
       if (existing?.hasDetail) input.hasDetail = true
     }
-    await this.store.append(input)
+    if (current()) await this.store.append(input, current)
+  }
+
+  private invalidateRecovery(threadId: string): void {
+    this.recoveryEpochs.set(threadId, (this.recoveryEpochs.get(threadId) ?? 0) + 1)
+    this.recovering.delete(threadId)
+  }
+
+  private tombstone(threadId: string): void {
+    this.deleted.add(threadId)
+    this.invalidateRecovery(threadId)
+    for (const [key, pending] of this.pending) if (pending.input.threadId === threadId) this.pending.delete(key)
+    this.pendingSubmissions.delete(threadId)
   }
 
   async beforeRpc(method: string, params: unknown): Promise<string | null> {
@@ -114,11 +130,12 @@ export class ActivityRecorder {
     const threadId = text(payload.threadId)
     if (!threadId) return
     if (method === 'thread/delete') {
-      this.deleted.add(threadId)
+      this.tombstone(threadId)
       await this.chains.get(threadId)
       await this.store.remove(threadId).catch(() => this.store.reportFailure(threadId))
       return
     }
+    if (this.deleted.has(threadId)) return
     if (method === 'thread/goal/set' || method === 'thread/goal/get') {
       const revision = submission ? this.requestGoalRevisions.get(submission) : undefined
       if (submission) this.requestGoalRevisions.delete(submission)
@@ -197,10 +214,12 @@ export class ActivityRecorder {
     const turn = record(params.turn)
     const turnId = text(params.turnId) || text(turn.id) || null
     if (method === 'thread/deleted') {
-      this.deleted.add(threadId)
+      this.tombstone(threadId)
       void (this.chains.get(threadId) ?? Promise.resolve()).then(() => this.store.remove(threadId)).catch(() => this.store.reportFailure(threadId))
       return
     }
+    if (this.deleted.has(threadId)) return
+    if (method === 'thread/closed') { this.invalidateRecovery(threadId); return }
     if (method === 'thread/goal/updated') {
       this.goalRevisions.set(threadId, (this.goalRevisions.get(threadId) ?? 0) + 1)
       void this.goal(threadId, record(params.goal))
@@ -294,10 +313,20 @@ export class ActivityRecorder {
   }
 
   recover(threadId: string, rpc: RpcExecutor, more = false): Promise<void> {
+    if (this.deleted.has(threadId)) return Promise.resolve()
     const existing = this.recovering.get(threadId)
     if (existing) return existing
+    const epoch = this.recoveryEpochs.get(threadId) ?? 0
+    // The native executor owns this opaque identity; it is observed, never changed.
+    // A cold first acquisition is additionally protected by native RPC generation rejection.
+    const transport = rpc as RpcExecutor & { readonly process?: unknown }
+    const hasNativeGeneration = 'process' in transport
+    let nativeGeneration = transport.process
+    const current = () => !this.deleted.has(threadId) && epoch === (this.recoveryEpochs.get(threadId) ?? 0)
+      && (!hasNativeGeneration || transport.process === nativeGeneration)
     const promise = (async () => {
       const page = await this.store.page(threadId, { limit: 1 })
+      if (!current()) return
       if (page.coverage.recoveryComplete || page.coverage.recoveredHistory && !more) return
       const storedCursor = page.coverage.recoveryCursor
       const mode = storedCursor?.startsWith('turns:') ? 'turns' : 'items'
@@ -308,11 +337,16 @@ export class ActivityRecorder {
         result = record(await rpc.rpc(mode === 'items' ? 'thread/items/list' : 'thread/turns/list', {
           threadId, limit: mode === 'items' ? 100 : 10, sortDirection: 'desc', ...(mode === 'turns' ? { itemsView: 'full' } : {}), ...(cursor ? { cursor } : {}),
         }))
+        if (!nativeGeneration) nativeGeneration = transport.process
       } catch (failure) {
+        if (!current()) return
         if (mode !== 'items' || storedCursor || !/unsupported|method not found|unknown method|not supported/i.test(failure instanceof Error ? failure.message : '')) throw failure
         source = 'turns'
         result = record(await rpc.rpc('thread/turns/list', { threadId, limit: 10, sortDirection: 'desc', itemsView: 'full' }))
+        if (!nativeGeneration) nativeGeneration = transport.process
       }
+      if (!current()) return
+      nativeGeneration = transport.process
       const rows = Array.isArray(result.data) ? result.data : []
       const entries = source === 'items'
         ? [...rows].reverse().map(value => ({ turnId: text(record(value).turnId), item: record(record(value).item), startedAt: null as string | null, status: 'completed' }))
@@ -322,21 +356,26 @@ export class ActivityRecorder {
         })
       const recoveryPage = (page.coverage.recoveryPages ?? 0) + 1
       for (const [index, value] of entries.entries()) {
+        if (!current()) return
         const type = text(value.item.type)
         const itemId = text(value.item.id)
         if (!type || !itemId) continue
         const id = 'item:' + itemId
-        if (await this.store.lookup(threadId, id)) continue
+        const found = await this.store.lookup(threadId, id)
+        if (!current()) return
+        if (found) continue
         const failed = value.item.status === 'failed' || typeof value.item.exitCode === 'number' && value.item.exitCode !== 0
         const running = value.status === 'inProgress' || value.item.status === 'inProgress'
         const input = { ...this.input(threadId, id, itemKind(type), itemTitle(type, value.item), failed ? 'failed' : running ? 'running' : 'completed'), turnId: value.turnId, itemId, startedAt: value.startedAt, reconstructed: true, historyOrder: -recoveryPage * 1000000 + index }
-        await this.run(threadId, () => this.write(input, itemDetail(type, value.item)))
+        await this.run(threadId, () => this.write(input, itemDetail(type, value.item), current), current)
+        if (!current()) return
       }
       const nextCursor = text(result.nextCursor) || null
-      await this.store.updateCoverage(threadId, { recoveredHistory: true, recoveryCursor: nextCursor ? source + ':' + nextCursor : null, recoveryComplete: nextCursor === null, recoveryPages: recoveryPage })
+      if (current()) await this.store.updateCoverage(threadId, { recoveredHistory: true, recoveryCursor: nextCursor ? source + ':' + nextCursor : null, recoveryComplete: nextCursor === null, recoveryPages: recoveryPage }, current)
     })().catch(async () => {
-      await this.store.updateCoverage(threadId, { warning: 'Older activity could not be recovered. Captured activity remains available.' }).catch(() => this.store.reportFailure(threadId))
-    }).finally(() => { this.recovering.delete(threadId) })
+      if (!current()) return
+      await this.store.updateCoverage(threadId, { warning: 'Older activity could not be recovered. Captured activity remains available.' }, current).catch(() => { if (current()) this.store.reportFailure(threadId) })
+    }).finally(() => { if (this.recovering.get(threadId) === promise) this.recovering.delete(threadId) })
     this.recovering.set(threadId, promise)
     return promise
   }

@@ -6,6 +6,7 @@
       <span v-if="coverage?.warning" class="activity-warning" role="status">{{ coverage.warning }}</span>
       <span v-if="error" class="activity-warning" role="alert">{{ error }}</span>
       <div class="activity-actions">
+        <button type="button" :disabled="loading" @click="refresh">Load recent updates</button>
         <button v-if="hasOlder" type="button" :disabled="loading" @click="loadEarlier">Load earlier activity</button>
         <button v-if="coverage && !coverage.recoveryComplete" type="button" :disabled="loading" @click="loadRecovered">Recover older history</button>
         <button v-if="error" type="button" :disabled="loading" @click="refresh">Retry</button>
