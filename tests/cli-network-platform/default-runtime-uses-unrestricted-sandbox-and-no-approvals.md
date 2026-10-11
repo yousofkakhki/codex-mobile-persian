@@ -14,6 +14,7 @@
 #### Expected Results
 - Default startup (no flags/env) uses `danger-full-access` sandbox and `never` approval policy.
 - Explicit CLI overrides still take precedence and are applied correctly.
+- Follow [default YOLO thread permissions](default-yolo-thread-permissions.md) to verify legacy cold resumes, hot viewing and subsequent turns separately; startup logs alone do not prove their effective permissions.
 
 #### Rollback/Cleanup
 - Unset any temporary env vars used for override checks.

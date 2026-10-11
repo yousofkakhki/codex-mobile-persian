@@ -283,6 +283,9 @@
                 <span>{{ providerError }}</span>
                 <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, providerError)">{{ t('Send feedback') }}</a>
               </div>
+              <div v-if="selectedProvider === 'ninerouter'" class="sidebar-settings-row sidebar-settings-row--input">
+                <p class="sidebar-settings-label">{{ t('Uses the server-configured 9Router connection. Credentials stay on the server.') }}</p>
+              </div>
               <div v-if="selectedProvider === 'openrouter'" class="sidebar-settings-row sidebar-settings-row--input">
                 <div class="sidebar-settings-provider-info">
                   <span class="sidebar-settings-label">{{ t('OpenRouter API key') }}</span>
@@ -462,6 +465,19 @@
                 <div class="sidebar-settings-field-help">
                   {{ t('Put one Telegram user ID per line or separate them with commas. Use `*` to allow all Telegram users. Unauthorized users will see their own ID in the rejection message so they can copy it here.') }}
                 </div>
+                <label class="sidebar-settings-field">
+                  <span class="sidebar-settings-field-label">{{ t('Completion notification chat IDs') }}</span>
+                  <textarea
+                    v-model="telegramNotificationChatIdsDraft"
+                    class="sidebar-settings-textarea"
+                    rows="2"
+                    placeholder="123456789&#10;987654321"
+                    spellcheck="false"
+                  />
+                </label>
+                <div class="sidebar-settings-field-help">
+                  {{ t('Send a completion message to these Telegram chats whenever any WebUI thread finishes. Use `/whoami` in each private bot chat to find the chat ID.') }}
+                </div>
                 <div v-if="telegramConfigError" class="sidebar-settings-telegram-error">
                   <span>{{ telegramConfigError }}</span>
                   <a class="visible-error-feedback" :href="feedbackMailto" @click="prepareFeedbackLink($event, telegramConfigError)">{{ t('Send feedback') }}</a>
@@ -541,6 +557,10 @@
             </span>
           </template>
           <template #actions>
+            <div v-if="route.name === 'thread' && selectedThreadId" class="thread-view-tabs" role="tablist" aria-label="Thread view">
+              <button type="button" role="tab" :aria-selected="activityView === 'chat'" :tabindex="activityView === 'chat' ? 0 : -1" @click="threadActivity.setView('chat')" @keydown.right.prevent="focusThreadView('activity')">Chat</button>
+              <button type="button" role="tab" :aria-selected="activityView === 'activity'" :tabindex="activityView === 'activity' ? 0 : -1" @click="threadActivity.setView('activity')" @keydown.left.prevent="focusThreadView('chat')">Activity</button>
+            </div>
             <ComposerDropdown
               v-if="canShowTerminalToggle"
               class="content-header-terminal-command"
@@ -976,8 +996,9 @@
               />
 
               <template v-else>
-                <div class="content-thread">
-                  <ThreadConversation ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
+                <div class="content-thread" role="tabpanel" :aria-label="activityView === 'activity' ? 'Activity' : 'Chat'">
+                  <ThreadActivity v-if="activityView === 'activity'" :thread-id="selectedThreadId" :entries="activityEntries" :coverage="activityCoverage" :loading="activityLoading" :error="activityError" :has-older="Boolean(activityNextCursor)" :older="threadActivity.older" :recover="threadActivity.recover" :refresh="threadActivity.refresh" />
+                  <ThreadConversation v-else ref="threadConversationRef" :messages="filteredMessages" :is-loading="isLoadingMessages"
                     :active-thread-id="composerThreadContextId" :cwd="composerCwd"
                     :live-overlay="liveOverlay"
                     :pending-requests="selectedThreadServerRequests"
@@ -1024,21 +1045,48 @@
                       <div class="thread-goal-card-copy">
                         <strong>Goal {{ formatGoalStatus(selectedThreadGoal.status) }}</strong>
                         <span>{{ selectedThreadGoal.objective }}</span>
+                        <span class="thread-goal-metrics" aria-label="Goal usage">
+                          Tokens {{ selectedThreadGoal.tokensUsed.toLocaleString() }} / {{ formatGoalBudget(selectedThreadGoal.tokenBudget) }}
+                          · Reported work {{ formatActivityDuration(selectedThreadGoal.timeUsedSeconds) }}
+                          · Elapsed {{ formatActivityDuration(goalElapsedSeconds) }}
+                        </span>
+                        <span class="thread-goal-sync" :class="{ 'is-error': goalEditorError }">
+                          {{ goalEditorError || (goalSyncedAt ? `Last synced ${new Date(goalSyncedAt).toLocaleTimeString()}` : 'Synchronizing goal…') }}
+                        </span>
                       </div>
                     </div>
-                    <button class="thread-goal-card-edit" type="button" aria-label="Edit goal" title="Edit goal" @click="openGoalEditor">✎</button>
+                    <button class="thread-goal-card-edit" type="button" aria-label="Edit goal" title="Edit goal" @click="openGoalEditor()">✎</button>
+                    <button
+                      v-if="selectedThreadGoal.status === 'budgetLimited'"
+                      class="thread-goal-resume"
+                      type="button"
+                      :disabled="isSavingThreadGoal || isLoadingThreadGoal"
+                      @click="openGoalEditor(true)"
+                    >Adjust budget to resume</button>
                   </section>
+                  <p v-if="isLoadingThreadGoal" class="thread-goal-editor-status-note" role="status">Loading Goal…</p>
+                  <p v-if="goalEditorError && !isGoalEditorOpen" class="thread-goal-editor-error" role="alert">{{ goalEditorError }}</p>
                   <section v-if="isGoalEditorOpen" class="thread-goal-editor" role="dialog" aria-label="Edit thread goal">
+                    <p v-if="selectedThreadGoal?.status === 'budgetLimited'" class="thread-goal-editor-status-note">Resuming requires an owner-approved numeric total budget adjustment greater than consumed usage. The existing objective and usage are preserved.</p>
                     <textarea v-model="goalEditorObjective" class="thread-goal-editor-input" aria-label="Goal objective" rows="5" />
                     <div class="thread-goal-editor-status" aria-label="Goal status">
                       <button v-for="status in goalStatusOptions" :key="status" type="button" :class="{ 'is-active': goalEditorStatus === status }" @click="goalEditorStatus = status">{{ formatGoalStatus(status) }}</button>
                     </div>
+                    <div v-if="selectedThreadGoal && goalBudgetOwnerAuthorized && !isGoalBudgetEditorOpen" class="thread-goal-budget-launcher">
+                      <button type="button" class="is-budget" @click="isGoalBudgetEditorOpen = true">Adjust budget</button>
+                    </div>
+                    <div v-if="goalBudgetOwnerAuthorized && isGoalBudgetEditorOpen" class="thread-goal-budget-editor">
+                      <label for="goal-total-budget">Total token budget</label>
+                      <input id="goal-total-budget" v-model="goalEditorTokenBudget" inputmode="numeric" type="number" min="1" step="1" aria-describedby="goal-total-budget-help" />
+                      <small id="goal-total-budget-help">This is the total budget, not additional tokens. It must be greater than {{ (selectedThreadGoal?.tokensUsed ?? 0).toLocaleString() }} consumed tokens.</small>
+                    </div>
+                    <p v-if="goalBudgetAuditStatus" class="thread-goal-editor-status-note" role="status">{{ goalBudgetAuditStatus }}</p>
                     <p v-if="goalEditorError" class="thread-goal-editor-error">{{ goalEditorError }}</p>
                     <div class="thread-goal-editor-actions">
                       <button v-if="selectedThreadGoal" type="button" class="is-danger" @click="onClearThreadGoal">Clear goal</button>
                       <span class="thread-goal-editor-spacer" />
                       <button type="button" @click="isGoalEditorOpen = false">Cancel</button>
-                      <button type="button" class="is-primary" :disabled="isSavingThreadGoal || !goalEditorObjective.trim()" @click="onSaveThreadGoal">{{ isSavingThreadGoal ? 'Saving…' : 'Save goal' }}</button>
+                      <button type="button" class="is-primary" :disabled="isSavingThreadGoal || (!goalEditorObjective.trim() && !isGoalBudgetAdjustment)" @click="onSaveThreadGoal">{{ isSavingThreadGoal ? 'Saving…' : 'Save goal' }}</button>
                     </div>
                   </section>
                   <ThreadComposer
@@ -1211,11 +1259,13 @@ import IconTablerSettings from './components/icons/IconTablerSettings.vue'
 import IconTablerTerminal from './components/icons/IconTablerTerminal.vue'
 import IconTablerX from './components/icons/IconTablerX.vue'
 import { useDesktopState } from './composables/useDesktopState'
+import { useThreadGoalState } from './composables/useThreadGoalState'
+import { useThreadActivity } from './composables/useThreadActivity'
+import { formatActivityDuration } from './utils/activityFormatting'
 import { useMobile } from './composables/useMobile'
 import { useUiLanguage } from './composables/useUiLanguage'
 import { useFeedbackDiagnostics } from './composables/useFeedbackDiagnostics'
 import {
-  clearThreadGoal,
   checkoutGitBranch,
   cloneGithubRepository,
   configureTelegramBot,
@@ -1239,7 +1289,7 @@ import {
   getTelegramStatus,
   getThreadTerminalQuickCommands,
   getThreadTerminalStatus,
-  getThreadGoal,
+  getGoalBudgetOwnerAuthorization,
   getWorkspaceRootsState,
   importProjectZip,
   listLocalDirectories,
@@ -1251,16 +1301,16 @@ import {
   startCodexLogin,
   searchThreads,
   switchAccount,
-  setThreadGoal,
 } from './api/codexGateway'
 import type { ReasoningEffort, SpeedMode, UiAccountEntry, UiRateLimitWindow, UiServerRequest, UiServerRequestReply, UiThreadAutomation, UiThreadTokenUsage } from './types/codex'
 import type { ComposerDraftPayload, ThreadComposerExposed } from './components/content/ThreadComposer.vue'
-import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, TelegramStatus, ThreadGoal, ThreadGoalStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
+import type { GitCommitFileChange, GitCommitOption, LocalDirectoryEntry, TelegramStatus, ThreadGoalStatus, ThreadTerminalQuickCommand, WorktreeBranchOption } from './api/codexGateway'
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, isProjectlessChatPath, normalizePathForUi } from './pathUtils.js'
 import { copyTextToClipboard } from './utils/clipboard'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
+const ThreadActivity = defineAsyncComponent(() => import('./components/content/ThreadActivity.vue'))
 const ThreadTerminalPanel = defineAsyncComponent(() => import('./components/content/ThreadTerminalPanel.vue'))
 const ReviewPane = defineAsyncComponent(() => import('./components/content/ReviewPane.vue'))
 const DirectoryHub = defineAsyncComponent(() => import('./components/content/DirectoryHub.vue'))
@@ -1675,9 +1725,10 @@ const freeModeHasCustomKey = ref(false)
 const freeModeCustomKeyMasked = ref<string | null>(null)
 const freeModeCustomKeySaving = ref(false)
 const providerError = ref('')
-const selectedProvider = ref<'codex' | 'openrouter' | 'opencode-zen' | 'custom'>('codex')
+const selectedProvider = ref<'codex' | 'ninerouter' | 'openrouter' | 'opencode-zen' | 'custom'>('codex')
 const providerDropdownOptions = computed(() => [
   { value: 'codex', label: t('Codex') },
+  { value: 'ninerouter', label: t('9Router') },
   { value: 'openrouter', label: t('OpenRouter') },
   { value: 'opencode-zen', label: t('OpenCode Zen') },
   { value: 'custom', label: t('Custom endpoint') },
@@ -1690,6 +1741,7 @@ const opencodeZenKey = ref('')
 const isTelegramConfigOpen = ref(false)
 const telegramBotTokenDraft = ref('')
 const telegramAllowedUserIdsDraft = ref('')
+const telegramNotificationChatIdsDraft = ref('')
 const telegramConfigError = ref('')
 const isTelegramSaving = ref(false)
 const isCreateFolderOpen = ref(false)
@@ -1736,6 +1788,7 @@ const telegramStatus = ref<TelegramStatus>({
   active: false,
   mappedChats: 0,
   mappedThreads: 0,
+  notificationChats: 0,
   allowedUsers: 0,
   allowAllUsers: false,
   lastError: '',
@@ -2127,12 +2180,34 @@ const terminalHeaderDropdownOptions = computed(() => [
   ...terminalHeaderQuickCommands.value.map((command) => ({ label: command.label, value: command.value })),
 ])
 const goalStatusOptions: ThreadGoalStatus[] = ['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']
-const selectedThreadGoal = ref<ThreadGoal | null>(null)
+const isThreadSurfaceHidden = computed(() => route.name !== 'thread')
+const threadGoalState = useThreadGoalState(selectedThreadId, isThreadSurfaceHidden)
+const threadActivity = useThreadActivity(selectedThreadId, isThreadSurfaceHidden)
+const { view: activityView, entries: activityEntries, coverage: activityCoverage, loading: activityLoading, error: activityError, nextCursor: activityNextCursor } = threadActivity
+const selectedThreadGoal = threadGoalState.goal
+const goalElapsedSeconds = threadGoalState.elapsedSeconds
+const goalSyncedAt = threadGoalState.syncedAt
+async function focusThreadView(value: 'chat' | 'activity'): Promise<void> {
+  threadActivity.setView(value)
+  await nextTick()
+  document.querySelector<HTMLButtonElement>('.thread-view-tabs [aria-selected="true"]')?.focus()
+}
 const isGoalEditorOpen = ref(false)
-const isSavingThreadGoal = ref(false)
+const isSavingThreadGoal = threadGoalState.saving
+const isLoadingThreadGoal = threadGoalState.loading
+const goalEditorContextVersion = ref(0)
 const goalEditorObjective = ref('')
 const goalEditorStatus = ref<ThreadGoalStatus>('active')
-const goalEditorError = ref('')
+const goalEditorTokenBudget = ref<string | number>('')
+const goalEditorError = threadGoalState.error
+const goalBudgetOwnerAuthorized = ref(false)
+const isGoalBudgetEditorOpen = ref(false)
+const goalBudgetAuditStatus = ref('')
+const isGoalBudgetAdjustment = computed(() => {
+  const budgetText = String(goalEditorTokenBudget.value ?? '').trim()
+  const existingGoal = selectedThreadGoal.value
+  return Boolean(existingGoal) && budgetText !== '' && Number(budgetText) !== existingGoal?.tokenBudget
+})
 
 function formatGoalStatus(status: string): string {
   if (status === 'usageLimited') return 'usage limited'
@@ -2140,60 +2215,82 @@ function formatGoalStatus(status: string): string {
   return status
 }
 
-async function refreshSelectedThreadGoal(): Promise<void> {
-  const threadId = selectedThreadId.value.trim()
-  if (!threadId || isHomeRoute.value) {
-    selectedThreadGoal.value = null
-    return
-  }
-  try {
-    const goal = await getThreadGoal(threadId)
-    if (selectedThreadId.value === threadId) selectedThreadGoal.value = goal
-  } catch (error) {
-    if (selectedThreadId.value === threadId) {
-      selectedThreadGoal.value = null
-      goalEditorError.value = error instanceof Error ? error.message : 'Failed to load goal'
-    }
-  }
+function formatGoalBudget(value: number | null): string {
+  return value === null ? 'unlimited' : value.toLocaleString()
 }
 
-function openGoalEditor(): void {
+async function refreshSelectedThreadGoal(): Promise<void> {
+  await threadGoalState.refresh()
+}
+
+async function openGoalEditor(adjustBudget = false): Promise<void> {
+  const threadId = selectedThreadId.value.trim()
+  const context = ++goalEditorContextVersion.value
+  if (!threadId || isHomeRoute.value) return
+  goalBudgetOwnerAuthorized.value = false
+  if (!threadGoalState.loaded.value) await threadGoalState.refresh()
+  if (context !== goalEditorContextVersion.value || selectedThreadId.value.trim() !== threadId || isHomeRoute.value || !threadGoalState.loaded.value) return
   goalEditorObjective.value = selectedThreadGoal.value?.objective ?? ''
   goalEditorStatus.value = selectedThreadGoal.value?.status ?? 'active'
+  goalEditorTokenBudget.value = selectedThreadGoal.value?.tokenBudget === null || selectedThreadGoal.value?.tokenBudget === undefined
+    ? ''
+    : String(selectedThreadGoal.value.tokenBudget)
   goalEditorError.value = ''
+  goalBudgetAuditStatus.value = ''
+  isGoalBudgetEditorOpen.value = false
+  const authorized = await getGoalBudgetOwnerAuthorization()
+  if (context !== goalEditorContextVersion.value || selectedThreadId.value.trim() !== threadId || isHomeRoute.value) return
+  goalBudgetOwnerAuthorized.value = authorized
+  isGoalBudgetEditorOpen.value = (adjustBudget === true || !selectedThreadGoal.value) && authorized
   isGoalEditorOpen.value = true
 }
 
 async function onSaveThreadGoal(): Promise<void> {
   const threadId = selectedThreadId.value.trim()
   const objective = goalEditorObjective.value.trim()
-  if (!threadId || !objective || isSavingThreadGoal.value) return
-  isSavingThreadGoal.value = true
-  goalEditorError.value = ''
-  try {
-    selectedThreadGoal.value = await setThreadGoal(threadId, { objective, status: goalEditorStatus.value })
-    isGoalEditorOpen.value = false
-  } catch (error) {
-    goalEditorError.value = error instanceof Error ? error.message : 'Failed to save goal'
-  } finally {
-    isSavingThreadGoal.value = false
+  const existingGoal = selectedThreadGoal.value
+  if (!threadId || isHomeRoute.value || isSavingThreadGoal.value || isLoadingThreadGoal.value) return
+  const budgetText = String(goalEditorTokenBudget.value ?? '').trim()
+  const requestedBudget = budgetText === '' ? null : Number(budgetText)
+  const isBudgetAdjustment = Boolean(existingGoal)
+    && requestedBudget !== null
+    && requestedBudget !== existingGoal?.tokenBudget
+  const writesBudget = isBudgetAdjustment || !existingGoal
+  if (!objective && !isBudgetAdjustment) return
+  if (existingGoal?.status === 'budgetLimited' && goalEditorStatus.value === 'active' && !isBudgetAdjustment) {
+    goalEditorError.value = 'Owner budget adjustment is required to resume a budget-limited Goal.'
+    return
   }
+  if (!isBudgetAdjustment && existingGoal && goalEditorStatus.value === 'active'
+    && ((existingGoal.tokenBudget !== null && existingGoal.tokenBudget <= existingGoal.tokensUsed)
+      || (existingGoal.status !== 'active' && existingGoal.tokenBudget === null))) {
+    goalEditorError.value = 'An explicit numeric budget with remaining tokens is required to resume. Ask the owner to adjust the total budget.'
+    return
+  }
+  if (writesBudget && (requestedBudget === null || !Number.isSafeInteger(requestedBudget) || requestedBudget <= (existingGoal?.tokensUsed ?? 0))) {
+    goalEditorError.value = 'Total token budget must be a finite integer greater than consumed usage.'
+    return
+  }
+  if (writesBudget && !goalBudgetOwnerAuthorized.value) {
+    goalEditorError.value = 'Owner authorization is required to adjust the total budget.'
+    return
+  }
+  if (writesBudget && !window.confirm(`Set the total budget to ${(requestedBudget as number).toLocaleString()} tokens${existingGoal ? ' and resume this existing Goal' : ' for this new Goal'}? This preserves ${(existingGoal?.tokensUsed ?? 0).toLocaleString()} consumed tokens.`)) return
+  goalEditorError.value = ''
+  goalBudgetAuditStatus.value = ''
+  const nextInput = isBudgetAdjustment
+    ? { status: 'active' as const, tokenBudget: requestedBudget, ownerConfirmed: true }
+    : { objective, status: goalEditorStatus.value, ...(!existingGoal ? { tokenBudget: requestedBudget, ownerConfirmed: true } : {}) }
+  const applied = isBudgetAdjustment && existingGoal?.status === 'budgetLimited'
+    ? await threadGoalState.resume(requestedBudget as number, true)
+    : await threadGoalState.save(nextInput)
+  if (!applied) return
+  if (isBudgetAdjustment) goalBudgetAuditStatus.value = 'Budget adjusted and verified by the server.'
+  isGoalEditorOpen.value = false
 }
 
 async function onClearThreadGoal(): Promise<void> {
-  const threadId = selectedThreadId.value.trim()
-  if (!threadId || isSavingThreadGoal.value) return
-  isSavingThreadGoal.value = true
-  goalEditorError.value = ''
-  try {
-    await clearThreadGoal(threadId)
-    selectedThreadGoal.value = null
-    isGoalEditorOpen.value = false
-  } catch (error) {
-    goalEditorError.value = error instanceof Error ? error.message : 'Failed to clear goal'
-  } finally {
-    isSavingThreadGoal.value = false
-  }
+  if (await threadGoalState.clear()) isGoalEditorOpen.value = false
 }
 const contentStyle = computed(() => {
   const preset = CHAT_WIDTH_PRESETS[chatWidth.value]
@@ -2215,12 +2312,14 @@ const telegramStatusText = computed(() => {
   const allowlist = telegramStatus.value.allowAllUsers
     ? t('allow all users')
     : `${telegramStatus.value.allowedUsers} ${t('allowed user(s)')}`
-  const mapped = `${telegramStatus.value.mappedChats} ${t('chat(s)')}, ${telegramStatus.value.mappedThreads} ${t('thread(s)')}, ${allowlist}`
+  const mapped = `${telegramStatus.value.mappedChats} ${t('chat(s)')}, ${telegramStatus.value.mappedThreads} ${t('thread(s)')}, ${telegramStatus.value.notificationChats} ${t('completion recipient(s)')}, ${allowlist}`
   const error = telegramStatus.value.lastError ? `, ${t('error')}: ${telegramStatus.value.lastError}` : ''
   return `${base}, ${mapped}${error}`
 })
 
 onMounted(() => {
+  threadGoalState.start()
+  threadActivity.start()
   document.addEventListener('pointerdown', onDocumentPointerDown)
   window.addEventListener('keydown', onWindowKeyDown)
   document.addEventListener('visibilitychange', onDocumentVisibilityChange)
@@ -2239,7 +2338,6 @@ onMounted(() => {
   void refreshDefaultProjectName()
   void refreshTelegramConfig()
   void refreshTelegramStatus()
-  void loadFreeModeStatus()
   void refreshThreadTerminalStatus()
   void refreshTerminalQuickCommands()
 })
@@ -2255,6 +2353,8 @@ watch(visibleFeedbackErrors, (values, oldValues) => {
 })
 
 onUnmounted(() => {
+  threadGoalState.stop()
+  threadActivity.stop()
   document.removeEventListener('pointerdown', onDocumentPointerDown)
   window.removeEventListener('keydown', onWindowKeyDown)
   document.removeEventListener('visibilitychange', onDocumentVisibilityChange)
@@ -2370,11 +2470,12 @@ async function refreshTelegramStatus(): Promise<void> {
     telegramStatus.value = await getTelegramStatus()
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to load Telegram status'
-    telegramStatus.value = {
+  telegramStatus.value = {
       configured: false,
       active: false,
       mappedChats: 0,
       mappedThreads: 0,
+      notificationChats: 0,
       allowedUsers: 0,
       allowAllUsers: false,
       lastError: message,
@@ -2387,6 +2488,7 @@ async function refreshTelegramConfig(): Promise<void> {
     const config = await getTelegramConfig()
     telegramBotTokenDraft.value = config.botToken
     telegramAllowedUserIdsDraft.value = config.allowedUserIds.map((value) => String(value)).join('\n')
+    telegramNotificationChatIdsDraft.value = config.notificationChatIds.map((value) => String(value)).join('\n')
     telegramConfigError.value = ''
   } catch (error) {
     telegramConfigError.value = error instanceof Error ? error.message : 'Failed to load Telegram configuration'
@@ -2410,9 +2512,18 @@ function parseTelegramAllowedUserIdsInput(value: string): Array<number | '*'> {
   return allowAllUsers ? ['*', ...normalizedUserIds] : normalizedUserIds
 }
 
+function parseTelegramChatIdsInput(value: string): number[] {
+  return Array.from(new Set(value
+    .split(/[\n,]/)
+    .map((entry) => entry.trim().replace(/^(telegram|tg):/i, '').trim())
+    .filter((entry) => /^-?\d+$/.test(entry))
+    .map((entry) => Number.parseInt(entry, 10))))
+}
+
 async function saveTelegramConfig(): Promise<void> {
   const botToken = telegramBotTokenDraft.value.trim()
   const allowedUserIds = parseTelegramAllowedUserIdsInput(telegramAllowedUserIdsDraft.value)
+  const notificationChatIds = parseTelegramChatIdsInput(telegramNotificationChatIdsDraft.value)
   if (!botToken) {
     telegramConfigError.value = t('Telegram bot token is required.')
     return
@@ -2425,8 +2536,9 @@ async function saveTelegramConfig(): Promise<void> {
   isTelegramSaving.value = true
   telegramConfigError.value = ''
   try {
-    await configureTelegramBot(botToken, allowedUserIds)
+    await configureTelegramBot(botToken, allowedUserIds, notificationChatIds)
     telegramAllowedUserIdsDraft.value = allowedUserIds.map((value) => String(value)).join('\n')
+    telegramNotificationChatIdsDraft.value = notificationChatIds.join('\n')
     await Promise.all([
       refreshTelegramConfig(),
       refreshTelegramStatus(),
@@ -3511,6 +3623,10 @@ async function syncAfterMobileResume(): Promise<void> {
 }
 
 function onSubmitThreadMessage(payload: { text: string; imageUrls: string[]; fileAttachments: Array<{ label: string; path: string; fsPath: string }>; skills: Array<{ name: string; path: string }>; mode: 'steer' | 'queue' }): void {
+  if (!hasInitialized.value) {
+    desktopError.value = 'Global provider startup is not ready; retry after the model catalog loads.'
+    return
+  }
   const text = payload.text
   scheduleMobileConversationJumpToLatest()
   const editingState = editingQueuedMessageState.value
@@ -3525,7 +3641,10 @@ function onSubmitThreadMessage(payload: { text: string; imageUrls: string[]; fil
     void submitFirstMessageForNewThread(text, payload.imageUrls, payload.skills, payload.fileAttachments)
     return
   }
-  void sendMessageToSelectedThread(text, payload.imageUrls, payload.skills, payload.mode, payload.fileAttachments, queueInsertIndex)
+  const submissionThreadId = selectedThreadId.value
+  void sendMessageToSelectedThread(text, payload.imageUrls, payload.skills, payload.mode, payload.fileAttachments, queueInsertIndex).catch(failure => {
+    if (selectedThreadId.value === submissionThreadId) desktopError.value = failure instanceof Error ? failure.message : 'Failed to submit prompt'
+  })
 }
 
 function onEditQueuedMessage(messageId: string): void {
@@ -4440,6 +4559,13 @@ async function onProviderChange(provider: string): Promise<void> {
       selectedProvider.value = 'codex'
       const result = await setFreeMode(false)
       freeModeEnabled.value = result.enabled
+    } else if (provider === 'ninerouter') {
+      selectedProvider.value = 'ninerouter'
+      await setCustomProvider('', '', {
+        wireApi: 'responses',
+        provider: 'ninerouter',
+      })
+      freeModeEnabled.value = true
     } else if (provider === 'openrouter') {
       selectedProvider.value = 'openrouter'
       const result = await setFreeMode(true)
@@ -4565,14 +4691,16 @@ async function clearFreeModeCustomKey(): Promise<void> {
   }
 }
 
-async function loadFreeModeStatus(): Promise<void> {
+async function loadFreeModeStatus(options: { deferRefresh?: boolean } = {}): Promise<boolean> {
   try {
     const previousProvider = selectedProvider.value
     const status = await getFreeModeStatus()
     freeModeEnabled.value = status.enabled
     freeModeHasCustomKey.value = status.customKey ?? false
     freeModeCustomKeyMasked.value = status.maskedKey ?? null
-    if (status.enabled) {
+    if (status.provider === 'ninerouter') {
+      selectedProvider.value = 'ninerouter'
+    } else if (status.enabled) {
       if (status.provider === 'opencode-zen') {
         selectedProvider.value = 'opencode-zen'
       } else if (status.provider === 'custom') {
@@ -4591,7 +4719,8 @@ async function loadFreeModeStatus(): Promise<void> {
       externalAuthImportAttempted = false
     }
     const providerChanged = selectedProvider.value !== previousProvider
-    if (providerChanged) {
+    if (providerChanged && options.deferRefresh !== true) {
+      // Preserve immediate route invalidation before any external-auth await outside startup.
       await refreshAll({
         includeSelectedThreadMessages: false,
         providerChanged: true,
@@ -4599,15 +4728,17 @@ async function loadFreeModeStatus(): Promise<void> {
       })
     }
     const importedExternalAuth = await maybeImportExternalCodexAuthAccount()
-    if (importedExternalAuth) {
+    if (importedExternalAuth && options.deferRefresh !== true) {
       await refreshAll({
         includeSelectedThreadMessages: false,
-        providerChanged: providerChanged || importedExternalAuth,
+        providerChanged: true,
         awaitAncillaryRefreshes: true,
       })
     }
+    return providerChanged || importedExternalAuth
   } catch {
-    // Ignore — free mode status unknown
+    // Global catalog discovery still uses authoritative config during the initial refresh.
+    return false
   }
 }
 
@@ -4732,9 +4863,17 @@ async function initialize(): Promise<void> {
     primeSelectedThread('', { persist: false })
   }
 
+  const providerChanged = await loadFreeModeStatus({ deferRefresh: true })
   await refreshAll({
-    includeSelectedThreadMessages: route.name === 'thread',
+    includeSelectedThreadMessages: false,
+    providerChanged,
+    awaitAncillaryRefreshes: true,
   })
+  if (route.name === 'thread' && routeThreadId.value) {
+    await ensureThreadMessagesLoaded(routeThreadId.value, { silent: true }).catch(() => {
+      // The conversation overlay receives the error from useDesktopState.
+    })
+  }
   void loadAccountsState({ silent: true })
   await applyLaunchProjectPathFromUrl()
   hasInitialized.value = true
@@ -4803,13 +4942,26 @@ watch(
   },
 )
 
+watch([selectedThreadId, isHomeRoute], () => {
+  goalEditorContextVersion.value++
+  isGoalEditorOpen.value = false
+  goalBudgetOwnerAuthorized.value = false
+  isGoalBudgetEditorOpen.value = false
+  goalBudgetAuditStatus.value = ''
+}, { flush: 'sync' })
+
 watch(
   () => [selectedThreadId.value, composerCwd.value] as const,
   () => {
     clearCommitReviewContext()
     isGoalEditorOpen.value = false
-    void refreshSelectedThreadGoal()
   },
+  { immediate: true },
+)
+
+watch(
+  () => [selectedThreadId.value, isThreadSurfaceHidden.value] as const,
+  () => { isGoalEditorOpen.value = false; void refreshSelectedThreadGoal() },
   { immediate: true },
 )
 
@@ -4976,6 +5128,10 @@ async function submitFirstMessageForNewThread(
   skills: Array<{ name: string; path: string }> = [],
   fileAttachments: Array<{ label: string; path: string; fsPath: string }> = [],
 ): Promise<void> {
+  if (!hasInitialized.value) {
+    desktopError.value = 'Global provider startup is not ready; retry after the model catalog loads.'
+    return
+  }
   try {
     worktreeInitStatus.value = { phase: 'idle', title: '', message: '' }
     let targetCwd = newThreadCwd.value
@@ -5246,7 +5402,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 }
 
 .thread-goal-card {
-  @apply flex items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-white px-3 py-2 shadow-sm;
+  @apply grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 gap-y-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 shadow-sm;
 }
 
 .thread-goal-card-main {
@@ -5258,7 +5414,7 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 }
 
 .thread-goal-card-copy {
-  @apply flex min-w-0 items-baseline gap-2;
+  @apply flex min-w-0 flex-1 flex-col gap-0.5;
 }
 
 .thread-goal-card-copy strong {
@@ -5266,11 +5422,37 @@ async function loadWorktreeBranches(sourceCwd: string): Promise<void> {
 }
 
 .thread-goal-card-copy span {
-  @apply truncate text-sm text-zinc-500;
+  @apply w-full truncate text-sm text-zinc-500;
+}
+
+.thread-goal-card-copy small {
+  @apply shrink-0 text-xs text-zinc-400;
+}
+
+.thread-goal-budget-launcher {
+  @apply mt-2;
+}
+
+.thread-goal-budget-launcher .is-budget,
+.thread-goal-budget-editor input {
+  @apply rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs text-zinc-700;
+}
+
+.thread-goal-budget-editor {
+  @apply mt-2 flex flex-col gap-1 text-xs text-zinc-500;
+}
+
+.thread-goal-budget-editor small,
+.thread-goal-editor-status-note {
+  @apply text-xs text-zinc-400;
 }
 
 .thread-goal-card-edit {
   @apply inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border-0 bg-transparent text-lg text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900;
+}
+
+.thread-goal-resume {
+  @apply col-span-2 justify-self-end shrink-0 rounded-full border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-semibold text-violet-700 transition hover:bg-violet-100 disabled:cursor-wait disabled:opacity-60;
 }
 
 .thread-goal-editor {

@@ -18,10 +18,16 @@ import type {
   ThreadListResponse,
   ThreadReadResponse,
   ThreadResumeResponse,
+  ThreadItemsListResponse,
+  ThreadItemEntry,
   ThreadStartResponse,
+  ThreadTurnsListResponse,
+  TurnsPage,
   Turn,
 } from './appServerDtos'
 import { extractErrorMessage, normalizeCodexApiError } from './codexErrors'
+import { mergeThreadTurnOrder } from '../utils/threadHistory'
+import { getModelReasoningEfforts } from '../utils/modelCapabilities'
 import {
   readActiveTurnIdFromResponse,
   normalizeThreadGroupsV2,
@@ -231,13 +237,14 @@ export type ThreadGoalSetInput = {
   objective?: string
   status?: ThreadGoalStatus
   tokenBudget?: number | null
+  ownerConfirmed?: boolean
 }
 
 export type ComposerFileSuggestion = {
   path: string
 }
 
-function normalizeThreadGoal(value: unknown): ThreadGoal | null {
+export function normalizeThreadGoal(value: unknown): ThreadGoal | null {
   const record = asRecord(value)
   if (!record) return null
   const threadId = readString(record.threadId)
@@ -272,11 +279,36 @@ export async function setThreadGoal(threadId: string, input: ThreadGoalSetInput)
   const params: Record<string, unknown> = { threadId: normalizedThreadId }
   if (input.objective?.trim()) params.objective = input.objective.trim()
   if (input.status) params.status = input.status
-  if (Object.prototype.hasOwnProperty.call(input, 'tokenBudget')) params.tokenBudget = input.tokenBudget
+  if (Object.prototype.hasOwnProperty.call(input, 'tokenBudget')) {
+    if (input.ownerConfirmed !== true) throw new Error('Explicit owner confirmation is required to set a goal budget')
+    params.tokenBudget = input.tokenBudget
+    params.ownerConfirmed = true
+  }
   const payload = await callRpc<{ goal?: unknown }>('thread/goal/set', params)
   const goal = normalizeThreadGoal(payload.goal)
   if (!goal) throw new Error('thread/goal/set response was malformed')
   return goal
+}
+
+// Recovery is a deliberate owner budget adjustment, never an unlimited or usage-reset shortcut.
+export async function resumeThreadGoal(threadId: string, tokenBudget: number, ownerConfirmed = false): Promise<ThreadGoal> {
+  if (!ownerConfirmed) throw new Error('Explicit owner confirmation is required to adjust the total budget')
+  if (!Number.isSafeInteger(tokenBudget) || tokenBudget <= 0) {
+    throw new Error('Recovery requires an explicit finite positive integer total budget')
+  }
+  if (!await getGoalBudgetOwnerAuthorization()) throw new Error('Owner authorization is required to adjust the total budget')
+  const before = await getThreadGoal(threadId)
+  if (before && before.threadId !== threadId.trim()) throw new Error('Goal response belongs to a different thread')
+  if (!before || before.status !== 'budgetLimited') throw new Error('Recovery requires an existing budget-limited Goal')
+  if (tokenBudget <= before.tokensUsed) throw new Error('Total token budget must be greater than consumed usage')
+  if (tokenBudget === before.tokenBudget) throw new Error('Owner budget adjustment is required; the unchanged budget cannot resume this Goal')
+  const after = await setThreadGoal(threadId, { status: 'active', tokenBudget, ownerConfirmed })
+  if (after.threadId !== before.threadId || after.status !== 'active' || after.tokenBudget !== tokenBudget
+    || after.objective !== before.objective || after.tokensUsed !== before.tokensUsed
+    || after.timeUsedSeconds !== before.timeUsedSeconds || after.createdAt !== before.createdAt) {
+    throw new Error('Goal recovery failed durable accounting preservation verification')
+  }
+  return after
 }
 
 export async function clearThreadGoal(threadId: string): Promise<boolean> {
@@ -284,6 +316,17 @@ export async function clearThreadGoal(threadId: string): Promise<boolean> {
   if (!normalizedThreadId) return false
   const payload = await callRpc<{ cleared?: unknown }>('thread/goal/clear', { threadId: normalizedThreadId })
   return payload.cleared === true
+}
+
+export async function getGoalBudgetOwnerAuthorization(): Promise<boolean> {
+  try {
+    const response = await fetch('/codex-api/owner/authorization')
+    if (!response.ok) return false
+    const payload = await response.json() as { authorized?: unknown }
+    return payload.authorized === true
+  } catch {
+    return false
+  }
 }
 
 const DEFAULT_COLLABORATION_MODE_OPTIONS: CollaborationModeOption[] = [
@@ -348,6 +391,7 @@ export type TelegramStatus = {
   active: boolean
   mappedChats: number
   mappedThreads: number
+  notificationChats: number
   allowedUsers: number
   allowAllUsers: boolean
   lastError: string
@@ -356,6 +400,7 @@ export type TelegramStatus = {
 export type TelegramConfig = {
   botToken: string
   allowedUserIds: Array<number | '*'>
+  notificationChatIds: number[]
 }
 
 export type LocalDirectoryEntry = {
@@ -535,7 +580,15 @@ export function pickCodexRateLimitSnapshot(payload: unknown): UiRateLimitSnapsho
   return normalizeRateLimitSnapshot(record.rateLimits ?? record.rate_limits)
 }
 
+const readOnlyThreadIds = new Set<string>()
+function assertThreadMutationAllowed(threadId: string): void {
+  if (readOnlyThreadIds.has(threadId)) throw new Error('This thread is read-only because another active writer owns it; no mutation was sent.')
+}
+
 async function callRpc<T>(method: string, params?: unknown): Promise<T> {
+  const threadId = readString(asRecord(params)?.threadId) ?? ''
+  const reads = new Set(['thread/resume', 'thread/read', 'thread/turns/list', 'thread/items/list', 'thread/fork', 'thread/goal/get'])
+  if (threadId && !reads.has(method)) assertThreadMutationAllowed(threadId)
   try {
     return await rpcCall<T>(method, params)
   } catch (error) {
@@ -688,20 +741,109 @@ async function enrichThreadMessagesWithFallback(threadId: string, messages: UiMe
 }
 
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
-  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
   return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
     ? (value as ReasoningEffort)
     : ''
 }
 
 function normalizeSpeedMode(value: unknown): SpeedMode {
-  return typeof value === 'string' && value.trim().toLowerCase() === 'fast'
+  return typeof value === 'string' && ['fast', 'priority'].includes(value.trim().toLowerCase())
     ? 'fast'
     : 'standard'
 }
 
 const INITIAL_THREAD_LIST_LIMIT = 50
+export function getSpeedModeServiceTier(mode: SpeedMode): 'priority' | 'default' {
+  return mode === 'fast' ? 'priority' : 'default'
+}
+
 const BACKGROUND_THREAD_LIST_LIMIT = 100
+const THREAD_ITEM_PAGE_LIMIT = 100
+const THREAD_HEADER_PAGE_LIMIT = 10
+const ITEM_HISTORY_CURSOR_PREFIX = 'item-history:'
+
+type ItemHistoryCursor = {
+  items: string | null
+  turns: string | null
+}
+
+function encodeItemHistoryCursor(items: string | null, turns: string | null): string | null {
+  return items || turns ? `${ITEM_HISTORY_CURSOR_PREFIX}${JSON.stringify({ items, turns })}` : null
+}
+
+function decodeItemHistoryCursor(cursor: string): ItemHistoryCursor {
+  const parsed = JSON.parse(cursor.slice(ITEM_HISTORY_CURSOR_PREFIX.length)) as ItemHistoryCursor
+  if (!parsed || ![parsed.items, parsed.turns].every(value => value === null || typeof value === 'string')) {
+    throw new Error('Invalid thread item history cursor')
+  }
+  return parsed
+}
+
+function isItemPaginationUnsupported(error: unknown): boolean {
+  return error instanceof Error && /(?:method not found|unknown (?:method|variant)|unsupported method).*thread\/items\/list|thread\/items\/list.*(?:not found|unsupported)|(?:not supported|unsupported).*item pagination|item pagination.*(?:not supported|unsupported)/iu.test(error.message)
+}
+
+function buildItemHistoryTurns(headers: Turn[], entries: ThreadItemEntry[]): Turn[] {
+  const turnsById = new Map(headers.map(turn => [turn.id, { ...turn, items: [] } as Turn]))
+  const itemTurnIds: string[] = []
+  for (const entry of [...entries].reverse()) {
+    let turn = turnsById.get(entry.turnId)
+    if (!turn) {
+      turn = { id: entry.turnId, items: [], itemsView: 'full', status: 'completed', error: null, startedAt: null, completedAt: null, durationMs: null }
+      turnsById.set(entry.turnId, turn)
+    }
+    if (!itemTurnIds.includes(entry.turnId)) itemTurnIds.push(entry.turnId)
+    turn.items.push(entry.item)
+    turn.itemsView = 'full'
+  }
+  return mergeThreadTurnOrder(itemTurnIds, headers.map(turn => turn.id)).map(turnId => turnsById.get(turnId)!)
+}
+
+async function readThreadItemsPage(threadId: string, cursor?: string): Promise<ThreadItemsListResponse> {
+  const page = await callRpc<ThreadItemsListResponse>('thread/items/list', {
+    threadId,
+    limit: THREAD_ITEM_PAGE_LIMIT,
+    sortDirection: 'desc',
+    ...(cursor ? { cursor } : {}),
+  })
+  if (!Array.isArray(page.data)) throw new Error('Thread item page did not include items')
+  return page
+}
+
+async function buildRecentThreadDetail(
+  threadId: string,
+  payload: ThreadResumeResponse | ThreadReadResponse,
+  suppliedHeaders?: TurnsPage,
+): Promise<ResumedThread> {
+  let page = suppliedHeaders ?? ('initialTurnsPage' in payload ? payload.initialTurnsPage : null)
+  let turns = [...(page?.data ?? payload.thread.turns ?? [])].reverse()
+  let olderCursor = page?.nextCursor ?? null
+  try {
+    const itemsPage = await readThreadItemsPage(threadId)
+    turns = buildItemHistoryTurns(turns, itemsPage.data)
+    olderCursor = encodeItemHistoryCursor(itemsPage.nextCursor, page?.nextCursor ?? null)
+  } catch (error) {
+    if (!isItemPaginationUnsupported(error)) throw error
+    page = await callRpc<ThreadTurnsListResponse>('thread/turns/list', {
+      threadId, limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'full',
+    })
+    turns = [...page.data].reverse()
+    olderCursor = page.nextCursor
+  }
+  const normalizedPayload = { thread: { ...payload.thread, turns } } as ThreadReadResponse
+  return {
+    model: normalizeThreadModelFromPayload(payload),
+    modelProvider: normalizeThreadModelProviderFromPayload(payload),
+    messages: normalizeThreadMessagesV2(normalizedPayload),
+    inProgress: readThreadInProgressFromResponse(normalizedPayload),
+    activeTurnId: readActiveTurnIdFromResponse(normalizedPayload),
+    hasMoreOlder: Boolean(olderCursor),
+    olderCursor,
+    turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
+    ...('serviceTier' in payload ? { speedMode: normalizeSpeedMode(payload.serviceTier) } : {}),
+  }
+}
 
 export type ThreadGroupsPage = {
   groups: UiProjectGroup[]
@@ -715,6 +857,7 @@ export type ThreadTurnPage = {
   hasMoreOlder: boolean
   startTurnIndex: number
   turnIndexByTurnId: ThreadTurnIndexById
+  nextCursor: string | null
 }
 
 async function getThreadGroupsPageV2(cursor: string | null, limit: number): Promise<ThreadGroupsPage> {
@@ -749,7 +892,7 @@ async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
   return normalizeThreadSummaryV2(payload)
 }
 
-async function getThreadDetailV2(threadId: string): Promise<{
+async function getThreadDetailV2(threadId: string, optionsOrSpeed: ThreadResumeOptions | SpeedMode = {}): Promise<{
   model: string
   modelProvider: string
   messages: UiMessage[]
@@ -757,51 +900,61 @@ async function getThreadDetailV2(threadId: string): Promise<{
   activeTurnId: string
   hasMoreOlder: boolean
   turnIndexByTurnId: ThreadTurnIndexById
+  olderCursor: string | null
 }> {
-  const payload = await callRpc<ThreadReadResponse>('thread/read', {
+  const revision = threadAcquisitionRevision
+  const options = typeof optionsOrSpeed === 'string' ? { speedMode: optionsOrSpeed } : optionsOrSpeed
+  const payload = await callRpc<ThreadResumeResponse>('thread/resume', {
     threadId,
-    includeTurns: true,
+    excludeTurns: true,
+    initialTurnsPage: { limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded' },
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
+    ...(options.speedMode ? { serviceTier: getSpeedModeServiceTier(options.speedMode) } : {}),
   })
-  const startTurnIndex = readThreadTurnStartIndex(payload)
-  const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
-  return {
-    model: normalizeThreadModelFromPayload(payload),
-    modelProvider: normalizeThreadModelProviderFromPayload(payload),
-    messages: normalized,
-    inProgress: readThreadInProgressFromResponse(payload),
-    activeTurnId: readActiveTurnIdFromResponse(payload),
-    hasMoreOlder: startTurnIndex > 0,
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
-  }
+  assertCurrentThreadAcquisition(revision)
+  const detail = await buildRecentThreadDetail(threadId, payload)
+  assertCurrentThreadAcquisition(revision)
+  return detail
 }
 
-async function getOlderThreadMessagesV2(threadId: string, beforeTurnId: string, limit = 10): Promise<ThreadTurnPage> {
-  const params = new URLSearchParams({
-    threadId,
-    beforeTurnId,
-    limit: String(limit),
-  })
+async function getOlderThreadMessagesV2(threadId: string, cursor: string, limit = 10): Promise<ThreadTurnPage> {
+  if (cursor.startsWith(ITEM_HISTORY_CURSOR_PREFIX)) {
+    const historyCursor = decodeItemHistoryCursor(cursor)
+    const [itemsPage, headersPage] = await Promise.all([
+      historyCursor.items ? readThreadItemsPage(threadId, historyCursor.items) : null,
+      historyCursor.turns ? callRpc<ThreadTurnsListResponse>('thread/turns/list', {
+        threadId, cursor: historyCursor.turns, limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded',
+      }) : null,
+    ])
+    const turns = buildItemHistoryTurns([...(headersPage?.data ?? [])].reverse(), itemsPage?.data ?? [])
+    const normalizedPayload = { thread: { turns } } as ThreadReadResponse
+    const nextCursor = encodeItemHistoryCursor(itemsPage?.nextCursor ?? null, headersPage?.nextCursor ?? null)
+    return {
+      messages: normalizeThreadMessagesV2(normalizedPayload),
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: Boolean(nextCursor),
+      startTurnIndex: 0,
+      turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
+      nextCursor,
+    }
+  }
+  const params = new URLSearchParams({ threadId, cursor, limit: String(limit) })
   const response = await fetch(`/codex-api/thread-turn-page?${params.toString()}`)
-  if (!response.ok) {
-    throw new Error(`Older thread page request failed with ${response.status}`)
-  }
-  const payload = await response.json() as {
-    result?: ThreadReadResponse
-    hasMoreOlder?: unknown
-    startTurnIndex?: unknown
-  }
-  if (!payload.result) {
-    throw new Error('Older thread page response did not include a thread result')
-  }
-  const startTurnIndex = Math.max(0, Math.floor(typeof payload.startTurnIndex === 'number' ? payload.startTurnIndex : 0))
-
+  if (!response.ok) throw new Error(`Older thread page request failed with ${response.status}`)
+  const payload = await response.json() as { result?: ThreadTurnsListResponse }
+  if (!payload.result) throw new Error('Older thread page response did not include a turns page')
+  const orderedTurns = [...payload.result.data].reverse()
+  const normalizedPayload = { thread: { turns: orderedTurns } } as ThreadReadResponse
   return {
-    messages: normalizeThreadMessagesV2(payload.result, startTurnIndex),
-    inProgress: readThreadInProgressFromResponse(payload.result),
-    activeTurnId: readActiveTurnIdFromResponse(payload.result),
-    hasMoreOlder: payload.hasMoreOlder === true,
-    startTurnIndex,
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload.result, startTurnIndex),
+    messages: normalizeThreadMessagesV2(normalizedPayload),
+    inProgress: false,
+    activeTurnId: '',
+    hasMoreOlder: Boolean(payload.result.nextCursor),
+    startTurnIndex: 0,
+    turnIndexByTurnId: buildTurnIndexByTurnId(normalizedPayload),
+    nextCursor: payload.result.nextCursor,
   }
 }
 
@@ -844,25 +997,17 @@ export async function getThreadSummary(threadId: string): Promise<UiThread> {
   }
 }
 
-export async function getThreadDetail(threadId: string): Promise<{
-  model: string
-  modelProvider: string
-  messages: UiMessage[]
-  inProgress: boolean
-  activeTurnId: string
-  hasMoreOlder: boolean
-  turnIndexByTurnId: ThreadTurnIndexById
-}> {
+export async function getThreadDetail(threadId: string, options: ThreadResumeOptions | SpeedMode = {}): Promise<ResumedThread> {
   try {
-    return await getThreadDetailV2(threadId)
+    return await getThreadDetailV2(threadId, options)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load thread ${threadId}`, 'thread/read')
   }
 }
 
-export async function getOlderThreadMessages(threadId: string, beforeTurnId: string, limit?: number): Promise<ThreadTurnPage> {
+export async function getOlderThreadMessages(threadId: string, cursor: string, limit?: number): Promise<ThreadTurnPage> {
   try {
-    return await getOlderThreadMessagesV2(threadId, beforeTurnId, limit)
+    return await getOlderThreadMessagesV2(threadId, cursor, limit)
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to load earlier messages for thread ${threadId}`, 'thread/read')
   }
@@ -1486,17 +1631,30 @@ export async function removeAccount(storageId: string): Promise<AccountsListResu
 }
 
 export type ResumedThread = {
+  readOnly?: boolean
   model: string
   modelProvider: string
+  speedMode?: SpeedMode
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
   hasMoreOlder: boolean
+  olderCursor: string | null
   turnIndexByTurnId: ThreadTurnIndexById
 }
 
 const RESUME_THREAD_COALESCE_TTL_MS = 30_000
 const recentResumeThreadById = new Map<string, Promise<ResumedThread>>()
+let threadAcquisitionRevision = 0
+
+function assertCurrentThreadAcquisition(revision: number): void {
+  if (revision !== threadAcquisitionRevision) throw new Error('Global provider changed while acquiring a thread; retry the message')
+}
+
+export function invalidateThreadResumeCache(): void {
+  threadAcquisitionRevision += 1
+  recentResumeThreadById.clear()
+}
 
 function isMissingLegacyCustomEndpointProvider(error: unknown): boolean {
   return error instanceof Error
@@ -1508,61 +1666,87 @@ function isThreadOwnedByAnotherWriter(error: unknown): boolean {
     && /thread .+ already has an active writer/iu.test(error.message)
 }
 
-export async function resumeThread(threadId: string): Promise<ResumedThread> {
-  const existing = recentResumeThreadById.get(threadId)
-  if (existing) return existing
+async function getReadOnlyThreadDetailV2(threadId: string): Promise<ResumedThread> {
+  const summary = await callRpc<ThreadReadResponse>('thread/read', { threadId, includeTurns: false })
+  const page = await callRpc<ThreadTurnsListResponse>('thread/turns/list', {
+    threadId, limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded',
+  })
+  const detail = await buildRecentThreadDetail(threadId, summary, page)
+  return {
+    ...detail,
+    readOnly: true,
+    model: detail.model || readString(asRecord(summary.thread)?.model) || '',
+  }
+}
 
-  const promise = (async () => {
-    let payload: ThreadResumeResponse | ThreadReadResponse
+export type ThreadResumeOptions = { model?: string; modelProvider?: string; speedMode?: SpeedMode }
+
+export async function resumeThread(threadId: string, optionsOrSpeed: ThreadResumeOptions | SpeedMode = {}): Promise<ResumedThread> {
+  const revision = threadAcquisitionRevision
+  const options = typeof optionsOrSpeed === 'string' ? { speedMode: optionsOrSpeed } : optionsOrSpeed
+  const resumeKey = JSON.stringify([threadId, options.model ?? '', normalizeRuntimeProviderId(options.modelProvider ?? ''), options.speedMode ?? null])
+  const existing = recentResumeThreadById.get(resumeKey)
+  if (existing) {
+    const result = await existing
+    assertCurrentThreadAcquisition(revision)
+    return result
+  }
+
+  const promise = (async (): Promise<ResumedThread> => {
+    let payload: ThreadResumeResponse
+    const params = {
+      threadId,
+      excludeTurns: true,
+      initialTurnsPage: { limit: THREAD_HEADER_PAGE_LIMIT, sortDirection: 'desc', itemsView: 'notLoaded' },
+      ...(options.model ? { model: options.model } : {}),
+      ...(options.modelProvider ? { modelProvider: normalizeRuntimeProviderId(options.modelProvider) } : {}),
+      ...(options.speedMode ? { serviceTier: getSpeedModeServiceTier(options.speedMode) } : {}),
+    }
     try {
-      payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
+      payload = await callRpc<ThreadResumeResponse>('thread/resume', params)
     } catch (error) {
-      if (isThreadOwnedByAnotherWriter(error)) {
-        payload = await callRpc<ThreadReadResponse>('thread/read', { threadId, includeTurns: true })
-      } else {
-        if (!isMissingLegacyCustomEndpointProvider(error)) throw error
-        try {
-          payload = await callRpc<ThreadResumeResponse>('thread/resume', {
-            threadId,
-            // Codex 0.147 removed the legacy custom_endpoint provider name. The
-            // top-level openai_base_url configuration continues to route OpenAI
-            // requests to the configured compatible endpoint.
-            modelProvider: 'openai',
-          })
-        } catch (retryError) {
-          if (!isThreadOwnedByAnotherWriter(retryError)) throw retryError
-          payload = await callRpc<ThreadReadResponse>('thread/read', { threadId, includeTurns: true })
-        }
+      assertCurrentThreadAcquisition(revision)
+      if (isThreadOwnedByAnotherWriter(error)) return getReadOnlyThreadDetailV2(threadId)
+      if (options.modelProvider || !isMissingLegacyCustomEndpointProvider(error)) throw error
+      try {
+        payload = await callRpc<ThreadResumeResponse>('thread/resume', {
+          ...params,
+          // Legacy callers without an explicit routing policy retain their compatibility retry.
+          // Explicit global provider requests must never silently switch to OpenAI.
+          modelProvider: 'openai',
+        })
+      } catch (retryError) {
+        assertCurrentThreadAcquisition(revision)
+        if (!isThreadOwnedByAnotherWriter(retryError)) throw retryError
+        return getReadOnlyThreadDetailV2(threadId)
       }
     }
-    const startTurnIndex = readThreadTurnStartIndex(payload)
-    const messages = normalizeThreadMessagesV2(payload, startTurnIndex)
-    return {
-      model: normalizeThreadModelFromPayload(payload),
-      modelProvider: normalizeThreadModelProviderFromPayload(payload),
-      messages,
-      inProgress: readThreadInProgressFromResponse(payload),
-      activeTurnId: readActiveTurnIdFromResponse(payload),
-      hasMoreOlder: startTurnIndex > 0,
-      turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
-    }
-  })()
+    assertCurrentThreadAcquisition(revision)
+    return buildRecentThreadDetail(threadId, payload)
+  })().then(result => {
+    assertCurrentThreadAcquisition(revision)
+    if (result.readOnly === true) readOnlyThreadIds.add(threadId)
+    else readOnlyThreadIds.delete(threadId)
+    return result
+  })
 
-  recentResumeThreadById.set(threadId, promise)
+  recentResumeThreadById.set(resumeKey, promise)
   const hardEvictionTimer = globalThis.setTimeout(() => {
-    if (recentResumeThreadById.get(threadId) === promise) {
-      recentResumeThreadById.delete(threadId)
+    if (recentResumeThreadById.get(resumeKey) === promise) {
+      recentResumeThreadById.delete(resumeKey)
     }
   }, RESUME_THREAD_COALESCE_TTL_MS)
   void promise.finally(() => {
     globalThis.clearTimeout(hardEvictionTimer)
     globalThis.setTimeout(() => {
-      if (recentResumeThreadById.get(threadId) === promise) {
-        recentResumeThreadById.delete(threadId)
+      if (recentResumeThreadById.get(resumeKey) === promise) {
+        recentResumeThreadById.delete(resumeKey)
       }
     }, 2000)
   }).catch(() => undefined)
-  return promise
+  const result = await promise
+  assertCurrentThreadAcquisition(revision)
+  return result
 }
 
 export async function archiveThread(threadId: string): Promise<void> {
@@ -1587,6 +1771,7 @@ export async function updateThreadFileChanges(
   scope?: 'single_turn' | 'turn_and_later',
 ): Promise<{ changed: number; errors: string[]; message?: string; revertedPatchIds?: string[]; appliedPatchIds?: string[] }> {
   try {
+    assertThreadMutationAllowed(threadId)
     const response = await fetch('/codex-api/thread/rollback-files', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1687,9 +1872,10 @@ export type ForkedThread = {
   messages: UiMessage[]
 }
 
-export async function startThread(cwd?: string, model?: string): Promise<StartedThread> {
+export async function startThread(cwd?: string, model?: string, speedMode: SpeedMode = 'standard'): Promise<StartedThread> {
+  const revision = threadAcquisitionRevision
   try {
-    const params: Record<string, unknown> = {}
+    const params: Record<string, unknown> = { serviceTier: getSpeedModeServiceTier(speedMode) }
     if (typeof cwd === 'string' && cwd.trim().length > 0) {
       params.cwd = cwd.trim()
     }
@@ -1697,6 +1883,7 @@ export async function startThread(cwd?: string, model?: string): Promise<Started
       params.model = model.trim()
     }
     const payload = await callRpc<ThreadStartResponse>('thread/start', params)
+    assertCurrentThreadAcquisition(revision)
     const threadId = normalizeThreadIdFromPayload(payload)
     if (!threadId) {
       throw new Error('thread/start did not return a thread id')
@@ -1718,12 +1905,14 @@ export async function forkThread(
   cwd?: string,
   model?: string,
 ): Promise<StartedThread | ForkedThread> {
+  const revision = threadAcquisitionRevision
   if (arguments.length <= 1) {
     try {
       const payload = await callRpc<ThreadForkResponse & ThreadReadResponse & { thread?: { id?: string; cwd?: string } }>('thread/fork', {
         threadId,
         persistExtendedHistory: true,
       })
+      assertCurrentThreadAcquisition(revision)
       const forkedThreadId = normalizeThreadIdFromPayload(payload)
       if (!forkedThreadId) {
         throw new Error('thread/fork did not return a thread id')
@@ -1754,6 +1943,7 @@ export async function forkThread(
       params.model = model.trim()
     }
     const payload = await callRpc<ThreadForkResponse>('thread/fork', params)
+    assertCurrentThreadAcquisition(revision)
     const nextThreadId = normalizeThreadIdFromPayload(payload)
     if (!nextThreadId) {
       throw new Error('thread/fork did not return a thread id')
@@ -1861,7 +2051,9 @@ export async function startThreadTurn(
   skills?: Array<{ name: string; path: string }>,
   fileAttachments: FileAttachmentParam[] = [],
   collaborationMode?: CollaborationModeKind,
+  speedMode: SpeedMode = 'standard',
 ): Promise<string> {
+  const revision = threadAcquisitionRevision
   try {
     const normalizedModel = model?.trim() ?? ''
     const localImageAttachments: FileAttachmentParam[] = []
@@ -1905,6 +2097,7 @@ export async function startThreadTurn(
     const params: Record<string, unknown> = {
       threadId,
       input,
+      serviceTier: getSpeedModeServiceTier(speedMode),
     }
     if (attachments.length > 0) params.attachments = attachments
     if (normalizedModel) {
@@ -1924,6 +2117,7 @@ export async function startThreadTurn(
         },
       }
     }
+    assertCurrentThreadAcquisition(revision)
     const payload = await callRpc<{ turn?: Turn }>('turn/start', params)
     return typeof payload?.turn?.id === 'string' ? payload.turn.id.trim() : ''
   } catch (error) {
@@ -1950,24 +2144,15 @@ export async function setDefaultModel(model: string): Promise<void> {
   await callRpc('setDefaultModel', { model })
 }
 
-export async function setCodexSpeedMode(mode: SpeedMode): Promise<void> {
-  const normalizedMode: SpeedMode = mode === 'fast' ? 'fast' : 'standard'
-  await callRpc('config/batchWrite', {
-    edits: [
-      {
-        keyPath: 'features.fast_mode',
-        value: true,
-        mergeStrategy: 'upsert',
-      },
-      {
-        keyPath: 'service_tier',
-        value: normalizedMode === 'fast' ? 'fast' : null,
-        mergeStrategy: normalizedMode === 'fast' ? 'upsert' : 'replace',
-      },
-    ],
-    filePath: null,
-    expectedVersion: null,
+export async function setThreadSpeedMode(threadId: string, mode: SpeedMode): Promise<void> {
+  if (!threadId.trim()) throw new Error('A thread is required to save its speed setting')
+  await callRpc('thread/settings/update', {
+    threadId: threadId.trim(),
+    serviceTier: getSpeedModeServiceTier(mode),
   })
+  for (const cacheKey of recentResumeThreadById.keys()) {
+    if ((JSON.parse(cacheKey) as unknown[])[0] === threadId.trim()) recentResumeThreadById.delete(cacheKey)
+  }
 }
 
 export interface FreeModeStatus {
@@ -1978,7 +2163,7 @@ export interface FreeModeStatus {
   currentModel: string | null
   customKey: boolean
   maskedKey: string | null
-  provider?: 'openrouter' | 'custom' | 'opencode-zen'
+  provider?: 'codex' | 'openrouter' | 'custom' | 'opencode-zen' | 'ninerouter'
   customBaseUrl?: string
   wireApi?: 'responses' | 'chat' | null
 }
@@ -2009,7 +2194,7 @@ export async function setFreeModeCustomKey(key: string): Promise<{ ok: boolean; 
 export async function setCustomProvider(
   baseUrl: string,
   apiKey: string,
-  options?: { wireApi?: 'responses' | 'chat'; provider?: 'custom' | 'opencode-zen' | 'openrouter' },
+  options?: { wireApi?: 'responses' | 'chat'; provider?: 'custom' | 'opencode-zen' | 'openrouter' | 'ninerouter' },
 ): Promise<{ ok: boolean }> {
   const response = await fetch('/codex-api/free-mode/custom-provider', {
     method: 'POST',
@@ -2024,9 +2209,24 @@ export async function setCustomProvider(
   return await response.json() as { ok: boolean }
 }
 
+function normalizeRuntimeProviderId(providerId: string): string {
+  const exact = providerId.trim()
+  switch (exact.toLowerCase()) {
+    case 'custom': case 'custom-endpoint': case 'custom_endpoint': return 'custom_endpoint'
+    case 'codex': case 'openai': return 'openai'
+    case 'opencode-zen': case 'opencode_zen': return 'opencode_zen'
+    case 'openrouter': case 'openrouter-free': case 'openrouter_free': return 'openrouter_free'
+    case 'ninerouter': return 'ninerouter'
+    default: return exact
+  }
+}
+
 async function fetchProviderModelIds(providerId?: string): Promise<{ ids: string[], exclusive: boolean; models?: ZenModelMetadata[] } | null> {
   try {
-    const normalizedProviderId = providerId?.trim() ?? ''
+    const providerAlias = providerId?.trim().toLowerCase() ?? ''
+    const normalizedProviderId = ['custom', 'custom-endpoint', 'custom_endpoint'].includes(providerAlias)
+      ? 'custom_endpoint'
+      : providerId?.trim() ?? ''
     const url = normalizedProviderId
       ? `/codex-api/provider-models?provider=${encodeURIComponent(normalizedProviderId)}`
       : '/codex-api/provider-models'
@@ -2047,7 +2247,10 @@ async function fetchProviderModelIds(providerId?: string): Promise<{ ids: string
           .filter((candidate, index, candidates): candidate is string =>
             candidate.length > 0 && candidates.indexOf(candidate) === index),
         exclusive: providerPayload.exclusive === true,
-        models: providerPayload.models,
+        // Executor provenance is minted only from native model/list below.
+        // Provider catalogs retain their wire route/restrictions, not that tag.
+        models: providerPayload.models?.map(model => model.routingSource === 'codex-runtime-catalog'
+          ? { ...model, routingSource: 'provider-catalog' as const } : model),
       }
     }
   } catch {
@@ -2060,24 +2263,103 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
   const shouldIncludeProviderModels = options.includeProviderModels !== false
   const providerModels = shouldIncludeProviderModels ? await fetchProviderModelIds(options.providerId) : null
 
-  options.onMetadata?.(providerModels?.models ?? [])
-
+  if (options.requireProviderModels && !providerModels) {
+    throw new Error(`Failed to refresh model catalog for ${options.providerId || 'active provider'}`)
+  }
+  if (options.requireProviderModels && providerModels?.ids.length === 0) {
+    throw new Error(`Model catalog for ${options.providerId || 'active provider'} is empty or unavailable`)
+  }
   if (providerModels?.exclusive || options.requireProviderModels) {
+    options.onMetadata?.(providerModels?.models ?? [])
     return providerModels?.ids ?? []
   }
 
   const payload = await callRpc<ModelListResponse>('model/list', {})
   const ids: string[] = []
+  const metadata = [...(providerModels?.models ?? [])]
+  const metadataIndexById = new Map<string, number>()
+  metadata.forEach((model, index) => {
+    if (!metadataIndexById.has(model.id)) metadataIndexById.set(model.id, index)
+  })
+  const nativeIdCounts = new Map<string, number>()
+  const nativeToolRestrictions = new Set<string>()
+  const nativeReasoningDeclarations = new Set<string>()
+  const nativeNonreasoningRestrictions = new Set<string>()
+  // Restrictive evidence must survive ID deduplication, regardless of row order.
   for (const row of payload.data) {
     const candidate = row.id || row.model
-    if (!candidate || ids.includes(candidate)) continue
-    ids.push(candidate)
+    if (!candidate) continue
+    nativeIdCounts.set(candidate, (nativeIdCounts.get(candidate) ?? 0) + 1)
+    if (asRecord(row)?.supportsTools === false || asRecord(asRecord(row)?.capabilities)?.tools === false) {
+      nativeToolRestrictions.add(candidate)
+    }
+    if (Object.prototype.hasOwnProperty.call(row, 'supportedReasoningEfforts')) {
+      // Presence is restrictive even when empty/malformed; duplicates still
+      // cannot affirm native efforts because the unique-count guard remains.
+      nativeReasoningDeclarations.add(candidate)
+    }
+    if (asRecord(row)?.reasoning === false || asRecord(asRecord(row)?.capabilities)?.reasoning === false) {
+      nativeNonreasoningRestrictions.add(candidate)
+    }
   }
+  const seenIds = new Set<string>()
+  for (const row of payload.data) {
+    const candidate = row.id || row.model
+    if (!candidate || seenIds.has(candidate)) continue
+    seenIds.add(candidate)
+    ids.push(candidate)
+    // Exact native declarations and provider restrictions constrain each other.
+    // cx/ local Ultra still requires the bridge's gated runtime evidence.
+    const metadataIndex = metadataIndexById.get(candidate) ?? -1
+    const existing = metadata[metadataIndex]
+    const nonreasoning = nativeNonreasoningRestrictions.has(candidate)
+    const noTools = nativeToolRestrictions.has(candidate)
+    const hasNativeReasoning = nativeReasoningDeclarations.has(candidate) || nonreasoning
+    if (!hasNativeReasoning && !noTools) continue
+    const raw = row.supportedReasoningEfforts
+    const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+    const efforts = Array.isArray(raw) ? raw.map(option => asRecord(option)?.reasoningEffort) : []
+    const valid = Array.isArray(raw) && efforts.every(effort => typeof effort === 'string' && allowed.includes(effort))
+      && (row.model === undefined || row.model === candidate)
+      && nativeIdCounts.get(candidate) === 1
+    const nativeOptions = valid && !nonreasoning
+      ? efforts.filter(effort => effort !== 'ultra' || !candidate.startsWith('cx/') || existing?.reasoningSource === 'codex-runtime-catalog') : []
+    if (existing) {
+      const authoritative = existing.reasoningSource === 'provider-catalog' || existing.reasoningSource === 'codex-runtime-catalog'
+      metadata[metadataIndex] = {
+        ...existing,
+        ...(nonreasoning ? { supportsReasoning: false } : {}),
+        ...(noTools ? { supportsTools: false } : {}),
+        ...(hasNativeReasoning ? {
+          reasoningSource: authoritative ? existing.reasoningSource : 'codex-runtime-catalog',
+          reasoningOptions: authoritative || existing.supportsReasoning === false
+            ? getModelReasoningEfforts(candidate, existing).filter(effort => nativeOptions.includes(effort)) : nativeOptions,
+        } : {}),
+      }
+      continue
+    }
+    metadataIndexById.set(candidate, metadata.length)
+    metadata.push({
+      id: candidate, name: row.displayName || candidate,
+      // model/list proves an executor route, not a custom provider wire API.
+      // Malformed/mismatched descriptors cannot affirm a selectable route.
+      upstreamApi: 'unknown', routingSource: valid ? 'codex-runtime-catalog' : 'unknown',
+      ...(hasNativeReasoning ? { reasoningSource: 'codex-runtime-catalog' as const } : {}),
+      supportsReasoning: nonreasoning ? false : null,
+      reasoningOptions: nativeOptions,
+      supportsTools: noTools ? false : null, inputModalities: row.inputModalities ?? null,
+      free: false, discoveredAt: new Date().toISOString(),
+    })
+  }
+  options.onMetadata?.(metadata)
 
   if (!shouldIncludeProviderModels || !providerModels) return ids
 
   for (const candidate of providerModels.ids) {
-    if (!ids.includes(candidate)) ids.push(candidate)
+    if (!seenIds.has(candidate)) {
+      seenIds.add(candidate)
+      ids.push(candidate)
+    }
   }
   return ids
 }
@@ -2588,6 +2870,9 @@ export async function getThreadQueueState(): Promise<ThreadQueueState> {
 }
 
 export async function setThreadQueueState(nextState: ThreadQueueState): Promise<void> {
+  // Whole-state replacement can delete an omitted read-only queue too.
+  if (readOnlyThreadIds.size) throw new Error('Queue state contains a read-only thread; no replacement was sent.')
+  for (const threadId of Object.keys(nextState)) assertThreadMutationAllowed(threadId)
   const response = await fetch('/codex-api/thread-queue-state', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -3279,6 +3564,7 @@ export async function searchThreads(
 export async function configureTelegramBot(
   botToken: string,
   allowedUserIds: Array<number | '*'>,
+  notificationChatIds: number[] = [],
 ): Promise<void> {
   const response = await fetch('/codex-api/telegram/configure-bot', {
     method: 'POST',
@@ -3286,6 +3572,7 @@ export async function configureTelegramBot(
     body: JSON.stringify({
       botToken,
       allowedUserIds,
+      notificationChatIds,
     }),
   })
   const payload = await response.json()
@@ -3321,9 +3608,18 @@ export async function getTelegramConfig(): Promise<TelegramConfig> {
       allowedUserIds.push(Math.trunc(value))
     }
   }
+  const rawNotificationChatIds = Array.isArray(data.notificationChatIds) ? data.notificationChatIds : []
+  const notificationChatIds = Array.from(new Set(rawNotificationChatIds
+    .map((value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value)
+      if (typeof value === 'string' && /^-?\d+$/.test(value.trim())) return Number.parseInt(value.trim(), 10)
+      return Number.NaN
+    })
+    .filter((value) => Number.isFinite(value)))).slice(0, 50)
   return {
     botToken: typeof data.botToken === 'string' ? data.botToken : '',
     allowedUserIds,
+    notificationChatIds,
   }
 }
 
@@ -3347,6 +3643,7 @@ export async function getTelegramStatus(): Promise<TelegramStatus> {
     active: data.active === true,
     mappedChats: typeof data.mappedChats === 'number' ? data.mappedChats : 0,
     mappedThreads: typeof data.mappedThreads === 'number' ? data.mappedThreads : 0,
+    notificationChats: typeof data.notificationChats === 'number' ? data.notificationChats : 0,
     allowedUsers: typeof data.allowedUsers === 'number' ? data.allowedUsers : 0,
     allowAllUsers: data.allowAllUsers === true,
     lastError: typeof data.lastError === 'string' ? data.lastError : '',

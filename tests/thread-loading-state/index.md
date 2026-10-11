@@ -15,6 +15,7 @@ Return to the [manual test index](../../tests.md).
 | [Feature: No automatic restore of last active thread on startup](no-automatic-restore-of-last-active-thread-on-startup.md) |
 | [Feature: Disable auto-restore to last thread when opening home URL](disable-auto-restore-to-last-thread-when-opening-home-url.md) |
 | [Feature: Thread load capped to latest 10 turns](thread-load-capped-to-latest-10-turns.md) |
+| [Feature: Lazy item-level thread history](lazy-item-history-paging.md) |
 | [Feature: Pinned threads persist across reload and prune removed threads](pinned-threads-persist-across-reload-and-prune-removed-threads.md) |
 | [Feature: Keep manual chat scroll position during streaming](keep-manual-chat-scroll-position-during-streaming.md) |
 | [Feature: Rapid thread switching during active load](rapid-thread-switching-during-active-load.md) |
@@ -26,6 +27,7 @@ Return to the [manual test index](../../tests.md).
 | [Thread list startup pagination and direct older-thread links](thread-list-startup-pagination-and-direct-older-thread-links.md) |
 | [Thread detail load avoids duplicate live-state history fetch](thread-detail-load-avoids-duplicate-live-state-history-fetch.md) |
 | [Thread message cache skips unchanged refetches](thread-message-cache-skips-unchanged-refetches.md) |
+| [Context-window compaction recovery](context-window-compaction-recovery.md) |
 | [Thread selection keeps sidebar list stable during refresh](thread-selection-keeps-sidebar-list-stable-during-refresh.md) |
 | [Sidebar thread row edge click selects thread](sidebar-thread-row-edge-click-selects-thread.md) |
 | [Sidebar thread inline delete confirmation and menu pin action](sidebar-thread-inline-delete-confirmation-and-menu-pin-action.md) |

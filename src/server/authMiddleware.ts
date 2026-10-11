@@ -147,6 +147,14 @@ function buildSessionCookie(token: string, expiresAt: number): string {
   ].join('; ')
 }
 
+function isAuthorizedByCookie(cookieHeader: string | undefined, validTokens: Map<string, number>): boolean {
+  const cookies = parseCookies(cookieHeader)
+  const token = cookies[TOKEN_COOKIE]
+  if (!token) return false
+  const expiresAt = validTokens.get(token)
+  return typeof expiresAt === 'number' && expiresAt > Date.now()
+}
+
 function isAuthorizedByRequestLike(
   remoteAddress: string | undefined,
   hostHeader: string | undefined,
@@ -154,20 +162,18 @@ function isAuthorizedByRequestLike(
   validTokens: Map<string, number>,
 ): boolean {
   const remote = remoteAddress ?? ''
-  // SSH reverse tunnels terminate on loopback, so remoteAddress alone is not enough
-  // to prove this is a direct local browser request.
+  // The app-server runs locally and calls internal provider proxy routes over loopback.
+  // Public requests through nginx carry the public Host header and do not match this bypass.
   if (isLocalhostRemote(remote) && isLocalhostHost(hostHeader ?? '')) {
     return true
   }
+  // SSH reverse tunnels terminate on loopback, so remoteAddress alone is not enough
+  // to prove this is a direct local browser request.
   if (isTrustedTailscaleRemote(remote)) {
     return true
   }
 
-  const cookies = parseCookies(cookieHeader)
-  const token = cookies[TOKEN_COOKIE]
-  if (!token) return false
-  const expiresAt = validTokens.get(token)
-  return typeof expiresAt === 'number' && expiresAt > Date.now()
+  return isAuthorizedByCookie(cookieHeader, validTokens)
 }
 
 const LOGIN_PAGE_HTML = `<!DOCTYPE html>
@@ -219,6 +225,7 @@ export function createAuthMiddleware(password: string): RequestHandler {
 export type AuthSession = {
   middleware: RequestHandler
   isRequestAuthorized: (req: IncomingMessage) => boolean
+  isOwnerAuthorized: (req: IncomingMessage) => boolean
 }
 
 export function createAuthSession(password: string): AuthSession {
@@ -232,12 +239,7 @@ export function createAuthSession(password: string): AuthSession {
       tryPersistSessions(validTokens)
     }
 
-    if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)) {
-      next()
-      return
-    }
-
-    // Handle login POST
+    // Explicit password login must issue its cookie even for trusted local clients.
     if (req.method === 'POST' && req.path === '/auth/login') {
       let body = ''
       req.setEncoding('utf8')
@@ -271,6 +273,11 @@ export function createAuthSession(password: string): AuthSession {
       return
     }
 
+    if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)) {
+      next()
+      return
+    }
+
     // Handle one-click auth links like /password=<value>
     if (req.method === 'GET' && req.path.startsWith('/password=')) {
       const provided = req.path.slice('/password='.length)
@@ -295,5 +302,6 @@ export function createAuthSession(password: string): AuthSession {
     isRequestAuthorized: (req: IncomingMessage) => (
       isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)
     ),
+    isOwnerAuthorized: (req: IncomingMessage) => isAuthorizedByCookie(req.headers.cookie, validTokens),
   }
 }

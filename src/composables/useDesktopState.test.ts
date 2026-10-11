@@ -18,11 +18,16 @@ const gatewayMocks = vi.hoisted(() => ({
   getAvailableCollaborationModes: vi.fn(),
   getAvailableModelIds: vi.fn(),
   getCurrentModelConfig: vi.fn(),
+  getThreadGoal: vi.fn(),
+  setThreadGoal: vi.fn(),
+  clearThreadGoal: vi.fn(),
   getPendingServerRequests: vi.fn(),
   getSkillsList: vi.fn(),
   getThreadDetail: vi.fn(),
+  getOlderThreadMessages: vi.fn(),
   getThreadGroupsPage: vi.fn(),
   getThreadQueueState: vi.fn(),
+  getThreadSummary: vi.fn(),
   getThreadTitleCache: vi.fn(),
   getWorkspaceRootsState: vi.fn(),
   generateThreadTitle: vi.fn(),
@@ -31,9 +36,10 @@ const gatewayMocks = vi.hoisted(() => ({
   renameThread: vi.fn(),
   replyToServerRequest: vi.fn(),
   resumeThread: vi.fn(),
+  invalidateThreadResumeCache: vi.fn(),
   revertThreadFileChanges: vi.fn(),
   rollbackThread: vi.fn(),
-  setCodexSpeedMode: vi.fn(),
+  setThreadSpeedMode: vi.fn(),
   setThreadQueueState: vi.fn(),
   setWorkspaceRootsState: vi.fn(),
   startThread: vi.fn(),
@@ -163,6 +169,61 @@ describe('filterGroupsByWorkspaceRoots', () => {
     expect(filterGroupsByWorkspaceRoots(groups, rootsState).map((group) => group.projectName)).toEqual([
       'beta',
       'alpha',
+    ])
+  })
+
+  it('keeps projects listed in project-order when saved roots are stale', () => {
+    const groups: UiProjectGroup[] = [
+      {
+        projectName: 'current-project',
+        threads: [thread('current-chat', '/tmp/current-project')],
+      },
+      {
+        projectName: 'older-project',
+        threads: [thread('older-chat', '/tmp/older-project')],
+      },
+    ]
+    const rootsState: WorkspaceRootsState = {
+      order: ['/tmp/current-project'],
+      labels: {},
+      active: ['/tmp/current-project'],
+      projectOrder: ['/tmp/current-project', '/tmp/older-project'],
+    }
+
+    expect(filterGroupsByWorkspaceRoots(groups, rootsState).map((group) => group.projectName)).toEqual([
+      'current-project',
+      'older-project',
+    ])
+  })
+
+  it('keeps stale-order projects visible in the loaded sidebar state', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [
+        {
+          projectName: 'current-project',
+          threads: [thread('current-chat', '/tmp/current-project')],
+        },
+        {
+          projectName: 'older-project',
+          threads: [thread('older-chat', '/tmp/older-project')],
+        },
+      ],
+      nextCursor: null,
+    })
+    gatewayMocks.getWorkspaceRootsState.mockResolvedValue({
+      order: ['/tmp/current-project'],
+      labels: {},
+      active: ['/tmp/current-project'],
+      projectOrder: ['/tmp/current-project', '/tmp/older-project'],
+    })
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+
+    expect(state.projectGroups.value.map((group) => group.projectName)).toEqual([
+      'current-project',
+      'older-project',
     ])
   })
 
@@ -618,6 +679,359 @@ describe('startup request deduplication', () => {
   })
 })
 
+describe('thread-scoped speed mode', () => {
+  function installSpeedThreads() {
+    installTestWindow()
+    const nativeModes = new Map<string, 'standard' | 'fast'>([['speed-a', 'standard'], ['speed-b', 'standard']])
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [{ projectName: 'speed', threads: [thread('speed-a', '/tmp/speed'), thread('speed-b', '/tmp/speed')] }], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/gpt-6.1-sol', providerId: 'ninerouter', reasoningEffort: 'high', speedMode: 'fast' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['cx/gpt-6.1-sol'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.startThreadTurn.mockResolvedValue('speed-turn')
+    const detail = (id: string) => ({ model: 'cx/gpt-6.1-sol', modelProvider: 'ninerouter', speedMode: nativeModes.get(id) ?? 'standard', messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, olderCursor: null, turnIndexByTurnId: {} })
+    gatewayMocks.resumeThread.mockImplementation(async id => detail(id))
+    gatewayMocks.getThreadDetail.mockImplementation(async id => detail(id))
+    gatewayMocks.setThreadSpeedMode.mockImplementation(async (id, mode) => { nativeModes.set(id, mode) })
+    return { state: useDesktopState(), nativeModes, detail }
+  }
+
+  it('keeps Fast isolated by thread and ignores the global Fast default on switches', async () => {
+    const { state } = installSpeedThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('speed-a')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+    await state.updateSelectedSpeedMode('fast')
+    expect(gatewayMocks.setThreadSpeedMode).toHaveBeenCalledWith('speed-a', 'fast')
+    await state.selectThread('speed-b')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+    await state.selectThread('speed-a')
+    expect(state.selectedSpeedMode.value).toBe('fast')
+    const reloaded = useDesktopState()
+    reloaded.primeSelectedThread('speed-a')
+    expect(reloaded.selectedSpeedMode.value).toBe('fast')
+    reloaded.primeSelectedThread('speed-b')
+    expect(reloaded.selectedSpeedMode.value).toBe('standard')
+  })
+
+  it('does not roll back another thread when a late save fails', async () => {
+    const { state } = installSpeedThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('speed-a')
+    let rejectSave!: (error: Error) => void
+    gatewayMocks.setThreadSpeedMode.mockImplementation(id => id === 'speed-a' ? new Promise((_resolve, reject) => { rejectSave = reject }) : Promise.resolve())
+    const saving = state.updateSelectedSpeedMode('fast')
+    expect(state.isUpdatingSpeedMode.value).toBe(true)
+    await state.selectThread('speed-b')
+    expect(state.isUpdatingSpeedMode.value).toBe(false)
+    await state.updateSelectedSpeedMode('fast')
+    rejectSave(new Error('failed A save'))
+    await saving
+    expect(state.selectedSpeedMode.value).toBe('fast')
+    expect(state.error.value).toBe('')
+    await state.selectThread('speed-a')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+  })
+
+  it('ignores a stale history response after a local Fast toggle', async () => {
+    const { state, detail } = installSpeedThreads()
+    state.primeSelectedThread('speed-a')
+    let finishLoad!: (value: unknown) => void
+    const stale = detail('speed-a')
+    gatewayMocks.resumeThread.mockImplementation(() => new Promise(resolve => { finishLoad = resolve }))
+    const loading = state.loadMessages('speed-a')
+    await vi.waitFor(() => expect(finishLoad).toBeTypeOf('function'))
+    await state.updateSelectedSpeedMode('fast')
+    finishLoad(stale)
+    await loading
+    expect(state.selectedSpeedMode.value).toBe('fast')
+  })
+
+  it('keeps the new-chat choice local and applies it only to the created thread', async () => {
+    const { state, nativeModes } = installSpeedThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    state.primeSelectedThread('')
+    await state.updateSelectedSpeedMode('fast')
+    expect(gatewayMocks.setThreadSpeedMode).not.toHaveBeenCalled()
+    gatewayMocks.startThread.mockImplementation(async (_cwd, _model, mode) => {
+      nativeModes.set('new-speed-thread', mode)
+      return { threadId: 'new-speed-thread', model: 'cx/gpt-6.1-sol', modelProvider: 'ninerouter' }
+    })
+    await state.sendMessageToNewThread('synthetic draft', '/tmp/speed')
+    await Promise.resolve()
+    expect(gatewayMocks.startThread).toHaveBeenCalledWith('/tmp/speed', 'cx/gpt-6.1-sol', 'fast')
+    expect(state.selectedSpeedMode.value).toBe('fast')
+    state.primeSelectedThread('')
+    expect(state.selectedSpeedMode.value).toBe('standard')
+  })
+
+  it('sends the selected thread mode explicitly on its next turn', async () => {
+    const { state } = installSpeedThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('speed-a')
+    await state.updateSelectedSpeedMode('fast')
+    await state.sendMessageToSelectedThread('synthetic fast request')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.at(-1)).toBe('fast')
+    await state.selectThread('speed-b')
+    await state.sendMessageToSelectedThread('synthetic standard request')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.at(-1)).toBe('standard')
+  })
+
+  it('syncs native settings notifications only to their own thread', async () => {
+    const { state } = installSpeedThreads()
+    gatewayMocks.setThreadQueueState.mockResolvedValue(undefined)
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('speed-a')
+    let notificationHandler: (notification: { method: string; params?: unknown }) => void = () => {}
+    gatewayMocks.subscribeCodexNotifications.mockImplementation(handler => {
+      notificationHandler = handler
+      return vi.fn()
+    })
+    state.startPolling()
+    try {
+      notificationHandler({ method: 'thread/settings/updated', params: { threadId: 'speed-b', threadSettings: { serviceTier: 'priority' } } })
+      expect(state.selectedSpeedMode.value).toBe('standard')
+      state.primeSelectedThread('speed-b')
+      expect(state.selectedSpeedMode.value).toBe('fast')
+      notificationHandler({ method: 'thread/settings/updated', params: { threadId: 'speed-b', threadSettings: { serviceTier: 'default' } } })
+      expect(state.selectedSpeedMode.value).toBe('standard')
+    } finally {
+      state.stopPolling()
+    }
+  })
+})
+
+describe('literal Goal message routing (accepted composer contract)', () => {
+  function installLiteralRoute() {
+    installTestWindow()
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'fixture-model', providerId: 'custom_endpoint', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['fixture-model'])
+    gatewayMocks.resumeThread.mockResolvedValue({ model: 'fixture-model', modelProvider: 'custom_endpoint', messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, olderCursor: null, turnIndexByTurnId: {} })
+    gatewayMocks.startThreadTurn.mockResolvedValue('fixture-turn')
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    return useDesktopState()
+  }
+
+  it('sends literal Goal controls through normal turns without Goal RPCs or local queue interception', async () => {
+    const state = installLiteralRoute()
+    state.primeSelectedThread('goal-route')
+    for (const text of ['/goal Synthetic goal', '/goal pause', '/goal resume', '/goal', '/goal clear']) {
+      await state.sendMessageToSelectedThread(text)
+    }
+    expect(gatewayMocks.startThreadTurn.mock.calls.map(call => call[1])).toEqual([
+      '/goal Synthetic goal', '/goal pause', '/goal resume', '/goal', '/goal clear',
+    ])
+    expect(gatewayMocks.getThreadGoal).not.toHaveBeenCalled()
+    expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
+    expect(gatewayMocks.clearThreadGoal).not.toHaveBeenCalled()
+    expect(gatewayMocks.setThreadQueueState).not.toHaveBeenCalled()
+  })
+
+  it('creates a normal first literal Goal turn with user text and the normal interrupt-persistence gate', async () => {
+    const state = installLiteralRoute()
+    state.primeSelectedThread('')
+    gatewayMocks.startThread.mockResolvedValue({ threadId: 'new-goal', model: 'fixture-model', modelProvider: 'custom_endpoint' })
+    let finishTurn!: (turnId: string) => void
+    gatewayMocks.startThreadTurn.mockImplementationOnce(() => new Promise<string>(resolve => { finishTurn = resolve }))
+    await expect(state.sendMessageToNewThread('/goal Synthetic objective', '/tmp/fixture')).resolves.toBe('new-goal')
+    await vi.waitFor(() => expect(finishTurn).toBeTypeOf('function'))
+    expect(state.selectedThreadId.value).toBe('new-goal')
+    expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
+    expect(state.isSelectedThreadInterruptPending.value).toBe(true)
+    expect(state.messages.value.some(message => message.role === 'user' && message.text === '/goal Synthetic objective')).toBe(true)
+    finishTurn('fixture-turn')
+    await vi.waitFor(() => expect(state.isSelectedThreadInterruptPending.value).toBe(false))
+  })
+
+  it('preserves file and skill parameters with the literal Goal normal turn', async () => {
+    const state = installLiteralRoute()
+    state.primeSelectedThread('goal-files')
+    const skills = [{ name: 'fixture-skill', path: '/tmp/SKILL.md' }]
+    const files = [{ label: 'handoff', path: '/tmp/HANDOFF.md', fsPath: '/tmp/HANDOFF.md' }]
+    await state.sendMessageToSelectedThread('/goal Inspect the fixture', [], skills, 'queue', files)
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith('goal-files', '/goal Inspect the fixture', [], 'fixture-model', 'medium', skills, files, 'default', 'standard')
+    expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadGoal).not.toHaveBeenCalled()
+  })
+})
+
+describe('thread-scoped reasoning effort', () => {
+  function installReasoningThreads() {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'reasoning', threads: [thread('effort-a', '/tmp/reasoning'), thread('effort-b', '/tmp/reasoning')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({
+      model: 'cx/gpt-6.1-sol',
+      providerId: 'ninerouter',
+      reasoningEffort: 'high',
+      speedMode: 'standard',
+    })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['cx/gpt-6.1-sol'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'cx/gpt-6.1-sol',
+      modelProvider: 'ninerouter',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      olderCursor: null,
+      turnIndexByTurnId: {},
+    })
+    gatewayMocks.startThreadTurn.mockResolvedValue('effort-turn')
+    return useDesktopState()
+  }
+
+  it('keeps the last reasoning effort isolated and persistent per thread', async () => {
+    const state = installReasoningThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    await state.selectThread('effort-a')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    state.setSelectedReasoningEffort('max')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+
+    await state.selectThread('effort-b')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    state.setSelectedReasoningEffort('low')
+    await state.selectThread('effort-a')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    await state.sendMessageToSelectedThread('synthetic max request')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[4]).toBe('max')
+    await state.selectThread('effort-b')
+    await state.sendMessageToSelectedThread('synthetic low request')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[4]).toBe('low')
+    await state.selectThread('effort-a')
+
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    const reloaded = useDesktopState()
+    reloaded.primeSelectedThread('effort-a')
+    expect(reloaded.selectedReasoningEffort.value).toBe('max')
+    reloaded.primeSelectedThread('effort-b')
+    expect(reloaded.selectedReasoningEffort.value).toBe('low')
+    expect(JSON.parse(window.localStorage.getItem('codex-web-local.reasoning-effort-by-context.v1') ?? '{}')).toMatchObject({
+      'effort-a': 'max',
+      'effort-b': 'low',
+    })
+  })
+
+  it('transfers a new-chat effort to the created thread and resets the draft context', async () => {
+    const state = installReasoningThreads()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    state.primeSelectedThread('')
+    state.setSelectedReasoningEffort('max')
+    gatewayMocks.startThread.mockResolvedValue({
+      threadId: 'new-effort-thread',
+      model: 'cx/gpt-6.1-sol',
+      modelProvider: 'ninerouter',
+    })
+
+    await state.sendMessageToNewThread('synthetic effort request', '/tmp/reasoning')
+    await Promise.resolve()
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[4]).toBe('max')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    state.primeSelectedThread('')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+  })
+})
+
+describe('older item-page merging', () => {
+  async function installPagedThread() {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [{ projectName: 'project', threads: [thread('paged-thread', '/tmp/project')] }], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'model-x', providerId: 'codex', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['model-x'])
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'model-x', modelProvider: 'openai', inProgress: false, activeTurnId: '',
+      messages: [{ id: 'latest', role: 'assistant', text: 'latest item', turnId: 'current', turnIndex: 0 }],
+      hasMoreOlder: true, olderCursor: 'item-history:{"items":"older","turns":null}', turnIndexByTurnId: { current: 0 },
+    })
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+    await state.selectThread('paged-thread')
+    return state
+  }
+
+  it('keeps earlier items from an already known turn and deduplicates overlapping items', async () => {
+    const state = await installPagedThread()
+    gatewayMocks.getOlderThreadMessages.mockResolvedValue({
+      messages: [
+        { id: 'earlier', role: 'user', text: 'earlier item', turnId: 'current', turnIndex: 0 },
+        { id: 'latest', role: 'assistant', text: 'stale duplicate', turnId: 'current', turnIndex: 0 },
+      ],
+      turnIndexByTurnId: { current: 0 }, hasMoreOlder: false, nextCursor: null,
+    })
+    await state.loadOlderMessages('paged-thread')
+    expect(state.messages.value.map(message => message.text)).toEqual(['earlier item', 'latest item'])
+    expect(state.messages.value.map(message => message.turnIndex)).toEqual([0, 0])
+    expect(state.hasMoreOlderMessages.value).toBe(false)
+  })
+
+  it('reindexes existing messages when a page crosses an older turn boundary', async () => {
+    const state = await installPagedThread()
+    gatewayMocks.getOlderThreadMessages.mockResolvedValue({
+      messages: [
+        { id: 'oldest', role: 'user', text: 'older turn', turnId: 'older', turnIndex: 0 },
+        { id: 'earlier', role: 'assistant', text: 'current turn prefix', turnId: 'current', turnIndex: 1 },
+      ],
+      turnIndexByTurnId: { older: 0, current: 1 }, hasMoreOlder: true, nextCursor: 'next-page',
+    })
+    await state.loadOlderMessages('paged-thread')
+    expect(state.messages.value.map(message => [message.id, message.turnIndex])).toEqual([
+      ['oldest', 0], ['earlier', 1], ['latest', 1],
+    ])
+    expect(state.hasMoreOlderMessages.value).toBe(true)
+  })
+})
+
+describe('fork sidebar retention', () => {
+  it('keeps a fork visible while the server thread list catches up', async () => {
+    installTestWindow()
+    const nowSpy = vi.spyOn(Date, 'now')
+    let now = 1000
+    nowSpy.mockImplementation(() => now)
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({
+      groups: [{ projectName: 'project', threads: [thread('source-thread', '/tmp/project')] }],
+      nextCursor: null,
+    })
+    gatewayMocks.forkThread.mockResolvedValue({ threadId: 'forked-thread', model: 'gpt-5.6-luna' })
+    gatewayMocks.getThreadDetail.mockResolvedValue({
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      turnIndexByTurnId: {},
+      hasMoreOlder: false,
+    })
+
+    try {
+      const state = useDesktopState()
+      await state.refreshAll({ includeSelectedThreadMessages: false })
+      now += 5000
+
+      await expect(state.forkThreadById('source-thread')).resolves.toBe('forked-thread')
+
+      expect(state.projectGroups.value.flatMap((group) => group.threads).map((row) => row.id)).toContain('forked-thread')
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
+  it('recovers a selected fork that thread/list omits after reconnect', async () => {
+    installTestWindow({
+      'codex-web-local.selected-thread-id.v1': 'forked-thread',
+    })
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getThreadSummary.mockResolvedValue(thread('forked-thread', '/tmp/project'))
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false })
+
+    expect(state.projectGroups.value.flatMap((group) => group.threads).map((row) => row.id)).toContain('forked-thread')
+    expect(window.localStorage.getItem('codex-web-local.optimistic-forks.v1')).toContain('forked-thread')
+  })
+})
+
 describe('live error overlay', () => {
   it('shows the default thinking overlay while a selected thread is in progress without activity events', async () => {
     installTestWindow()
@@ -740,7 +1154,85 @@ describe('live error overlay', () => {
   })
 })
 
+describe('startup refresh coalescing', () => {
+  it('clears selected thread without refreshing models, messages, or skills', async () => {
+    installTestWindow({
+      'codex-web-local.selected-thread-id.v1': 'previous-thread',
+    })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+
+    const state = useDesktopState()
+    const result = await state.selectThread('')
+
+    expect(result).toBe('ok')
+    expect(state.selectedThreadId.value).toBe('')
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+    expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+    expect(gatewayMocks.getAvailableModelIds).not.toHaveBeenCalled()
+    expect(gatewayMocks.getSkillsList).not.toHaveBeenCalled()
+  })
+})
+
 describe('provider model selection', () => {
+  it('discards stale provider metadata when an older catalog settles after a newer refresh', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/current', providerId: 'ninerouter', reasoningEffort: 'medium', speedMode: 'standard' })
+    const deferred: Array<{ callback: (metadata: unknown[]) => void; release: (ids: string[]) => void }> = []
+    gatewayMocks.getAvailableModelIds.mockImplementation(options => new Promise<string[]>(resolve => {
+      deferred.push({ callback: options.onMetadata, release: resolve })
+    }))
+    const state = useDesktopState()
+    const older = state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true, providerChanged: true })
+    await vi.waitFor(() => expect(deferred).toHaveLength(1))
+    const newer = state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true, providerChanged: true })
+    expect(state.availableModelMetadata.value).toEqual([])
+    await vi.waitFor(() => expect(deferred).toHaveLength(2))
+    deferred[1]!.callback([{ id: 'cx/current', contextWindow: 1000, reasoningOptions: ['high'], reasoningSource: 'provider-catalog' }])
+    deferred[1]!.release(['cx/current'])
+    await newer
+    deferred[0]!.callback([{ id: 'cx/retired', contextWindow: 999999, reasoningOptions: ['max'], reasoningSource: 'provider-catalog' }])
+    deferred[0]!.release(['cx/retired'])
+    await older
+    expect(state.availableModelMetadata.value).toMatchObject([{ id: 'cx/current', contextWindow: 1000 }])
+    state.setSelectedReasoningEffort('high')
+    state.setSelectedReasoningEffort('max')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(2)
+  })
+
+  it('validates selected reasoning against provider metadata without an extra discovery request', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/gpt-6.1-sol', providerId: 'ninerouter', reasoningEffort: 'ultra', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockImplementation(async (options) => {
+      options.onMetadata([
+        { id: 'cx/gpt-6.1-sol', contextWindow: 1050000, supportsReasoning: true, reasoningOptions: ['low', 'medium', 'high', 'xhigh', 'max'], reasoningSource: 'provider-catalog' },
+        { id: 'cx/gpt-reserve', supportsReasoning: false, reasoningOptions: [] },
+        { id: 'cx/high-only', reasoningOptions: ['high'], reasoningSource: 'provider-catalog' },
+      ])
+      return ['cx/gpt-6.1-sol', 'cx/gpt-reserve', 'cx/high-only']
+    })
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    state.setSelectedReasoningEffort('max')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    state.setSelectedReasoningEffort('ultra')
+    state.setSelectedReasoningEffort('none')
+    expect(state.selectedReasoningEffort.value).toBe('max')
+    expect(state.availableModelMetadata.value[0]?.contextWindow).toBe(1050000)
+    state.setSelectedModelId('cx/gpt-reserve')
+    expect(state.selectedReasoningEffort.value).toBe('')
+    state.setSelectedReasoningEffort('high')
+    expect(state.selectedReasoningEffort.value).toBe('')
+    state.setSelectedModelId('cx/high-only')
+    state.setSelectedReasoningEffort('high')
+    expect(state.selectedReasoningEffort.value).toBe('high')
+    expect(gatewayMocks.getCurrentModelConfig).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(1)
+  })
+
   it('does not overwrite a model chosen while catalog refresh is pending', async () => {
     installTestWindow()
     gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'muse-spark-1.3-contributor-free', providerId: 'opencode_zen', reasoningEffort: 'medium', speedMode: 'standard' })
@@ -759,6 +1251,8 @@ describe('provider model selection', () => {
 
   it('preserves an explicitly selected next-turn model across thread resume and reload', async () => {
     installTestWindow()
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'muse-spark-1.3-contributor-free', providerId: 'opencode_zen', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['muse-spark-1.3-contributor-free', 'mimo-v2.5-free'])
     gatewayMocks.resumeThread.mockResolvedValue({ model: 'muse-spark-1.3-contributor-free', modelProvider: 'opencode_zen', messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {} })
     const state = useDesktopState()
     state.primeSelectedThread('zen-persist')
@@ -925,7 +1419,7 @@ describe('provider model selection', () => {
     })
   })
 
-  it('keeps an existing OpenCode Zen thread locked to Zen models after Codex auth becomes active', async () => {
+  it('applies global Codex models to an existing OpenCode Zen thread after Codex auth becomes active', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({
       groups: [{ projectName: 'Project', threads: [thread('legacy-zen-thread', '/tmp/project')] }],
@@ -963,20 +1457,17 @@ describe('provider model selection', () => {
 
     expect(gatewayMocks.getAvailableModelIds).toHaveBeenLastCalledWith({
       includeProviderModels: true,
-      requireProviderModels: true,
+      requireProviderModels: false,
       onMetadata: expect.any(Function),
-      providerId: 'opencode-zen',
+      providerId: undefined,
     })
-    expect(state.availableModelIds.value).toEqual([
-      'big-pickle',
-      'ring-2.6-1t-free',
-    ])
-    expect(state.selectedModelId.value).toBe('big-pickle')
-    expect(state.readModelIdForThread('legacy-zen-thread')).toBe('big-pickle')
+    expect(state.availableModelIds.value).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
+    expect(state.selectedModelId.value).toBe('gpt-5.4-mini')
+    expect(state.readModelIdForThread('legacy-zen-thread')).toBe('gpt-5.4-mini')
     expect(state.readModelIdForThread('')).toBe('gpt-5.4-mini')
   })
 
-  it('loads provider models for a selected provider-backed thread during scheduled refreshes', async () => {
+  it('loads globally active provider models for a legacy thread during scheduled refreshes', async () => {
     installTestWindow()
     vi.mocked(window.setTimeout).mockImplementation(((callback: TimerHandler) => {
       if (typeof callback === 'function') {
@@ -1021,12 +1512,12 @@ describe('provider model selection', () => {
 
     expect(gatewayMocks.getAvailableModelIds).toHaveBeenLastCalledWith({
       includeProviderModels: true,
-      requireProviderModels: true,
+      requireProviderModels: false,
       onMetadata: expect.any(Function),
-      providerId: 'opencode-zen',
+      providerId: undefined,
     })
-    expect(state.availableModelIds.value).toEqual(['big-pickle', 'ring-2.6-1t-free'])
-    expect(state.selectedModelId.value).toBe('big-pickle')
+    expect(state.availableModelIds.value).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
+    expect(state.selectedModelId.value).toBe('gpt-5.4-mini')
   })
 
   it('captures the active provider when creating a new thread', async () => {
@@ -1069,7 +1560,7 @@ describe('provider model selection', () => {
     await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
     await state.sendMessageToNewThread('hi', '/tmp/project')
 
-    expect(gatewayMocks.startThread).toHaveBeenCalledWith('/tmp/project', 'gpt-5.5')
+    expect(gatewayMocks.startThread).toHaveBeenCalledWith('/tmp/project', 'gpt-5.5', 'standard')
     expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith(
       'codex-thread',
       'hi',
@@ -1079,6 +1570,7 @@ describe('provider model selection', () => {
       undefined,
       [],
       'default',
+      'standard',
     )
     expect(state.readModelIdForThread('codex-thread')).toBe('gpt-5.5')
     expect(state.messages.value.some((message) => (
@@ -1168,7 +1660,7 @@ describe('provider model selection', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('mini-thread')
+    await vi.waitFor(() => expect(gatewayMocks.getThreadDetail).toHaveBeenCalledWith('mini-thread', 'standard'))
     expect(state.messages.value.map((message) => `${message.role}:${message.text}`)).toEqual([
       'user:hi',
       'system:Worked for <1s',
@@ -1231,4 +1723,21 @@ describe('findAdjacentThreadId', () => {
   it('returns no fallback when there is no adjacent thread', () => {
     expect(findAdjacentThreadId([thread('selected-thread', '/tmp/project')], 'selected-thread')).toBe('')
   })
+})
+
+describe('literal Goal finite-policy separation', () => {
+  it.each([null, { threadId: 'goal-literal', objective: 'Existing', status: 'paused', tokenBudget: 100, tokensUsed: 10 }])(
+    'does not read or mutate Goal state from a literal message even for existing/missing Goal %j', async goal => {
+      installTestWindow()
+      gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'fixture-model', providerId: 'custom_endpoint', reasoningEffort: 'medium', speedMode: 'standard' })
+      gatewayMocks.getAvailableModelIds.mockResolvedValue(['fixture-model'])
+      gatewayMocks.resumeThread.mockResolvedValue({ model: 'fixture-model', modelProvider: 'custom_endpoint', messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, olderCursor: null, turnIndexByTurnId: {} })
+      gatewayMocks.startThreadTurn.mockResolvedValue('fixture-turn')
+      gatewayMocks.getThreadGoal.mockResolvedValue(goal)
+      const state = useDesktopState(); state.primeSelectedThread('goal-literal')
+      await state.sendMessageToSelectedThread('/goal Edited')
+      expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[1]).toBe('/goal Edited')
+      expect(gatewayMocks.getThreadGoal).not.toHaveBeenCalled()
+      expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
+    })
 })

@@ -7,12 +7,24 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { homedir } from 'node:os'
 import { tmpdir } from 'node:os'
+import { createRequire } from 'node:module'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
-import { writeFile } from 'node:fs/promises'
+import { chmod, writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import {
+  applyAppServerPermissionDefaults,
+  readAppServerPermissionIntent,
+  readAppServerPermissionDefaults,
+  prepareAppServerHotPermissionOverrides,
+  mergeAppServerHotPermissionOverrides,
+  type AppServerPermissionIntent,
+  type AppServerPermissionDefaults,
+  type AppServerTurnPermissionOverrides,
+} from './appServerPermissionDefaults.js'
+import { assertThreadProjectionIntegrity, resolveSQLiteHome } from './threadProjectionIntegrity.js'
 import { callRpcWithRateLimitDecodeRecovery } from './rateLimitDecodeRecovery.js'
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes } from './skillsRoutes.js'
@@ -25,6 +37,7 @@ import {
   getFreeModels,
   refreshFreeModelsInBackground,
   FREE_MODE_STATE_FILE,
+  NINEROUTER_PROVIDER_ID,
   OPENCODE_ZEN_DEFAULT_MODEL,
   OPENCODE_ZEN_PROVIDER_ID,
   createDefaultOpenCodeZenFreeModeState,
@@ -39,17 +52,29 @@ import {
 } from './freeMode.js'
 import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { getZenModelCatalog } from './zenModelCatalog.js'
+import { normalizeProviderModelMetadata } from './providerModelMetadata.js'
+import { readConfiguredContextWindows, readConfiguredModelCatalog } from './runtimeModelCatalog.js'
+import { nativeSlugForRoute, indexDescriptors, nativeUltraWireEffort, providerWireEfforts } from './runtimeLocalUltra.mjs'
 import type { ZenModelMetadata } from '../types/zenModels.js'
 import { handleZenProxyRequest } from './zenProxy.js'
-import { handleCustomEndpointProxyRequest } from './customEndpointProxy.js'
+import {
+  handleCustomEndpointModelsRequest,
+  handleCustomEndpointProxyRequest,
+} from './customEndpointProxy.js'
 import { ThreadTerminalManager } from './terminalManager.js'
+import { appendGoalBudgetAuditRecord } from './goalBudgetAudit.js'
+import { ActivityStore } from './activityStore.js'
+import { ActivityRecorder } from './activityRecorder.js'
+import { handleActivityRoutes } from './activityRoutes.js'
 import { getSpawnInvocation } from '../utils/commandInvocation.js'
 import {
   resolveCodexCommand,
   resolveRipgrepCommand,
 } from '../commandResolution.js'
-import type { CollaborationModeKind, ReasoningEffort } from '../types/codex.js'
+import type { ReasoningEffort } from '../types/codex.js'
 import { isAbsoluteLikePath } from '../pathUtils.js'
+
+const require = createRequire(import.meta.url)
 
 type JsonRpcCall = {
   jsonrpc: '2.0'
@@ -74,8 +99,11 @@ type RpcProxyRequest = {
   params?: unknown
 }
 
+type RuntimeModelCatalogSnapshot = { config: Record<string, unknown>; modelList: unknown; customBaseUrl: string; customWireApi: string; isCurrent: () => boolean }
+
 type RpcExecutor = {
   rpc: (method: string, params: unknown) => Promise<unknown>
+  readModelCatalogSnapshot?: () => Promise<RuntimeModelCatalogSnapshot | null>
 }
 
 type ServerRequestReply = {
@@ -736,13 +764,36 @@ async function sanitizeInlinePayloadDeep(
   return changed ? { value: nextRecord, changed: true } : { value, changed: false }
 }
 
+export async function listThreadTurnsPage(
+  appServer: { rpc: (method: string, params: unknown) => Promise<unknown> },
+  threadId: string,
+  cursor: string,
+  limit: number,
+): Promise<unknown> {
+  return appServer.rpc('thread/turns/list', {
+    threadId,
+    cursor,
+    limit,
+    sortDirection: 'desc',
+    itemsView: 'full',
+  })
+}
+
 export async function sanitizeThreadTurnsInlinePayloads(method: string, result: unknown): Promise<unknown> {
-  if (!THREAD_METHODS_WITH_TURNS.has(method)) return result
+  const isTurnsPage = method === 'thread/turns/list'
+  if (!THREAD_METHODS_WITH_TURNS.has(method) && !isTurnsPage) return result
 
   const record = asRecord(result)
   const thread = asRecord(record?.thread)
-  const turns = Array.isArray(thread?.turns) ? thread.turns : null
-  if (!record || !thread || !turns || turns.length === 0) return result
+  const turns = isTurnsPage
+    ? (Array.isArray(record?.data) ? record.data : null)
+    : (Array.isArray(thread?.turns) ? thread.turns : null)
+  if (!record || !turns || turns.length === 0) return result
+  if (!isTurnsPage && !thread) return result
+
+  const buildSanitizedResult = (nextTurns: unknown[]): unknown => isTurnsPage
+    ? { ...record, data: nextTurns }
+    : { ...record, thread: { ...thread, turns: nextTurns } }
 
   let changed = false
   const nextTurns: unknown[] = []
@@ -791,13 +842,7 @@ export async function sanitizeThreadTurnsInlinePayloads(method: string, result: 
   }
 
   if (!changed) return result
-  return {
-    ...record,
-    thread: {
-      ...thread,
-      turns: nextTurns,
-    },
-  }
+  return buildSanitizedResult(nextTurns)
 }
 
 function trimThreadTurnsInRpcResult(method: string, result: unknown): unknown {
@@ -1406,6 +1451,12 @@ function getCurrentImportedSessionModelDefaults(): { model: string; modelProvide
       modelProvider: 'custom_endpoint',
     }
   }
+  if (fmState.provider === NINEROUTER_PROVIDER_ID) {
+    return {
+      model: fmState.model?.trim() || '',
+      modelProvider: NINEROUTER_PROVIDER_ID,
+    }
+  }
   if (fmState.apiKey?.trim()) {
     return {
       model: fmState.model?.trim() || FREE_MODE_DEFAULT_MODEL,
@@ -1623,6 +1674,59 @@ function registerImportedSessionsInStateDb(sessions: ImportedSessionRecord[]): v
   }
 }
 
+type StateDbReader = {
+  prepare: (sql: string) => { all: () => unknown[] }
+  close: () => void
+}
+
+type NodeSqliteModule = {
+  DatabaseSync?: new (path: string, options?: { readOnly?: boolean; timeout?: number }) => StateDbReader
+}
+
+function readStateDbRowsWithNodeSqlite(stateDbPath: string, sql: string): Array<Record<string, unknown>> | null {
+  try {
+    const sqlite = require('node:sqlite') as NodeSqliteModule
+    if (!sqlite.DatabaseSync) return null
+    const database = new sqlite.DatabaseSync(stateDbPath, { readOnly: true, timeout: 2000 })
+    try {
+      return database.prepare(sql).all().flatMap((row) => {
+        const record = asRecord(row)
+        return record ? [record] : []
+      })
+    } finally {
+      database.close()
+    }
+  } catch {
+    return null
+  }
+}
+
+function normalizeImportedThreadRows(rows: unknown[]): Array<Record<string, unknown>> {
+  return rows.flatMap((row) => {
+    const record = asRecord(row)
+    const id = readNonEmptyString(record?.id)
+    const path = readNonEmptyString(record?.rollout_path)
+    const cwd = readNonEmptyString(record?.cwd)
+    if (!id || !path || !cwd) return []
+    const title = readNonEmptyString(record?.title) || readNonEmptyString(record?.first_user_message) || 'Imported chat'
+    const createdAt = typeof record?.created_at === 'number' ? record.created_at : Math.floor(Date.now() / 1000)
+    const updatedAt = typeof record?.updated_at === 'number' ? record.updated_at : createdAt
+    return [{
+      id,
+      preview: title,
+      modelProvider: readNonEmptyString(record?.model_provider) || 'openai',
+      createdAt,
+      updatedAt,
+      path,
+      cwd,
+      cliVersion: readNonEmptyString(record?.cli_version),
+      source: 'cli',
+      gitInfo: null,
+      turns: [],
+    }]
+  })
+}
+
 function listImportedThreadsFromStateDb(): Array<Record<string, unknown>> {
   const stateDbPath = join(getCodexHomeDir(), 'state_5.sqlite')
   if (!existsSync(stateDbPath)) return []
@@ -1630,40 +1734,17 @@ function listImportedThreadsFromStateDb(): Array<Record<string, unknown>> {
 SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
        cli_version, first_user_message, archived
 FROM threads
-WHERE archived = 0 AND replace(rollout_path, '\\', '/') LIKE '%/sessions/%' AND id IN (
-  SELECT id FROM threads WHERE first_user_message != '' OR title != ''
-)
+WHERE archived = 0 AND replace(rollout_path, '\\', '/') LIKE '%/sessions/%'
 ORDER BY updated_at DESC
 LIMIT 200;
 `
+  const nodeSqliteRows = readStateDbRowsWithNodeSqlite(stateDbPath, sql)
+  if (nodeSqliteRows) return normalizeImportedThreadRows(nodeSqliteRows)
   const result = spawnSync('sqlite3', ['-json', stateDbPath, sql], { encoding: 'utf8' })
   if (result.status !== 0 || !result.stdout.trim()) return []
   try {
     const rows = JSON.parse(result.stdout) as unknown
-    if (!Array.isArray(rows)) return []
-    return rows.flatMap((row) => {
-      const record = asRecord(row)
-      const id = readNonEmptyString(record?.id)
-      const path = readNonEmptyString(record?.rollout_path)
-      const cwd = readNonEmptyString(record?.cwd)
-      if (!id || !path || !cwd) return []
-      const title = readNonEmptyString(record?.title) || readNonEmptyString(record?.first_user_message) || 'Imported chat'
-      const createdAt = typeof record?.created_at === 'number' ? record.created_at : Math.floor(Date.now() / 1000)
-      const updatedAt = typeof record?.updated_at === 'number' ? record.updated_at : createdAt
-      return [{
-        id,
-        preview: title,
-        modelProvider: readNonEmptyString(record?.model_provider) || 'openai',
-        createdAt,
-        updatedAt,
-        path,
-        cwd,
-        cliVersion: readNonEmptyString(record?.cli_version),
-        source: 'cli',
-        gitInfo: null,
-        turns: [],
-      }]
-    })
+    return Array.isArray(rows) ? normalizeImportedThreadRows(rows) : []
   } catch {
     return []
   }
@@ -1718,14 +1799,17 @@ ${archivedPredicate};
   }
 }
 
-function mergeImportedThreadsIntoThreadListResult(result: unknown): unknown {
+async function mergeImportedThreadsIntoThreadListResult(result: unknown): Promise<unknown> {
   const record = asRecord(result)
   const data = Array.isArray(record?.data) ? record.data : null
   if (!record || !data) return result
+  const threadTitles = await readMergedThreadTitleCache()
   const importedById = new Map<string, Record<string, unknown>>()
   for (const thread of listImportedThreadsFromStateDb()) {
     const id = readNonEmptyString(thread.id)
-    if (id) importedById.set(id, thread)
+    if (!id) continue
+    const title = readNonEmptyString(threadTitles.titles[id])
+    importedById.set(id, title ? { ...thread, name: title, preview: title } : thread)
   }
   if (importedById.size === 0) return result
   const mergedData: unknown[] = []
@@ -2181,14 +2265,84 @@ async function fetchCustomEndpointDefaultModel(baseUrl: string, apiKey: string):
   }
 }
 
-async function fetchCustomEndpointModelIds(baseUrl: string, apiKey: string): Promise<string[]> {
+async function addRuntimeLocalReasoning(
+  appServer: RpcExecutor, models: ZenModelMetadata[], providerId: string, customBaseUrl = '', fetchedBaseUrl = '',
+): Promise<ZenModelMetadata[]> {
+  // Ultra is agent-local, not proof of a gateway-supported wire effort.
+  models = models.map(model => !model.id.startsWith('cx/') || !model.reasoningOptions.includes('ultra')
+    ? model : { ...model, reasoningOptions: model.reasoningOptions.filter(effort => effort !== 'ultra') })
+  const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
+  if (!path || !appServer.readModelCatalogSnapshot) return models
+  try {
+    const identity = (info: Awaited<ReturnType<typeof stat>>) => JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs])
+    const descriptorIdentity = identity(await stat(path))
+    const catalog = asRecord(await readConfiguredModelCatalog())
+    const descriptors = indexDescriptors(catalog?.models)
+    const eligible = new Map<string, string>()
+    for (const model of models) {
+      if (!nativeSlugForRoute(model.id) || model.supportsReasoning === false) continue
+      const wire = nativeUltraWireEffort(descriptors.get(model.id))
+      if (wire && (model.reasoningSource !== 'provider-catalog' || model.reasoningOptions.includes(wire))) eligible.set(model.id, wire)
+    }
+    if (!eligible.size) return models
+    const snapshot = await appServer.readModelCatalogSnapshot()
+    if (!snapshot || snapshot.config.model_catalog_json !== path
+      || asRecord(snapshot.config.features)?.multi_agent_v2 !== true
+      || descriptorIdentity !== identity(await stat(path)) || !snapshot.isCurrent()) return models
+    const normalizeProvider = (id: string) => ['custom', 'custom_endpoint', 'custom-endpoint'].includes(id.trim().toLowerCase())
+      ? 'custom-endpoint' : id
+    const effectiveProvider = readNonEmptyString(snapshot.config.model_provider)
+    if (normalizeProvider(effectiveProvider) !== normalizeProvider(providerId)) return models
+    const provider = asRecord(asRecord(snapshot.config.model_providers)?.[effectiveProvider])
+    if (provider?.wire_api !== 'responses') return models
+    const effectiveBaseUrl = readNonEmptyString(provider.base_url)
+    if (fetchedBaseUrl && effectiveBaseUrl !== fetchedBaseUrl) return models
+    const boundBaseUrl = customBaseUrl || effectiveBaseUrl
+    if (boundBaseUrl.replace(/\/+$/, '') !== 'http://127.0.0.1:20128/v1') return models
+    if (customBaseUrl && (snapshot.customBaseUrl !== customBaseUrl || snapshot.customWireApi !== 'responses')) return models
+    const port = parseInt(process.env.CODEXUI_SERVER_PORT ?? '', 10)
+    if (effectiveBaseUrl.replace(/\/+$/, '') !== boundBaseUrl.replace(/\/+$/, '')
+      && !(customBaseUrl && port > 0 && effectiveBaseUrl === `http://127.0.0.1:${port}/codex-api/custom-proxy/v1`)) return models
+    const result = asRecord(snapshot.modelList)
+    if (!Array.isArray(result?.data) || result?.nextCursor) return models
+    const runtimeRows = new Map<string, Record<string, unknown> | null>()
+    for (const value of result.data) {
+      const row = asRecord(value)
+      if (!row || typeof row.model !== 'string') continue
+      runtimeRows.set(row.model, runtimeRows.has(row.model) ? null : row)
+    }
+    const confirmed = new Map<string, string[]>()
+    for (const [id, wire] of eligible) {
+      const runtime = runtimeRows.get(id)
+      if (!runtime || runtime.id !== undefined && runtime.id !== id) continue
+      const efforts = providerWireEfforts(runtime)
+      const rows = runtime.supportedReasoningEfforts
+      if (Array.isArray(rows) && rows.every(value => typeof asRecord(value)?.reasoningEffort === 'string')
+        && rows.some(value => asRecord(value)?.reasoningEffort === 'ultra')
+        && efforts && efforts.has(wire)) {
+        const levels = descriptors.get(id)!.supported_reasoning_levels as unknown[]
+        confirmed.set(id, levels.map(value => asRecord(value)?.effort)
+          .filter((effort): effort is string => typeof effort === 'string' && efforts.has(effort)))
+      }
+    }
+    if (!snapshot.isCurrent()) return models
+    return models.map(model => !confirmed.has(model.id) ? model : {
+      ...model, reasoningOptions: [...(model.reasoningSource === 'provider-catalog'
+        ? model.reasoningOptions.filter(effort => effort !== 'ultra') : confirmed.get(model.id)!), 'ultra'],
+      reasoningSource: 'codex-runtime-catalog',
+    })
+  } catch { return models }
+}
+
+async function fetchCustomEndpointModels(baseUrl: string, apiKey: string): Promise<Pick<ProviderModelsResponse, 'data' | 'models'>> {
   const normalizedBaseUrl = baseUrl.trim()
-  if (!normalizedBaseUrl) return []
+  if (!normalizedBaseUrl) return { data: [] }
   const modelsUrl = buildProviderModelsUrl(normalizedBaseUrl, null)
   const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
   const response = await fetch(modelsUrl, { headers, signal: AbortSignal.timeout(PROVIDER_MODELS_FETCH_TIMEOUT_MS) })
-  if (!response.ok) return []
-  return normalizeProviderModelsData(await response.json() as unknown)
+  if (!response.ok) return { data: [] }
+  const payload = await response.json() as unknown
+  return { data: normalizeProviderModelsData(payload), models: normalizeProviderModelMetadata(payload) }
 }
 
 async function fetchOpenCodeZenModelIds(apiKey: string | null | undefined): Promise<string[]> {
@@ -2202,32 +2356,7 @@ function sortOpenCodeZenModelIds(modelIds: string[]): string[] {
   return [...freeIds, ...paidIds]
 }
 
-async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<ProviderModelsResponse> {
-  const configPayload = asRecord(await appServer.rpc('config/read', {}))
-  const config = asRecord(configPayload?.config)
-  const providerId = readNonEmptyString(config?.model_provider)
-  if (!providerId) {
-    return { data: [], providerId: '', source: 'provider' }
-  }
-
-  const providers = asRecord(config?.model_providers)
-  const provider = asRecord(providers?.[providerId])
-  if (!provider) {
-    logProviderModelDiscoveryWarning('configured provider is missing from model_providers', { providerId })
-    return { data: [], providerId, source: 'provider' }
-  }
-
-  const wireApi = readNonEmptyString(provider.wire_api)
-  if (wireApi !== 'responses') {
-    return { data: [], providerId, source: 'provider' }
-  }
-
-  const baseUrl = readNonEmptyString(provider.base_url)
-  if (!baseUrl) {
-    logProviderModelDiscoveryWarning('responses provider is missing base_url', { providerId })
-    return { data: [], providerId, source: 'provider' }
-  }
-
+export function buildProviderDiscoveryHeaders(provider: Record<string, unknown>): Headers {
   const headers = new Headers()
   const configuredHeaders = asRecord(provider.http_headers)
   if (configuredHeaders) {
@@ -2240,18 +2369,66 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
 
   const bearerToken = readNonEmptyString(provider.experimental_bearer_token)
   if (bearerToken && !headers.has('Authorization')) {
-    headers.set('Authorization', `Bearer ${bearerToken}`)
+    headers.set('Authorization', 'Bearer ' + bearerToken)
   }
 
-  const envKey = readNonEmptyString(provider.env_key)
-  const envHttpHeaders = asRecord(provider.env_http_headers)
-  if (envKey || envHttpHeaders) {
-    logProviderModelDiscoveryWarning('provider discovery skipped env-backed auth/header expansion', {
-      providerId,
-      hasEnvKey: Boolean(envKey),
-      hasEnvHttpHeaders: Boolean(envHttpHeaders),
-    })
+  const envKeyName = normalizeHeaderValue(provider.env_key)
+  const envKey = envKeyName ? normalizeHeaderValue(process.env[envKeyName]) : null
+  if (envKey && !headers.has('Authorization')) {
+    headers.set('Authorization', 'Bearer ' + envKey)
   }
+
+  const envHttpHeaders = asRecord(provider.env_http_headers)
+  if (envHttpHeaders) {
+    for (const [key, rawEnvName] of Object.entries(envHttpHeaders)) {
+      const envName = normalizeHeaderValue(rawEnvName)
+      const value = envName ? normalizeHeaderValue(process.env[envName]) : null
+      if (!value) continue
+      headers.set(key, value)
+    }
+  }
+
+  return headers
+}
+
+async function readProviderBackedModelIds(
+  appServer: RpcExecutor,
+  options: { config?: Record<string, unknown> | null; includeConfiguredModel?: boolean; requestedProviderId?: string } = {},
+): Promise<ProviderModelsResponse> {
+  const configPayload = options.config === undefined ? asRecord(await appServer.rpc('config/read', {})) : null
+  const config = options.config === undefined ? asRecord(configPayload?.config) : options.config
+  const providerId = readNonEmptyString(config?.model_provider)
+  if (!providerId) {
+    return { data: [], providerId: '', source: 'provider' }
+  }
+  const normalizedProviderId = providerId.toLowerCase().replace(/_/g, '-')
+  const isCustomProvider = normalizedProviderId === 'custom' || normalizedProviderId === 'custom-endpoint'
+  const configuredModel = options.includeConfiguredModel === false || isCustomProvider ? '' : readNonEmptyString(config?.model)
+  const fallback = (): ProviderModelsResponse => ({
+    data: configuredModel ? [configuredModel] : [],
+    providerId,
+    source: 'provider',
+  })
+
+  const providers = asRecord(config?.model_providers)
+  const provider = asRecord(providers?.[providerId])
+  if (!provider) {
+    logProviderModelDiscoveryWarning('configured provider is missing from model_providers', { providerId })
+    return fallback()
+  }
+
+  const wireApi = readNonEmptyString(provider.wire_api)
+  if (wireApi !== 'responses') {
+    return fallback()
+  }
+
+  const baseUrl = readNonEmptyString(provider.base_url)
+  if (!baseUrl) {
+    logProviderModelDiscoveryWarning('responses provider is missing base_url', { providerId })
+    return fallback()
+  }
+
+  const headers = buildProviderDiscoveryHeaders(provider)
 
   let requestUrl: URL
   try {
@@ -2261,7 +2438,7 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       providerId,
       error: getErrorMessage(error, 'invalid url'),
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 
   let response: Response
@@ -2276,7 +2453,7 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       providerId,
       error: isTimeoutError(error) ? `request timed out after ${PROVIDER_MODELS_FETCH_TIMEOUT_MS}ms` : getErrorMessage(error, 'network error'),
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 
   let payload: unknown = null
@@ -2288,7 +2465,7 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       status: response.status,
       error: getErrorMessage(error, 'invalid json'),
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 
   if (!response.ok) {
@@ -2297,26 +2474,32 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
       status: response.status,
       statusText: response.statusText,
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 
   try {
+    const modelIds = normalizeProviderModelsData(payload)
+    if (configuredModel && !modelIds.includes(configuredModel)) modelIds.unshift(configuredModel)
+    const configuredWindows = await readConfiguredContextWindows(config?.model_context_window)
     return {
-      data: normalizeProviderModelsData(payload),
+      data: modelIds,
       providerId,
       source: 'provider',
+      models: await addRuntimeLocalReasoning(appServer, normalizeProviderModelMetadata(payload).map(model => ({
+        ...model, configuredContextWindow: configuredWindows[model.id] ?? null,
+      })), options.requestedProviderId ?? providerId, '', baseUrl),
     }
   } catch (error) {
     logProviderModelDiscoveryWarning('provider /models payload was invalid', {
       providerId,
       error: getErrorMessage(error, 'invalid payload'),
     })
-    return { data: [], providerId, source: 'provider' }
+    return fallback()
   }
 }
 
 async function readProviderModelIdsForProvider(
-  appServer: AppServerProcess,
+  appServer: RpcExecutor,
   providerId: string,
 ): Promise<ProviderModelsResponse> {
   const normalizedProviderId = providerId.trim().toLowerCase().replace(/_/g, '-')
@@ -2349,10 +2532,12 @@ async function readProviderModelIdsForProvider(
     }
   }
 
-  if (normalizedProviderId === 'custom-endpoint' && fmState?.provider === 'custom' && fmState.customBaseUrl) {
+  if ((normalizedProviderId === 'custom' || normalizedProviderId === 'custom-endpoint') && fmState?.provider === 'custom' && fmState.customBaseUrl) {
     try {
+      const catalog = await fetchCustomEndpointModels(fmState.customBaseUrl, fmState.apiKey ?? '')
+      if (catalog.models) catalog.models = await addRuntimeLocalReasoning(appServer, catalog.models, 'custom_endpoint', fmState.customBaseUrl)
       return {
-        data: await fetchCustomEndpointModelIds(fmState.customBaseUrl, fmState.apiKey ?? ''),
+        ...catalog,
         providerId: 'custom_endpoint',
         source: 'custom',
       }
@@ -2361,7 +2546,10 @@ async function readProviderModelIdsForProvider(
     }
   }
 
-  return readProviderBackedModelIds(appServer)
+  return readProviderBackedModelIds(appServer, {
+    includeConfiguredModel: normalizedProviderId !== 'custom' && normalizedProviderId !== 'custom-endpoint',
+    requestedProviderId: providerId,
+  })
 }
 
 function extractThreadMessageText(threadReadPayload: unknown): string {
@@ -2439,8 +2627,28 @@ export async function callRpcWithArchiveRecovery(
     const threadId = readNonEmptyString(paramsRecord?.threadId)
 
     if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
-      await appServer.rpc('thread/resume', { threadId })
-      return appServer.rpc(method, params ?? null)
+      const collaborationMode = asRecord(paramsRecord?.collaborationMode)
+      const collaborationSettings = asRecord(collaborationMode?.settings)
+      const requestedModel = readNonEmptyString(paramsRecord?.model) || readNonEmptyString(collaborationSettings?.model)
+      const settings = await resolveCurrentTurnRoutingSettings(appServer, requestedModel)
+      const resumed = await appServer.rpc('thread/resume', {
+        threadId,
+        modelProvider: settings.modelProvider,
+        model: settings.model,
+        excludeTurns: true,
+      })
+      assertResumedTurnProvider(resumed, threadId, settings.modelProvider)
+      const retryParams = {
+        ...paramsRecord,
+        model: settings.model,
+        ...(collaborationMode && collaborationSettings ? {
+          collaborationMode: {
+            ...collaborationMode,
+            settings: { ...collaborationSettings, model: settings.model },
+          },
+        } : {}),
+      }
+      return appServer.rpc(method, retryParams)
     }
 
     if (method !== 'thread/archive') {
@@ -4323,9 +4531,10 @@ let explicitCodexModelProviderConfigCache: {
   mtimeMs: number | null
   size: number | null
   value: boolean
+  provider: string | null
 } | null = null
 
-function hasExplicitCodexModelProviderConfigSync(): boolean {
+function readExplicitCodexModelProviderConfigSync(): string | null {
   const configPath = join(getCodexHomeDir(), 'config.toml')
   let info: ReturnType<typeof statSync> | null = null
   try {
@@ -4336,18 +4545,20 @@ function hasExplicitCodexModelProviderConfigSync(): boolean {
       mtimeMs: null,
       size: null,
       value: false,
+      provider: null,
     }
-    return false
+    return null
   }
   if (
     explicitCodexModelProviderConfigCache?.path === configPath
     && explicitCodexModelProviderConfigCache.mtimeMs === info.mtimeMs
     && explicitCodexModelProviderConfigCache.size === info.size
   ) {
-    return explicitCodexModelProviderConfigCache.value
+    return explicitCodexModelProviderConfigCache.provider
   }
 
   let value = false
+  let provider: string | null = null
   try {
     const raw = readFileSync(configPath, 'utf8')
     let inTopLevelTable = true
@@ -4365,6 +4576,17 @@ function hasExplicitCodexModelProviderConfigSync(): boolean {
       if (!inTopLevelTable) continue
       if (isModelProviderAssignment(content)) {
         value = true
+        const equalsIndex = content.indexOf('=')
+        const rawValue = equalsIndex >= 0 ? content.slice(equalsIndex + 1).trim() : ''
+        if (rawValue.length >= 2) {
+          const first = rawValue[0]
+          const last = rawValue[rawValue.length - 1]
+          if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+            provider = rawValue.slice(1, -1).trim() || null
+          } else {
+            provider = rawValue
+          }
+        }
         break
       }
     }
@@ -4376,8 +4598,14 @@ function hasExplicitCodexModelProviderConfigSync(): boolean {
     mtimeMs: info.mtimeMs,
     size: info.size,
     value,
+    provider,
   }
-  return value
+  return provider
+}
+
+function hasExplicitCodexModelProviderConfigSync(): boolean {
+  readExplicitCodexModelProviderConfigSync()
+  return explicitCodexModelProviderConfigCache?.value === true
 }
 
 export async function writeFreeModeStateFile(statePath: string, state: FreeModeState): Promise<void> {
@@ -4910,6 +5138,7 @@ let sessionIndexThreadTitleCacheState: SessionIndexThreadTitleCacheState = {
 type TelegramBridgeConfigState = {
   botToken: string
   chatIds: number[]
+  notificationChatIds: number[]
   allowedUserIds: Array<number | '*'>
 }
 
@@ -5076,9 +5305,66 @@ type ThreadQueueStateUpdate<T> = {
   result: T
 }
 
-type ResolvedCollaborationModeSettings = {
+type CurrentTurnRoutingSettings = {
+  modelProvider: string
   model: string
   reasoningEffort: ReasoningEffort | null
+}
+
+class TurnProviderMismatchError extends Error {}
+
+function assertResumedTurnProvider(result: unknown, threadId: string, modelProvider: string): void {
+  // thread.modelProvider is historical metadata; the top-level field is the effective runtime provider.
+  const returnedProvider = readNonEmptyString(asRecord(result)?.modelProvider)
+  if (returnedProvider !== modelProvider) {
+    throw new TurnProviderMismatchError(
+      `Cannot start thread "${threadId}": configured provider "${modelProvider}" but thread/resume returned "${returnedProvider || 'unknown'}". `
+      + 'The thread may still be loaded or have an active writer; finish the active turn and reload it before retrying.',
+    )
+  }
+}
+
+async function resolveCurrentTurnRoutingSettings(appServer: RpcExecutor, requestedModel = ''): Promise<CurrentTurnRoutingSettings> {
+  const configPayload = asRecord(await appServer.rpc('config/read', {}))
+  const config = asRecord(configPayload?.config)
+  const modelProvider = readNonEmptyString(config?.model_provider)
+  const configuredModel = readNonEmptyString(config?.model)
+  let model = requestedModel || configuredModel
+  const providerState = modelProvider === 'custom_endpoint'
+    ? ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
+    : null
+  const configuredProvider = asRecord(asRecord(config?.model_providers)?.[modelProvider])
+  const useCustomCatalog = modelProvider === 'custom_endpoint' && Boolean(readNonEmptyString(configuredProvider?.base_url)
+    || providerState?.enabled && providerState.provider === 'custom' && providerState.customBaseUrl)
+  if (useCustomCatalog) {
+    const catalog = readNonEmptyString(configuredProvider?.base_url)
+      ? await readProviderBackedModelIds(appServer, { config, includeConfiguredModel: false })
+      : await readProviderModelIdsForProvider(appServer, modelProvider)
+    model = catalog.data.includes(model) ? model : catalog.data[0] ?? ''
+  } else if (modelProvider === 'openrouter_free' && requestedModel && requestedModel !== configuredModel) {
+    const models = getCachedFreeModels()
+    model = models.includes(requestedModel) ? requestedModel : configuredModel || models[0] || ''
+  } else if (modelProvider === 'opencode_zen' && requestedModel && requestedModel !== configuredModel) {
+    const catalog = await readProviderModelIdsForProvider(appServer, modelProvider)
+    model = catalog.data.includes(requestedModel) ? requestedModel : configuredModel || catalog.data[0] || ''
+  }
+  if (!useCustomCatalog && modelProvider && !model) {
+    const modelsPayload = asRecord(await appServer.rpc('model/list', {}))
+    const models = Array.isArray(modelsPayload?.data) ? modelsPayload.data : []
+    for (const row of models) {
+      const record = asRecord(row)
+      model = readNonEmptyString(record?.id) || readNonEmptyString(record?.model)
+      if (model) break
+    }
+  }
+  if (!modelProvider || !model) {
+    throw new Error('Starting a turn requires a configured provider and available model.')
+  }
+  return {
+    modelProvider,
+    model,
+    reasoningEffort: normalizeCollaborationModeReasoningEffort(normalizeReasoningEffort(config?.model_reasoning_effort)),
+  }
 }
 
 function normalizeStoredQueuedMessage(value: unknown): StoredQueuedMessage | null {
@@ -5141,6 +5427,7 @@ function normalizeThreadQueueState(value: unknown): ThreadQueueState {
 }
 
 let threadQueueMutationChain: Promise<unknown> = Promise.resolve()
+let recordQueueActivity: ((previous: ThreadQueueState, next: ThreadQueueState) => void) | null = null
 
 async function readThreadQueueState(): Promise<ThreadQueueState> {
   const statePath = getCodexGlobalStatePath()
@@ -5173,12 +5460,17 @@ async function writeThreadQueueStateUnlocked(nextState: ThreadQueueState): Promi
 
 async function withThreadQueueStateUpdate<T>(
   update: (state: ThreadQueueState) => ThreadQueueStateUpdate<T> | Promise<ThreadQueueStateUpdate<T>>,
+  guard?: (state: ThreadQueueState, commit: () => Promise<T>) => Promise<T>,
 ): Promise<T> {
   const run = threadQueueMutationChain.then(async () => {
     const currentState = await readThreadQueueState()
-    const { nextState, result } = await update(currentState)
-    await writeThreadQueueStateUnlocked(nextState)
-    return result
+    const commit = async (): Promise<T> => {
+      const { nextState, result } = await update(currentState)
+      await writeThreadQueueStateUnlocked(nextState)
+      recordQueueActivity?.(currentState, nextState)
+      return result
+    }
+    return guard ? guard(currentState, commit) : commit()
   })
   threadQueueMutationChain = run.catch(() => {})
   return run
@@ -5204,7 +5496,7 @@ async function appendThreadQueuedMessage(threadId: string, message: StoredQueued
 }
 
 function normalizeReasoningEffort(value: unknown): ReasoningEffort | '' {
-  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  const allowed: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
   return typeof value === 'string' && allowed.includes(value as ReasoningEffort)
     ? (value as ReasoningEffort)
     : ''
@@ -5598,12 +5890,23 @@ async function rollbackCreatedWorktree(
 
 function normalizeTelegramBridgeConfig(value: unknown): TelegramBridgeConfigState {
   const record = asRecord(value)
-  if (!record) return { botToken: '', chatIds: [], allowedUserIds: [] }
+  if (!record) return { botToken: '', chatIds: [], notificationChatIds: [], allowedUserIds: [] }
   const botToken = typeof record.botToken === 'string' ? record.botToken.trim() : ''
   const rawChatIds = Array.isArray(record.chatIds) ? record.chatIds : []
   const chatIds = Array.from(new Set(rawChatIds
     .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
     .map((value) => Math.trunc(value)))).slice(0, 50)
+  const rawNotificationChatIds = Array.isArray(record.notificationChatIds) ? record.notificationChatIds : []
+  const notificationChatIds = Array.from(new Set(rawNotificationChatIds
+    .map((value) => {
+      if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value)
+      if (typeof value === 'string') {
+        const normalized = value.trim().replace(/^(telegram|tg):/i, '').trim()
+        if (/^-?\d+$/.test(normalized)) return Number.parseInt(normalized, 10)
+      }
+      return Number.NaN
+    })
+    .filter((value) => Number.isFinite(value)))).slice(0, 50)
   const rawAllowedUserIds = Array.isArray(record.allowedUserIds) ? record.allowedUserIds : []
   const allowAllUsers = rawAllowedUserIds.some((value) => typeof value === 'string' && value.trim() === '*')
   const normalizedAllowedUserIds = Array.from(new Set(rawAllowedUserIds
@@ -5621,17 +5924,36 @@ function normalizeTelegramBridgeConfig(value: unknown): TelegramBridgeConfigStat
   const allowedUserIds: Array<number | '*'> = allowAllUsers
     ? ['*' as const, ...normalizedAllowedUserIds]
     : normalizedAllowedUserIds
-  return { botToken, chatIds, allowedUserIds }
+  return { botToken, chatIds, notificationChatIds, allowedUserIds }
+}
+
+function telegramEnvironmentConfig(): TelegramBridgeConfigState {
+  return normalizeTelegramBridgeConfig({
+    botToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
+    allowedUserIds: (process.env.TELEGRAM_ALLOWED_USER_IDS ?? '').split(',').filter(Boolean),
+    notificationChatIds: (process.env.TELEGRAM_NOTIFICATION_CHAT_IDS ?? '').split(',').filter(Boolean),
+  })
 }
 
 async function readTelegramBridgeConfig(): Promise<TelegramBridgeConfigState> {
   const telegramConfigPath = getTelegramBridgeConfigPath()
+  const environmentConfig = telegramEnvironmentConfig()
   try {
     const raw = await readFile(telegramConfigPath, 'utf8')
     const payload = asRecord(JSON.parse(raw)) ?? {}
-    return normalizeTelegramBridgeConfig(payload)
+    const normalized = normalizeTelegramBridgeConfig(payload)
+    return {
+      botToken: normalized.botToken || environmentConfig.botToken,
+      chatIds: normalized.chatIds,
+      notificationChatIds: normalized.notificationChatIds.length > 0
+        ? normalized.notificationChatIds
+        : environmentConfig.notificationChatIds,
+      allowedUserIds: normalized.allowedUserIds.length > 0
+        ? normalized.allowedUserIds
+        : environmentConfig.allowedUserIds,
+    }
   } catch {
-    return { botToken: '', chatIds: [], allowedUserIds: [] }
+    return environmentConfig
   }
 }
 
@@ -5641,8 +5963,10 @@ async function writeTelegramBridgeConfig(nextState: TelegramBridgeConfigState): 
   await writeFile(telegramConfigPath, JSON.stringify({
     botToken: normalized.botToken,
     chatIds: normalized.chatIds,
+    notificationChatIds: normalized.notificationChatIds,
     allowedUserIds: normalized.allowedUserIds,
   }), 'utf8')
+  await chmod(telegramConfigPath, 0o600)
 }
 
 let telegramBridgeConfigMutation: Promise<void> = Promise.resolve()
@@ -5900,14 +6224,19 @@ const MERGEABLE_ITEM_TYPES = new Set([
   'fileChange',
 ])
 
+type AppServerPermissionRequest = { threadId: string; intent: AppServerPermissionIntent; generation: ChildProcessWithoutNullStreams; epoch: number; order: number; dimensionOrder?: { approvalPolicy: number; sandbox: number }; pendingHotPermissions?: AppServerTurnPermissionOverrides; settings?: AppServerTurnPermissionOverrides; settingsAcknowledged?: boolean; settingsRejected?: boolean; settingsObservation?: Record<string, unknown>; settingsObservationRevision?: number; settingsNoop?: { settings: Record<string, unknown>; revision: number } }
+
 class AppServerProcess {
+  private activityRecorder: ActivityRecorder | null = null
+
+  setActivityRecorder(recorder: ActivityRecorder): void { this.activityRecorder = recorder }
   private process: ChildProcessWithoutNullStreams | null = null
   private initialized = false
   private initializePromise: Promise<void> | null = null
   private readBuffer = ''
   private nextId = 1
   private stopping = false
-  private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
+  private readonly pending = new Map<number, { method: string; resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
   private readonly notificationListeners = new Set<(value: { method: string; params: unknown }) => void>()
   private readonly pendingServerRequests = new Map<number, PendingServerRequest>()
   private readonly streamEventsByThreadId = new Map<string, StreamEventFrame[]>()
@@ -5918,6 +6247,37 @@ class AppServerProcess {
   private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
   private activeConfigSignature = ''
+  private activePermissionDefaults: AppServerPermissionDefaults = { approvalPolicy: 'never', sandboxMode: 'danger-full-access' }
+  private activeSQLiteHome = ''
+  private confirmedSQLiteHome = ''
+  private sqliteHomeVerificationPromise: Promise<void> | null = null
+  private configChangeDeferred = false
+  private activeCustomCatalogBinding = ''
+  private activeCatalogFileIdentity = ''
+  private runtimeModelCatalogCache: { process: ChildProcessWithoutNullStreams | null; pending: Promise<RuntimeModelCatalogSnapshot | null>; expiresAt: number } | null = null
+  private readonly fileMutationsByThreadId = new Set<string>()
+  private readonly goalMutationsByThreadId = new Map<string, object>()
+  // A lease excludes competitors; only a one-use policy permit authorizes native Goal writes.
+  private readonly goalWritePermits = new WeakMap<object, { method: string; params: unknown; generation: ChildProcessWithoutNullStreams; lease: object; assertAllowed: () => void }>()
+  private readonly joinedThreads = new Map<string, unknown>()
+  private readonly permissionIntentByThreadId = new Map<string, AppServerPermissionIntent>()
+  private readonly pendingHotPermissionsByThreadId = new Map<string, AppServerTurnPermissionOverrides>()
+  private readonly permissionEpochByThreadId = new Map<string, number>()
+  private nextPermissionOrder = 1
+  private readonly acceptedPermissionOrderByThreadId = new Map<string, { approvalPolicy: number; sandbox: number }>()
+  private readonly hotPermissionOrderByThreadId = new Map<string, { approvalPolicy: number; sandbox: number }>()
+  private readonly permissionRequestsById = new Map<number, AppServerPermissionRequest>()
+  private readonly effectivePermissionSettingsByThreadId = new Map<string, { generation: ChildProcessWithoutNullStreams; epoch: number; revision: number; settings: Record<string, unknown> }>()
+  private readonly permissionSettingsRevisionByThreadId = new Map<string, number>()
+  private readonly possiblePermissionChangesById = new Map<number, string>()
+  // Native {} means queued, not applied. Confirm with an owned applied event or exact current no-op evidence.
+  private readonly pendingPermissionSettingsById = new Map<number, AppServerPermissionRequest>()
+  // Subscription removal acknowledges no writer shutdown; protect until thread/closed.
+  private readonly writerThreadIds = new Set<string>()
+  private readonly writerMetadataByThreadId = new Map<string, Record<string, unknown>>()
+  private readonly timedOutRpcIds = new Map<number, string>()
+  private readonly resumePromisesByRequest = new Map<string, Promise<unknown>>()
+  private readonly resumeTailsByThreadId = new Map<string, Promise<unknown>>()
 
 
   private getCodexCommand(): string {
@@ -5928,8 +6288,10 @@ class AppServerProcess {
     return codexCommand
   }
 
-  private buildAppServerConfig(): { args: string[]; env: Record<string, string> } {
+  private buildAppServerConfig(): { args: string[]; env: Record<string, string>; sqliteHome: string } {
     const args = buildAppServerArgs()
+    const sqliteHome = resolveSQLiteHome(getCodexHomeDir())
+    args.push('-c', `sqlite_home=${JSON.stringify(sqliteHome)}`)
     let extraEnv: Record<string, string> = {}
     const serverPort = parseInt(process.env.CODEXUI_SERVER_PORT ?? '', 10) || undefined
     args.push(...getProviderCompatibilityConfigArgs(serverPort))
@@ -5943,7 +6305,7 @@ class AppServerProcess {
     } catch {
       // No free-mode state or invalid — use defaults
     }
-    return { args, env: extraEnv }
+    return { args, env: extraEnv, sqliteHome }
   }
 
   private getAppServerConfigSignature(config: { args: string[]; env: Record<string, string> }): string {
@@ -5959,25 +6321,52 @@ class AppServerProcess {
     if (!this.process) return
     const config = this.buildAppServerConfig()
     const nextSignature = this.getAppServerConfigSignature(config)
-    if (this.activeConfigSignature === nextSignature) return
+    this.configChangeDeferred = this.activeConfigSignature !== nextSignature
+    if (!this.configChangeDeferred) return
+    // An attached writer can still be flushing even when its turn is idle. Release is
+    // explicit (unsubscribe/close), never inferred from turn completion or a JS deadline.
+    if (this.writerThreadIds.size || this.joinedThreads.size || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size || [...this.pending.values()].some(request => ['thread/resume', 'thread/start', 'turn/start', 'thread/rollback'].includes(request.method))) return
     this.dispose()
   }
 
-  private start(): void {
+  private start(preparedConfig?: ReturnType<AppServerProcess['buildAppServerConfig']>): void {
     if (this.process) return
 
     this.stopping = false
-    const config = this.buildAppServerConfig()
+    this.joinedThreads.clear()
+    this.permissionIntentByThreadId.clear()
+    this.pendingHotPermissionsByThreadId.clear()
+    this.permissionRequestsById.clear()
+    this.permissionEpochByThreadId.clear()
+    this.acceptedPermissionOrderByThreadId.clear()
+    this.hotPermissionOrderByThreadId.clear()
+    this.pendingPermissionSettingsById.clear()
+    this.effectivePermissionSettingsByThreadId.clear()
+    this.permissionSettingsRevisionByThreadId.clear()
+    this.possiblePermissionChangesById.clear()
+    this.writerThreadIds.clear()
+    this.writerMetadataByThreadId.clear()
+    this.timedOutRpcIds.clear()
+    const config = preparedConfig ?? this.buildAppServerConfig()
+    this.activeSQLiteHome = config.sqliteHome
+    this.activePermissionDefaults = readAppServerPermissionDefaults(config.args)
+    this.configChangeDeferred = false
     this.activeConfigSignature = this.getAppServerConfigSignature(config)
+    this.activeCustomCatalogBinding = this.currentCustomCatalogBinding()
+    this.activeCatalogFileIdentity = this.currentCatalogFileIdentity()
+    this.runtimeModelCatalogCache = null
     const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
     const spawnEnv = Object.keys(config.env).length > 0
       ? { ...process.env, ...config.env }
       : undefined
     const proc = spawn(invocation.command, invocation.args, { stdio: ['pipe', 'pipe', 'pipe'], ...(spawnEnv ? { env: spawnEnv } : {}) })
     this.process = proc
+    this.confirmedSQLiteHome = ''
+    this.sqliteHomeVerificationPromise = null
 
     proc.stdout.setEncoding('utf8')
     proc.stdout.on('data', (chunk: string) => {
+      if (this.process !== proc) return
       this.readBuffer += chunk
 
       let lineEnd = this.readBuffer.indexOf('\n')
@@ -6009,6 +6398,10 @@ class AppServerProcess {
       }
 
       this.pending.clear()
+      this.permissionRequestsById.clear()
+      this.pendingPermissionSettingsById.clear()
+      this.possiblePermissionChangesById.clear()
+      this.effectivePermissionSettingsByThreadId.clear()
       this.pendingServerRequests.clear()
       this.process = null
       this.initialized = false
@@ -6033,6 +6426,58 @@ class AppServerProcess {
       return
     }
 
+    if (typeof message.id === 'number' && !message.method && ('result' in message || message.error)) {
+      const acquisitionMethod = this.timedOutRpcIds.get(message.id) ?? this.pending.get(message.id)?.method
+      const permissionRequest = this.permissionRequestsById.get(message.id)
+      const currentPermissionRequest = permissionRequest && permissionRequest.generation === this.process
+        && permissionRequest.epoch === (this.permissionEpochByThreadId.get(permissionRequest.threadId) ?? 0)
+      this.permissionRequestsById.delete(message.id)
+      this.possiblePermissionChangesById.delete(message.id)
+      if (message.error) this.pendingPermissionSettingsById.delete(message.id)
+      else if (acquisitionMethod === 'thread/settings/update' && currentPermissionRequest && permissionRequest) {
+        permissionRequest.settingsAcknowledged = true
+        if (permissionRequest.settingsRejected) this.pendingPermissionSettingsById.delete(message.id)
+        else if (permissionRequest.settingsObservation) this.completePermissionSettings(message.id, permissionRequest, permissionRequest.settingsObservation)
+        else if (permissionRequest.settingsNoop && permissionRequest.settingsNoop.revision === (this.permissionSettingsRevisionByThreadId.get(permissionRequest.threadId) ?? 0)
+          && ![...this.possiblePermissionChangesById.values()].includes(permissionRequest.threadId)) {
+          this.completePermissionSettings(message.id, permissionRequest, permissionRequest.settingsNoop.settings)
+        }
+      }
+      this.timedOutRpcIds.delete(message.id)
+      if (!message.error && (acquisitionMethod === 'thread/resume' || acquisitionMethod === 'thread/start')) {
+        const acquiredThreadId = readNonEmptyString(asRecord(asRecord(message.result)?.thread)?.id)
+        // A successful native acquisition owns a writer even if caller identity or
+        // permission validation rejects its result. Protect the actual returned ID
+        // before resolving the promise; only a subsequent confirmed close releases it.
+        if (acquiredThreadId) this.writerThreadIds.add(acquiredThreadId)
+      }
+      if (!message.error && currentPermissionRequest && (acquisitionMethod === 'thread/resume' || acquisitionMethod === 'thread/start')) {
+        const result = asRecord(message.result)
+        const threadId = readNonEmptyString(asRecord(result?.thread)?.id)
+        if (threadId && permissionRequest && (!permissionRequest.threadId || permissionRequest.threadId === threadId)) {
+          // Bind new acquisitions to the returned identity before any later stdout frame.
+          permissionRequest.threadId = threadId
+          permissionRequest.epoch = this.permissionEpochByThreadId.get(threadId) ?? 0
+          const { thread: _thread, initialTurnsPage: _page, turnsBackwardsCursor: _turnsCursor, itemsBackwardsCursor: _itemsCursor, ...runtimeMetadata } = result ?? {}
+          this.joinedThreads.set(threadId, runtimeMetadata)
+          this.writerMetadataByThreadId.set(threadId, runtimeMetadata)
+          if (permissionRequest) {
+            this.permissionIntentByThreadId.set(threadId, permissionRequest.intent)
+            this.acceptedPermissionOrderByThreadId.set(threadId, { approvalPolicy: permissionRequest.intent.approvalPolicy ? permissionRequest.order : 0, sandbox: permissionRequest.intent.sandbox ? permissionRequest.order : 0 })
+          }
+          this.writerThreadIds.add(threadId)
+          this.cacheEffectivePermissionSettings(threadId, { ...runtimeMetadata, sandboxPolicy: runtimeMetadata.sandbox })
+        }
+      }
+      if (!message.error && currentPermissionRequest && acquisitionMethod === 'turn/start' && permissionRequest?.threadId
+        && this.writerThreadIds.has(permissionRequest.threadId)) {
+        if (this.pendingHotPermissionsByThreadId.get(permissionRequest.threadId) === permissionRequest.pendingHotPermissions) {
+          this.pendingHotPermissionsByThreadId.delete(permissionRequest.threadId)
+          this.hotPermissionOrderByThreadId.delete(permissionRequest.threadId)
+        }
+        this.acceptPermissionIntent(permissionRequest)
+      }
+    }
     if (typeof message.id === 'number' && this.pending.has(message.id)) {
       const pendingRequest = this.pending.get(message.id)
       this.pending.delete(message.id)
@@ -6040,7 +6485,7 @@ class AppServerProcess {
       if (!pendingRequest) return
 
       if (message.error) {
-        pendingRequest.reject(new Error(message.error.message))
+        pendingRequest.reject(Object.assign(new Error(message.error.message), { rpcCode: message.error.code }))
       } else {
         pendingRequest.resolve(message.result)
       }
@@ -6061,11 +6506,141 @@ class AppServerProcess {
     }
   }
 
+  private acceptPermissionIntent(request: AppServerPermissionRequest): void {
+    const { threadId, intent } = request
+    const order = request.dimensionOrder ?? { approvalPolicy: request.order, sandbox: request.order }
+    const retained = this.permissionIntentByThreadId.get(threadId)
+    this.permissionIntentByThreadId.set(threadId, { approvalPolicy: !!retained?.approvalPolicy || intent.approvalPolicy, sandbox: !!retained?.sandbox || intent.sandbox })
+    const accepted = this.acceptedPermissionOrderByThreadId.get(threadId) ?? { approvalPolicy: 0, sandbox: 0 }
+    this.acceptedPermissionOrderByThreadId.set(threadId, { approvalPolicy: intent.approvalPolicy ? Math.max(order.approvalPolicy, accepted.approvalPolicy) : accepted.approvalPolicy, sandbox: intent.sandbox ? Math.max(order.sandbox, accepted.sandbox) : accepted.sandbox })
+    const pending = this.pendingHotPermissionsByThreadId.get(threadId)
+    const stagedOrder = this.hotPermissionOrderByThreadId.get(threadId)
+    if (!pending || !stagedOrder) return
+    const remaining = { ...pending }
+    if (intent.approvalPolicy && stagedOrder.approvalPolicy <= order.approvalPolicy) delete remaining.approvalPolicy
+    if (intent.sandbox && stagedOrder.sandbox <= order.sandbox) { delete remaining.sandboxPolicy; delete remaining.permissions }
+    if (Object.keys(remaining).length) this.pendingHotPermissionsByThreadId.set(threadId, remaining)
+    else { this.pendingHotPermissionsByThreadId.delete(threadId); this.hotPermissionOrderByThreadId.delete(threadId) }
+  }
+
+  private stageHotPermissionOverrides(threadId: string, overrides: AppServerTurnPermissionOverrides, order: number): void {
+    const accepted = this.acceptedPermissionOrderByThreadId.get(threadId) ?? { approvalPolicy: 0, sandbox: 0 }
+    const previousOrder = this.hotPermissionOrderByThreadId.get(threadId) ?? { approvalPolicy: 0, sandbox: 0 }
+    const current = { ...overrides }
+    if (order < Math.max(accepted.approvalPolicy, previousOrder.approvalPolicy)) delete current.approvalPolicy
+    if (order < Math.max(accepted.sandbox, previousOrder.sandbox)) { delete current.sandboxPolicy; delete current.permissions }
+    if (!Object.keys(current).length) return
+    this.pendingHotPermissionsByThreadId.set(threadId, mergeAppServerHotPermissionOverrides(this.pendingHotPermissionsByThreadId.get(threadId) ?? {}, current))
+    const intent = readAppServerPermissionIntent('turn/start', current)
+    this.hotPermissionOrderByThreadId.set(threadId, { approvalPolicy: intent.approvalPolicy ? order : previousOrder.approvalPolicy, sandbox: intent.sandbox ? order : previousOrder.sandbox })
+  }
+
+  private invalidateEffectivePermissionSettings(threadId: string): number {
+    const revision = (this.permissionSettingsRevisionByThreadId.get(threadId) ?? 0) + 1
+    this.permissionSettingsRevisionByThreadId.set(threadId, revision)
+    this.effectivePermissionSettingsByThreadId.delete(threadId)
+    return revision
+  }
+
+  private cacheEffectivePermissionSettings(threadId: string, settings: Record<string, unknown>): void {
+    if (!this.process || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId)) return
+    this.effectivePermissionSettingsByThreadId.set(threadId, {
+      generation: this.process, epoch: this.permissionEpochByThreadId.get(threadId) ?? 0,
+      revision: this.permissionSettingsRevisionByThreadId.get(threadId) ?? 0,
+      settings: JSON.parse(JSON.stringify(settings)) as Record<string, unknown>,
+    })
+  }
+
+  private readEffectivePermissionSettings(threadId: string): Record<string, unknown> | null {
+    if (!this.process || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId)
+      || [...this.possiblePermissionChangesById.values()].includes(threadId)) return null
+    let snapshot = this.effectivePermissionSettingsByThreadId.get(threadId)
+    // Joined metadata originates only in the acquisition response. It is a baseline,
+    // never reusable after any possible settings change in this child/closure epoch.
+    if (!snapshot && !this.permissionSettingsRevisionByThreadId.has(threadId)) {
+      const baseline = asRecord(this.joinedThreads.get(threadId))
+      if (baseline) this.cacheEffectivePermissionSettings(threadId, { ...baseline, sandboxPolicy: baseline.sandbox })
+      snapshot = this.effectivePermissionSettingsByThreadId.get(threadId)
+    }
+    return snapshot && snapshot.generation === this.process && snapshot.epoch === (this.permissionEpochByThreadId.get(threadId) ?? 0)
+      && snapshot.revision === (this.permissionSettingsRevisionByThreadId.get(threadId) ?? 0) ? snapshot.settings : null
+  }
+
+  private permissionSettingsMatch(expected: Record<string, unknown>, settings: Record<string, unknown>): boolean {
+    const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
+      : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)])) : value
+    const same = (left: unknown, right: unknown): boolean => JSON.stringify(canonical(left)) === JSON.stringify(canonical(right))
+    return !(expected.permissions != null && expected.sandboxPolicy != null)
+      && (expected.approvalPolicy == null || same(expected.approvalPolicy, settings.approvalPolicy))
+      && (expected.sandboxPolicy == null || same(expected.sandboxPolicy, settings.sandboxPolicy))
+      && (expected.permissions == null || asRecord(settings.activePermissionProfile)?.id === expected.permissions)
+  }
+
+  private completePermissionSettings(id: number, request: AppServerPermissionRequest, settings: Record<string, unknown>): void {
+    const { threadId } = request
+    if (this.pendingPermissionSettingsById.get(id) !== request || !request.settingsAcknowledged || request.settingsRejected
+      || request.generation !== this.process || request.epoch !== (this.permissionEpochByThreadId.get(threadId) ?? 0)
+      || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId)
+      || (request.settingsObservation ? request.settingsObservationRevision : request.settingsNoop?.revision) !== (this.permissionSettingsRevisionByThreadId.get(threadId) ?? 0)
+      || [...this.possiblePermissionChangesById].some(([otherId, target]) => target === threadId && otherId !== id)) return
+    this.pendingPermissionSettingsById.delete(id)
+    this.acceptPermissionIntent(request)
+    this.joinedThreads.set(threadId, { ...asRecord(this.joinedThreads.get(threadId)), approvalPolicy: settings.approvalPolicy, sandbox: settings.sandboxPolicy })
+    this.cacheEffectivePermissionSettings(threadId, settings)
+  }
+
+  private observePermissionSettings(notification: { method: string; params: unknown }, threadId: string): void {
+    const params = asRecord(notification.params)
+    const settings = asRecord(params?.threadSettings)
+    if (notification.method === 'thread/settings/updated') {
+      this.invalidateEffectivePermissionSettings(threadId)
+      if (settings) this.cacheEffectivePermissionSettings(threadId, settings)
+    }
+    const error = asRecord(params?.error)
+    const rejected = notification.method === 'error' && typeof error?.message === 'string' && error.message.startsWith('invalid thread settings override:')
+    for (const [id, request] of this.pendingPermissionSettingsById) {
+      if (request.threadId !== threadId) continue
+      if (request.generation !== this.process || request.epoch !== (this.permissionEpochByThreadId.get(threadId) ?? 0)
+        || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId)) { this.pendingPermissionSettingsById.delete(id); continue }
+      if (rejected) {
+        request.settingsRejected = true
+        request.settingsObservation = undefined
+        if (request.settingsAcknowledged) this.pendingPermissionSettingsById.delete(id)
+        continue
+      }
+      if (request.settingsRejected) continue
+      if (notification.method !== 'thread/settings/updated' || !settings) continue
+      const expected = request.settings ?? {}
+      request.settingsObservation = undefined
+      if (!this.permissionSettingsMatch(expected, settings)) continue
+      // Settings notifications have no RPC id: a matching owned observation is evidence,
+      // never synchronous acceptance. Preserve rejection until this request's ack arrives.
+      request.settingsObservation = settings
+      request.settingsObservationRevision = this.permissionSettingsRevisionByThreadId.get(threadId) ?? 0
+      this.completePermissionSettings(id, request, settings)
+    }
+  }
+
   private emitNotification(notification: { method: string; params: unknown }): void {
+    this.activityRecorder?.notification(notification)
     this.recordStreamEvent(notification)
     this.captureItemFromNotification(notification)
     const nThreadId = this.extractThreadIdFromParams(notification.params)
     if (nThreadId) {
+      if (['turn/started', 'thread/started', 'thread/closed'].includes(notification.method)) this.invalidateEffectivePermissionSettings(nThreadId)
+      if (notification.method === 'thread/closed') {
+        this.permissionEpochByThreadId.set(nThreadId, (this.permissionEpochByThreadId.get(nThreadId) ?? 0) + 1)
+        for (const [id, request] of this.permissionRequestsById) if (request.threadId === nThreadId) this.permissionRequestsById.delete(id)
+        for (const [id, request] of this.pendingPermissionSettingsById) if (request.threadId === nThreadId) this.pendingPermissionSettingsById.delete(id)
+        this.acceptedPermissionOrderByThreadId.delete(nThreadId)
+        this.hotPermissionOrderByThreadId.delete(nThreadId)
+        this.joinedThreads.delete(nThreadId)
+        this.permissionIntentByThreadId.delete(nThreadId)
+        this.pendingHotPermissionsByThreadId.delete(nThreadId)
+        this.writerThreadIds.delete(nThreadId)
+        this.writerMetadataByThreadId.delete(nThreadId)
+      }
+      if (notification.method === 'thread/settings/updated' || notification.method === 'error') this.observePermissionSettings(notification, nThreadId)
       this.invalidateLiveStateCache(nThreadId)
       this.threadTurnPageReadCacheByThreadId.delete(nThreadId)
     }
@@ -6286,6 +6861,7 @@ class AppServerProcess {
         id: requestId,
         method: pendingRequest.method,
         threadId,
+        decision: reply.error ? 'error' : readNonEmptyString(asRecord(reply.result)?.decision) || 'submitted',
         mode: 'manual',
         resolvedAtIso: new Date().toISOString(),
       },
@@ -6349,30 +6925,77 @@ class AppServerProcess {
     })
   }
 
-  private async call(method: string, params: unknown): Promise<unknown> {
+  private async call(method: string, params: unknown, expectedProcess?: ChildProcessWithoutNullStreams, goalLease?: object, goalPermit?: object, permissionRequest?: AppServerPermissionRequest): Promise<unknown> {
+    const goalRecord = params && typeof params === 'object' ? params as Record<string, unknown> : null
+    const goalThreadId = typeof goalRecord?.threadId === 'string' ? goalRecord.threadId.trim() : ''
+    if (this.goalMutationsByThreadId.has(goalThreadId) && !goalLease && ['turn/start', 'thread/resume', 'thread/rollback', 'thread/archive', 'thread/unsubscribe'].includes(method)) throw new Error('Goal mutation is busy; no competing mutation was sent.')
+    if (['thread/goal/set', 'thread/goal/clear'].includes(method)) {
+      const permit = goalPermit && this.goalWritePermits.get(goalPermit)
+      if (!permit || permit.method !== method || permit.params !== params || permit.generation !== this.process
+        || permit.generation !== expectedProcess || permit.lease !== goalLease
+        || this.goalMutationsByThreadId.get(readNonEmptyString(asRecord(params)?.threadId)) !== goalLease) throw new Error('Goal policy permit is not held')
+      this.goalWritePermits.delete(goalPermit!)
+      permit.assertAllowed()
+    }
+    if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'thread/items/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
+    if (this.timedOutRpcIds.size) throw new Error('Codex still has an unresolved timed-out operation; no retry was sent and active writers were preserved.')
+    if (expectedProcess && this.process !== expectedProcess) throw new Error('codex app-server changed before RPC dispatch; retry the request')
     this.start()
     const id = this.nextId++
 
+    const requestProcess = this.process
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-
-      this.sendLine({
-        jsonrpc: '2.0',
-        id,
+      const timer = setTimeout(() => {
+        const pending = this.pending.get(id)
+        if (!pending) return
+        this.pending.delete(id)
+        // Rejecting a JS promise does not cancel Codex's Rust handler. Do not enqueue more
+        // requests or restart an active writer; only its late response/exit can release this.
+        if (method !== 'initialize' && this.process === requestProcess) this.timedOutRpcIds.set(id, method)
+        pending.reject(new Error(`codex app-server ${method} timed out`))
+        if (method === 'initialize' && this.process === requestProcess) this.dispose()
+      }, method === 'initialize' ? 30_000 : 120_000)
+      timer.unref?.()
+      this.pending.set(id, {
         method,
-        params,
-      } satisfies JsonRpcCall)
+        resolve: (value) => { clearTimeout(timer); resolve(value) },
+        reject: (error) => { clearTimeout(timer); reject(error) },
+      })
+      try {
+        const readsWhileDeferred = new Set(['initialize', 'thread/read', 'thread/turns/list', 'thread/items/list', 'thread/list', 'thread/loaded/list', 'config/read', 'turn/interrupt', 'thread/unsubscribe'])
+        if (this.configChangeDeferred && !readsWhileDeferred.has(method)) throw new Error('App-server configuration change is deferred until writer shutdown is confirmed; no mutation was sent.')
+        if (goalThreadId && ['thread/resume', 'turn/start', 'thread/settings/update', 'turn/settings/update', 'thread/rollback'].includes(method)) {
+          const expected = permissionRequest?.settings
+          const effective = method === 'thread/settings/update' && expected
+            && Object.keys(expected).every(key => ['threadId', 'approvalPolicy', 'sandboxPolicy', 'permissions'].includes(key))
+            ? this.readEffectivePermissionSettings(goalThreadId) : null
+          const revision = this.invalidateEffectivePermissionSettings(goalThreadId)
+          if (permissionRequest && expected && effective && this.permissionSettingsMatch(expected, effective)) permissionRequest.settingsNoop = { settings: effective, revision }
+          this.possiblePermissionChangesById.set(id, goalThreadId)
+        }
+        if (permissionRequest) this.permissionRequestsById.set(id, permissionRequest)
+        if (method === 'thread/settings/update' && permissionRequest && (permissionRequest.intent.approvalPolicy || permissionRequest.intent.sandbox)) this.pendingPermissionSettingsById.set(id, permissionRequest)
+        this.sendLine({ jsonrpc: '2.0', id, method, params } satisfies JsonRpcCall)
+      } catch (error) {
+        this.pending.get(id)?.reject(error)
+        this.pending.delete(id)
+        this.permissionRequestsById.delete(id)
+        this.pendingPermissionSettingsById.delete(id)
+        this.possiblePermissionChangesById.delete(id)
+      }
     })
   }
 
   private async ensureInitialized(): Promise<void> {
+    this.start()
+    const initializingProcess = this.process
     if (this.initialized) return
     if (this.initializePromise) {
       await this.initializePromise
       return
     }
 
-    this.initializePromise = this.call('initialize', {
+    const initializePromise = this.call('initialize', {
       clientInfo: {
         name: 'codex-web-local',
         version: '0.1.0',
@@ -6381,22 +7004,487 @@ class AppServerProcess {
         experimentalApi: true,
       },
     }).then(() => {
+      if (this.process !== initializingProcess) throw new Error('codex app-server changed during initialization; retry the request')
       this.sendLine({
         jsonrpc: '2.0',
         method: 'initialized',
       })
       this.initialized = true
     }).finally(() => {
-      this.initializePromise = null
+      if (this.initializePromise === initializePromise) this.initializePromise = null
     })
+    this.initializePromise = initializePromise
 
-    await this.initializePromise
+    await initializePromise
   }
 
-  async rpc(method: string, params: unknown): Promise<unknown> {
-    this.disposeIfConfigChanged()
+  private currentCatalogFileIdentity(): string {
+    const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
+    if (!path) return ''
+    try {
+      const info = statSync(path)
+      if (info.size <= 0 || info.size > 4 * 1024 * 1024) return ''
+      return JSON.stringify([path, info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs])
+    } catch { return '' }
+  }
+
+  private currentCustomCatalogBinding(): string {
+    const state = ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
+    return JSON.stringify({ provider: state?.provider ?? '', enabled: state?.enabled ?? false,
+      baseUrl: state?.customBaseUrl ?? '', wireApi: state?.wireApi ?? 'responses' })
+  }
+
+  readModelCatalogSnapshot(): Promise<RuntimeModelCatalogSnapshot | null> {
+    const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
+    if (!path) return Promise.resolve(null)
+    const valid = () => !!this.process && !this.configChangeDeferred && !this.timedOutRpcIds.size
+      && !this.fileMutationsByThreadId.size && this.activeConfigSignature === this.getAppServerConfigSignature(this.buildAppServerConfig())
+      && this.activeCustomCatalogBinding === this.currentCustomCatalogBinding()
+      && !!this.activeCatalogFileIdentity && this.activeCatalogFileIdentity === this.currentCatalogFileIdentity()
+    if (this.process && !valid()) return Promise.resolve(null)
+    const proc = this.process
+    if (this.runtimeModelCatalogCache?.process === proc && this.runtimeModelCatalogCache.expiresAt > Date.now()) {
+      return this.runtimeModelCatalogCache.pending.then(snapshot => this.process === proc && valid() ? snapshot : null)
+    }
+    const pending = (async () => {
+      this.start()
+      const generation = this.process
+      await this.ensureInitialized()
+      if (!generation || this.process !== generation || !this.initialized || !valid()) return null
+      const payload = asRecord(await this.call('config/read', {}, generation))
+      if (this.process !== generation || !valid()) return null
+      if (asRecord(payload?.config)?.model_catalog_json !== path) return null
+      const modelList = await this.call('model/list', { includeHidden: true, limit: 1000 }, generation)
+      if (this.process !== generation || !valid()) return null
+      const binding = asRecord(JSON.parse(this.activeCustomCatalogBinding))
+      return { config: asRecord(payload?.config) ?? {}, modelList, customBaseUrl: readNonEmptyString(binding?.baseUrl),
+        customWireApi: readNonEmptyString(binding?.wireApi), isCurrent: () => this.process === generation && valid() }
+    })().catch(() => null)
+    this.runtimeModelCatalogCache = { process: this.process, pending, expiresAt: Date.now() + 5000 }
+    return pending
+  }
+
+  createActivityRecoveryLease(threadId: string): { rpc: (method: string, params: unknown) => Promise<unknown>; isCurrent: () => boolean } {
+    const initialProcess = this.process
+    let generation = initialProcess
+    let epoch = this.permissionEpochByThreadId.get(threadId) ?? 0
+    let dispatched = false
+    const isCurrent = () => this.process === generation && epoch === (this.permissionEpochByThreadId.get(threadId) ?? 0)
+    const captureDispatch = (proc: ChildProcessWithoutNullStreams, dispatchEpoch: number): void => {
+      // Rebase a cold lease exactly once, against the actual guarded dispatch.
+      // Neither a settled reply nor a fallback may adopt a replacement child.
+      if (((dispatched || initialProcess) && (!isCurrent() || generation !== proc || epoch !== dispatchEpoch))
+        || this.process !== proc || dispatchEpoch !== (this.permissionEpochByThreadId.get(threadId) ?? 0)) {
+        throw new Error('Activity recovery generation or thread ownership changed; no history read was sent.')
+      }
+      generation = proc
+      epoch = dispatchEpoch
+      dispatched = true
+    }
+    return Object.freeze({
+      isCurrent,
+      rpc: (method: string, params: unknown): Promise<unknown> => {
+        if (!threadId || !['thread/items/list', 'thread/turns/list'].includes(method)
+          || asRecord(params)?.threadId !== threadId || !isCurrent()) {
+          return Promise.reject(new Error('Activity recovery requires its current exact read-only thread lease.'))
+        }
+        // These bounded reads use the same preflight, initialization, quarantine
+        // and dispatch guards as public rpc; the lease grants no mutation path.
+        return this.rpcInner(method, params, undefined, captureDispatch)
+      },
+    })
+  }
+
+  rpc(method: string, params: unknown): Promise<unknown> {
+    const record = params && typeof params === 'object' ? params as Record<string, unknown> : null
+    const threadId = typeof record?.threadId === 'string' ? record.threadId : ''
+    if (method !== 'thread/resume' || !threadId) return this.rpcInner(method, params)
+    // Only structurally equivalent callers share a response. Different paging/provider
+    // options wait for the first acquisition, then use the joined writer's bounded reads.
+    const canonical = (value: unknown): unknown => Array.isArray(value)
+      ? value.map(canonical)
+      : value && typeof value === 'object'
+        ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, canonical(v)]))
+        : value
+    const key = JSON.stringify(canonical(record))
+    const existing = this.resumePromisesByRequest.get(key)
+    if (existing) return existing
+    const predecessor = this.resumeTailsByThreadId.get(threadId)
+    const proceed = () => this.rpcInner(method, params)
+    const promise = (predecessor ? predecessor.then(proceed, (error: unknown) => {
+      if (asRecord(error)?.rpcCode !== -32602 || this.timedOutRpcIds.size) throw error
+      return proceed() // Invalid parameters were rejected before acquisition; evaluate this caller.
+    }) : proceed()).finally(() => {
+      if (this.resumePromisesByRequest.get(key) === promise) this.resumePromisesByRequest.delete(key)
+      if (this.resumeTailsByThreadId.get(threadId) === promise) this.resumeTailsByThreadId.delete(threadId)
+    })
+    this.resumePromisesByRequest.set(key, promise)
+    this.resumeTailsByThreadId.set(threadId, promise)
+    return promise
+  }
+
+  private captureGoalIntent(method: string, params: unknown): Readonly<Record<string, unknown>> {
+    const input = asRecord(params)
+    const reject = (message: string): never => { throw Object.assign(new Error(message), { goalPolicyStatus: 400 }) }
+    if (!input || Array.isArray(params)) return reject('Invalid Goal parameters')
+    const intent = Object.freeze({ ...input })
+    if (typeof intent.threadId !== 'string' || !intent.threadId.trim() || intent.threadId !== intent.threadId.trim()) return reject('Goal requires a nonempty exact threadId')
+    if (method !== 'thread/goal/set' && method !== 'thread/goal/clear') return reject('Unsupported Goal mutation')
+    return intent
+  }
+
+  async mutateGoal(method: string, params: unknown, context?: { ownerAuthorized: boolean }): Promise<unknown> {
+    // Capture before the first await. Trusted context is never reconstructed from RPC params.
+    const intent = this.captureGoalIntent(method, params)
+    const ownerAuthorized = context?.ownerAuthorized === true
+    return this.withThreadGoalMutation(intent.threadId as string, async (_rpc, assertAllowed) =>
+      this.mutateGoalUnderLease(method, intent, ownerAuthorized, this.goalMutationsByThreadId.get(intent.threadId as string)!, assertAllowed))
+  }
+
+  private async mutateGoalUnderLease(method: string, intent: Readonly<Record<string, unknown>>, ownerAuthorized: boolean,
+    lease: object, assertLeaseAllowed: () => void): Promise<unknown> {
+    const fail = (status: number, message: string): never => { throw Object.assign(new Error(message), { goalPolicyStatus: status }) }
+    const threadId = intent.threadId as string
+    const generation = this.process!
+    const assertAllowed = (): void => {
+      assertLeaseAllowed()
+      if (this.goalMutationsByThreadId.get(threadId) !== lease || this.process !== generation
+        || [...this.pending.values()].some(request => ['thread/resume', 'thread/start', 'turn/start', 'thread/rollback'].includes(request.method))) {
+        throw new Error('Writer ownership is busy; no Goal mutation was sent.')
+      }
+    }
+    assertAllowed()
+    const explicitBudget = Object.prototype.hasOwnProperty.call(intent, 'tokenBudget')
+    // Only the typed in-process middleware context can authorize budget writes.
+    const allowed = method === 'thread/goal/set' ? ['threadId', 'objective', 'status', 'tokenBudget', 'ownerConfirmed'] : ['threadId', 'ownerConfirmed']
+    if (Object.keys(intent).some(key => !allowed.includes(key))) return fail(explicitBudget && !ownerAuthorized ? 403 : 400, 'Unknown or unauthorized Goal mutation fields')
+    const objectivePresent = Object.prototype.hasOwnProperty.call(intent, 'objective')
+    const objective = typeof intent.objective === 'string' ? intent.objective.trim() : ''
+    if (objectivePresent && !objective) return fail(400, 'A nonempty objective is required to create or replace a Goal')
+    const statuses = ['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']
+    if (Object.prototype.hasOwnProperty.call(intent, 'status') && (typeof intent.status !== 'string' || !statuses.includes(intent.status))) return fail(400, 'Invalid Goal status')
+    const sqliteHome = this.activeSQLiteHome
+    const lastTurnStart = () => this.getStreamEvents(threadId, STREAM_EVENT_BUFFER_LIMIT).filter(event => event.method === 'turn/started').at(-1)
+    const turnStartBefore = lastTurnStart()
+    await assertThreadProjectionIntegrity(getCodexHomeDir(), threadId, sqliteHome)
+    assertAllowed()
+    if (this.activeSQLiteHome !== sqliteHome) throw new Error('SQLite home changed while verifying history; no Goal mutation was sent.')
     await this.ensureInitialized()
-    return this.call(method, params)
+    assertAllowed()
+    if (this.confirmedSQLiteHome !== sqliteHome) {
+      const config = asRecord(asRecord(await this.call('config/read', { includeLayers: false }, generation))?.config)
+      assertAllowed()
+      const effective = readNonEmptyString(config?.sqlite_home)
+      if (!effective || resolve(effective) !== sqliteHome) throw new Error('Cannot verify effective SQLite home; active writer preserved.')
+      this.confirmedSQLiteHome = sqliteHome
+    }
+    const nonnegativeFinite = (value: unknown): boolean => typeof value === 'number' && Number.isFinite(value) && value >= 0
+    const validGoal = (goal: Record<string, unknown>): boolean => goal.threadId === threadId
+      && typeof goal.objective === 'string' && !!goal.objective.trim() && typeof goal.status === 'string' && statuses.includes(goal.status)
+      && typeof goal.tokensUsed === 'number' && Number.isSafeInteger(goal.tokensUsed) && goal.tokensUsed >= 0
+      && nonnegativeFinite(goal.timeUsedSeconds) && nonnegativeFinite(goal.createdAt) && nonnegativeFinite(goal.updatedAt)
+      && (goal.tokenBudget === null || (typeof goal.tokenBudget === 'number' && Number.isSafeInteger(goal.tokenBudget) && goal.tokenBudget > 0))
+    let before: Record<string, unknown> | null = null
+    let nativeParams: Readonly<Record<string, unknown>> = Object.freeze({ threadId })
+    let expectedStatus: unknown
+    let expectedObjective: unknown
+    {
+      const response = asRecord(await this.call('thread/goal/get', { threadId }, generation))
+      assertAllowed()
+      const current = asRecord(response?.goal)
+      if (!response || !Object.prototype.hasOwnProperty.call(response, 'goal') || (response.goal !== null && (!current || !validGoal(current)))) return fail(502, 'Invalid Goal identity, metadata, or accounting; no mutation was sent')
+      before = current ? Object.freeze({ ...current }) : null
+    }
+    if (method === 'thread/goal/set') {
+      if (explicitBudget && !ownerAuthorized) return fail(403, 'Owner authorization is required to adjust a goal budget')
+    if (explicitBudget && (typeof intent.tokenBudget !== 'number' || !Number.isSafeInteger(intent.tokenBudget) || intent.tokenBudget <= 0)) return fail(400, 'tokenBudget must be an explicit finite positive safe integer')
+    if (explicitBudget && intent.ownerConfirmed !== true) return fail(400, 'Explicit owner confirmation is required to set a goal budget')
+      if (!before && (!explicitBudget || !ownerAuthorized || !objective)) return fail(400, 'A new Goal requires an owner-confirmed finite token budget and a nonempty objective')
+      expectedObjective = objectivePresent ? objective : before?.objective
+      expectedStatus = intent.status ?? before?.status ?? 'active'
+      if (!explicitBudget && expectedStatus === 'active' && before?.tokenBudget === null) return fail(400, 'Rearming a Goal requires an owner-confirmed finite token budget')
+      if (explicitBudget && (intent.tokenBudget as number) <= (before?.tokensUsed as number ?? 0)) return fail(400, 'tokenBudget must be greater than tokensUsed')
+      const { ownerConfirmed: _confirmation, ...capturedNative } = intent
+      const native: Record<string, unknown> = { ...capturedNative }
+      if (objectivePresent) native.objective = objective
+      // An unchanged objective in the active editor pause is a status-only write.
+      if (!explicitBudget && intent.status === 'paused' && objectivePresent && objective === before?.objective) delete native.objective
+      nativeParams = Object.freeze(native)
+    }
+    const activePause = method === 'thread/goal/set' && !!before && !explicitBudget && intent.status === 'paused'
+      && (!objectivePresent || objective === before.objective)
+    const idleRead = asRecord(await this.call('thread/read', { threadId, includeTurns: false }, generation))
+    assertAllowed()
+    const thread = asRecord(idleRead?.thread)
+    const threadStatus = asRecord(thread?.status)?.type
+    const activeWriterPause = activePause && (threadStatus === 'active' || threadStatus === 'inProgress')
+    if (thread?.id !== threadId || (threadStatus !== 'idle' && !activeWriterPause)
+      || lastTurnStart() !== turnStartBefore) throw new Error('Thread mutation requires an idle owned writer; no mutation was sent.')
+    const permit = Object.freeze({})
+    this.goalWritePermits.set(permit, { method, params: nativeParams, generation, lease, assertAllowed })
+    let result: unknown
+    const submission = this.activityRecorder?.beforeRpc(method, nativeParams) ?? Promise.resolve(null)
+    try {
+      assertAllowed()
+      if (lastTurnStart() !== turnStartBefore) throw new Error('Thread activity changed during Goal recording; no mutation was sent.')
+      result = await this.call(method, nativeParams, generation, lease, permit)
+      void submission.then(id => this.process === generation ? this.activityRecorder?.afterRpc(method, nativeParams, result, id) : undefined).catch(() => {})
+    } catch (failure) {
+      void submission.then(id => this.activityRecorder?.rpcFailed(nativeParams, id, failure)).catch(() => {})
+      throw failure
+    }
+    finally { this.goalWritePermits.delete(permit) }
+    assertAllowed()
+    const afterResponse = asRecord(await this.call('thread/goal/get', { threadId }, generation))
+    assertAllowed()
+    if (method === 'thread/goal/clear') {
+      if (!afterResponse || !Object.prototype.hasOwnProperty.call(afterResponse, 'goal') || afterResponse.goal !== null) return fail(502, 'Goal clear failed post-write verification; no retry or repair was sent')
+      return result
+    }
+    const after = asRecord(afterResponse?.goal)
+    const cap = explicitBudget ? intent.tokenBudget : before?.tokenBudget
+    const exhaustedNormalization = !explicitBudget && expectedStatus === 'active' && typeof cap === 'number' && cap <= (before?.tokensUsed as number) && after?.status === 'budgetLimited'
+    // A status-only active pause can overlap the existing turn's native usage
+    // flush. Preserve nondecreasing accounting only for that narrow exception;
+    // idle edits/creation/budget writes still require exact accounting equality.
+    const accountingPreserved = activeWriterPause && before && after
+      ? typeof after.tokensUsed === 'number' && after.tokensUsed >= (before.tokensUsed as number)
+        && typeof after.timeUsedSeconds === 'number' && after.timeUsedSeconds >= (before.timeUsedSeconds as number)
+      : after?.tokensUsed === (before?.tokensUsed ?? 0) && after?.timeUsedSeconds === (before?.timeUsedSeconds ?? 0)
+    if (!after || !validGoal(after) || (after.status !== expectedStatus && !exhaustedNormalization)
+      || after.objective !== expectedObjective || after.tokenBudget !== cap
+      || !accountingPreserved
+      || (before && after.createdAt !== before.createdAt)) return fail(502, 'Goal update failed post-write verification; no retry or repair was sent')
+    if (explicitBudget) {
+      await appendGoalBudgetAuditRecord(getCodexHomeDir(), {
+        event: 'goal_budget_adjusted', atIso: new Date().toISOString(), threadId, actor: 'owner', source: 'codex-web',
+        previousStatus: typeof before?.status === 'string' ? before.status : '',
+        previousTotalBudget: typeof before?.tokenBudget === 'number' ? before.tokenBudget : null,
+        previousTokensUsed: before?.tokensUsed as number ?? 0, requestedTotalBudget: intent.tokenBudget as number,
+        resultingStatus: after.status as string, resultingTotalBudget: after.tokenBudget as number, resultingTokensUsed: after.tokensUsed as number,
+      })
+      assertAllowed()
+    }
+    return result
+  }
+
+  async withThreadGoalMutation<T>(threadId: string, mutate: (rpc: (method: string, params: unknown) => Promise<unknown>, assertAllowed: () => void) => Promise<T>): Promise<T> {
+    if (!threadId || threadId !== threadId.trim() || this.goalMutationsByThreadId.has(threadId)) throw new Error('Goal mutation is busy; no competing mutation was sent.')
+    const generation = this.process
+    const lease = {}
+    const assertAllowed = (): void => {
+      this.disposeIfConfigChanged()
+      if (!generation || this.process !== generation || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId)
+        || this.configChangeDeferred || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size
+        || this.goalMutationsByThreadId.get(threadId) !== lease) throw new Error('Goal mutation requires current proven writer ownership; no mutation was sent.')
+    }
+    this.goalMutationsByThreadId.set(threadId, lease)
+    let pendingOperation: Promise<unknown> | null = null
+    try {
+      assertAllowed()
+      let operationPending = false
+      const rpc = async (method: string, params: unknown): Promise<unknown> => {
+        if (!['thread/goal/get', 'thread/goal/set', 'thread/goal/clear'].includes(method) || asRecord(params)?.threadId !== threadId) throw new Error('Goal lease target mismatch')
+        assertAllowed()
+        if (operationPending) throw new Error('Goal mutation is busy; no concurrent scoped operation was sent.')
+        operationPending = true
+        try {
+          const intent = Object.freeze({ ...(asRecord(params) ?? {}) })
+          pendingOperation = ['thread/goal/set', 'thread/goal/clear'].includes(method)
+            ? this.mutateGoalUnderLease(method, this.captureGoalIntent(method, intent), false, lease, assertAllowed)
+            : this.rpcInner(method, intent, lease)
+          const result = await pendingOperation
+          assertAllowed()
+          return result
+        } finally { operationPending = false }
+      }
+      const result = await mutate(rpc, assertAllowed)
+      await pendingOperation
+      assertAllowed()
+      return result
+    } finally {
+      // A callback returning/throwing is not transport cancellation. Drain the bounded RPC
+      // before release so another mutation cannot enter during native write/post-read.
+      try { await (pendingOperation as Promise<unknown> | null)?.catch(() => {}) }
+      finally { if (this.goalMutationsByThreadId.get(threadId) === lease) this.goalMutationsByThreadId.delete(threadId) }
+    }
+  }
+
+  private resumeInitialTurnsPage(input: unknown): Record<string, unknown> | null {
+    const page = asRecord(input)
+    if (!page) return null
+    // Pinned V2 initial pages have no identity or cursor. Never spread caller
+    // fields into a read target, even when the transport ignores unknown fields.
+    return {
+      limit: Math.min(THREAD_RESPONSE_TURN_LIMIT, Math.max(1, Number(page.limit) || THREAD_RESPONSE_TURN_LIMIT)),
+      ...(page.sortDirection !== undefined ? { sortDirection: page.sortDirection } : {}),
+      ...(page.itemsView !== undefined ? { itemsView: page.itemsView } : {}),
+    }
+  }
+
+  private async rpcInner(method: string, params: unknown, goalLease?: object, captureHistoryDispatch?: (generation: ChildProcessWithoutNullStreams, epoch: number) => void): Promise<unknown> {
+    if (this.process && this.timedOutRpcIds.size) throw new Error('Codex still has an unresolved timed-out operation; no retry was sent and active writers were preserved.')
+    const record = params && typeof params === 'object' ? params as Record<string, unknown> : null
+    const threadId = typeof record?.threadId === 'string' ? record.threadId.trim() : ''
+    const permissionProcess = this.process
+    const hotPermissionProcess = method === 'thread/resume' && this.writerThreadIds.has(threadId) ? this.process : null
+    let permissionEpoch = this.permissionEpochByThreadId.get(threadId) ?? 0
+    const permissionOrder = ['thread/start', 'thread/resume', 'turn/start', 'thread/settings/update'].includes(method) ? this.nextPermissionOrder++ : 0
+    const assertHotPermissionOwnership = (): void => {
+      if (hotPermissionProcess && (this.process !== hotPermissionProcess
+        || (this.permissionEpochByThreadId.get(threadId) ?? 0) !== permissionEpoch
+        || !this.writerThreadIds.has(threadId))) {
+        throw new Error('Hot permission writer changed while reading; no permission choice was staged.')
+      }
+    }
+    const goalMutation = ['thread/goal/set', 'thread/goal/clear'].includes(method)
+    if (goalMutation) return this.mutateGoal(method, params)
+    if (this.goalMutationsByThreadId.has(threadId) && !goalLease && ['turn/start', 'thread/resume', 'thread/rollback', 'thread/archive', 'thread/unsubscribe'].includes(method)) throw new Error('Goal mutation is busy; no competing mutation was sent.')
+    const directMutation = ['thread/goal/set', 'thread/goal/clear', 'turn/interrupt', 'thread/rollback'].includes(method)
+    const mutationProcess = this.process
+    const assertDirectMutationOwnership = (): void => {
+      if (!directMutation) return
+      if (!threadId || record?.threadId !== threadId || !mutationProcess || this.process !== mutationProcess
+        || !this.joinedThreads.has(threadId) || !this.writerThreadIds.has(threadId)) {
+        throw new Error('Thread mutation requires proven writer ownership; no mutation or acquisition was sent.')
+      }
+      this.disposeIfConfigChanged()
+      if (method !== 'turn/interrupt' && this.configChangeDeferred) throw new Error('App-server configuration change is deferred until writer shutdown is confirmed; no mutation was sent.')
+      if (method !== 'turn/interrupt' && [...this.pending.values()].some(request => ['thread/resume', 'thread/start', 'turn/start', 'thread/rollback'].includes(request.method))) {
+        throw new Error('Writer ownership is busy; no mutation was sent.')
+      }
+    }
+    assertDirectMutationOwnership()
+    this.disposeIfConfigChanged()
+    const preparedConfig = this.process ? undefined : this.buildAppServerConfig()
+    const inspectedSQLiteHome = this.process ? this.activeSQLiteHome : preparedConfig?.sqliteHome
+    if (threadId && (directMutation || method === 'thread/resume' || method === 'thread/read' || method === 'thread/turns/list' || method === 'thread/items/list' || method === 'turn/start')) {
+      await assertThreadProjectionIntegrity(getCodexHomeDir(), threadId, inspectedSQLiteHome)
+    }
+    assertDirectMutationOwnership()
+    assertHotPermissionOwnership()
+    if (this.process && this.activeSQLiteHome !== inspectedSQLiteHome) throw new Error('SQLite home changed while verifying history; retry the bounded read. No mutation was sent.')
+    const safeWhileDeferred = new Set(['thread/read', 'thread/turns/list', 'thread/items/list', 'thread/list', 'thread/loaded/list', 'config/read', 'turn/interrupt', 'thread/unsubscribe'])
+    if (this.configChangeDeferred && !safeWhileDeferred.has(method) && method !== 'thread/resume') {
+      throw new Error('App-server configuration change is deferred until attached writers are explicitly released; no mutation was sent.')
+    }
+    if (this.configChangeDeferred && method === 'thread/resume' && !this.writerThreadIds.has(threadId)) {
+      throw new Error('App-server configuration change is deferred until attached writers are explicitly released; no acquisition was sent.')
+    }
+    if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'thread/items/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
+    this.start(preparedConfig)
+    const rpcProcess = this.process!
+    // start resets permission epochs for its new child. Never inherit a retired
+    // generation's closure epoch, or rebase a closure within the same child.
+    if (rpcProcess !== permissionProcess) permissionEpoch = this.permissionEpochByThreadId.get(threadId) ?? 0
+    await this.ensureInitialized()
+    if (this.process !== rpcProcess || !this.initialized) throw new Error('codex app-server changed during RPC initialization; retry the request')
+    assertHotPermissionOwnership()
+    assertDirectMutationOwnership()
+    if (threadId && (directMutation || ['thread/resume', 'thread/read', 'thread/turns/list', 'thread/items/list', 'turn/start', 'thread/rollback'].includes(method))) {
+      if (this.confirmedSQLiteHome !== this.activeSQLiteHome) {
+        if (!this.sqliteHomeVerificationPromise) {
+          this.sqliteHomeVerificationPromise = this.call('config/read', { includeLayers: false }, rpcProcess).then(payload => {
+            const effective = readNonEmptyString(asRecord(asRecord(payload)?.config)?.sqlite_home)
+            if (!effective || resolve(effective) !== this.activeSQLiteHome) throw new Error('Cannot verify effective SQLite home: config/requirements differs from inspected directory; active writer preserved.')
+            this.confirmedSQLiteHome = this.activeSQLiteHome
+          }).finally(() => { this.sqliteHomeVerificationPromise = null })
+        }
+        await this.sqliteHomeVerificationPromise
+      }
+    }
+    assertHotPermissionOwnership()
+    if (['turn/start', 'thread/settings/update'].includes(method) && [...this.pendingPermissionSettingsById.values()].some(request => request.threadId === threadId)) {
+      throw new Error('Thread permission settings are pending application; wait for the applied event or explicit rejection. No dependent mutation was sent.')
+    }
+    // The connection already observes this writer. A hot resume cannot apply overrides and
+    // unnecessarily runs another persistence/listener barrier in Codex's serial RPC handler.
+    // Use the supported bounded read APIs without releasing subscriptions or active writers.
+    if (method === 'thread/resume' && threadId && this.writerThreadIds.has(threadId)) {
+      if (record?.excludeTurns !== true) throw new Error('Loaded thread history requires bounded pagination; active writer preserved.')
+      const pendingPermissions = prepareAppServerHotPermissionOverrides(params)
+      const summary = asRecord(await this.call('thread/read', { threadId, includeTurns: false }, rpcProcess))
+      assertHotPermissionOwnership()
+      const thread = asRecord(summary?.thread)
+      if (!thread) throw new Error('Thread metadata was not returned; active writer preserved.')
+      const previous = asRecord(this.joinedThreads.get(threadId)) ?? this.writerMetadataByThreadId.get(threadId)
+      const pageParams = this.resumeInitialTurnsPage(record?.initialTurnsPage)
+      let initialTurnsPage: unknown
+      if (pageParams) {
+        // Reinspect the exact final target at the page boundary after the summary
+        // await; the earlier resume preflight cannot cover a later projection.
+        await assertThreadProjectionIntegrity(getCodexHomeDir(), threadId, inspectedSQLiteHome)
+        assertHotPermissionOwnership()
+        if (this.activeSQLiteHome !== inspectedSQLiteHome) throw new Error('SQLite home changed before bounded page read; active writer preserved.')
+        initialTurnsPage = await this.call('thread/turns/list', { ...pageParams, threadId }, rpcProcess)
+      }
+      assertHotPermissionOwnership()
+      this.stageHotPermissionOverrides(threadId, pendingPermissions, permissionOrder)
+      return {
+        ...previous,
+        thread: { ...thread, turns: [] },
+        model: readNonEmptyString(previous?.model) || readNonEmptyString(thread.model),
+        modelProvider: readNonEmptyString(previous?.modelProvider),
+        initialTurnsPage,
+      }
+    }
+    const page = method === 'thread/resume' ? this.resumeInitialTurnsPage(record?.initialTurnsPage) : null
+    let boundedParams = page ? { ...record, initialTurnsPage: page } : params
+    const pendingHotPermissions = method === 'turn/start' ? this.pendingHotPermissionsByThreadId.get(threadId) : undefined
+    const permissionParams = pendingHotPermissions ? mergeAppServerHotPermissionOverrides(pendingHotPermissions, record!) : boundedParams
+    boundedParams = applyAppServerPermissionDefaults(method, permissionParams,
+      method === 'turn/start' ? this.permissionIntentByThreadId.get(threadId) : undefined,
+      this.activePermissionDefaults,
+      method === 'turn/start' && threadId ? (asRecord(this.joinedThreads.get(threadId)) ?? this.writerMetadataByThreadId.get(threadId))?.sandbox : undefined)
+    if (directMutation && method !== 'turn/interrupt') {
+      assertDirectMutationOwnership()
+      const lastTurnStart = () => this.getStreamEvents(threadId, STREAM_EVENT_BUFFER_LIMIT).filter(event => event.method === 'turn/started').at(-1)
+      const turnStartBeforeRead = lastTurnStart()
+      const idleRead = asRecord(await this.call('thread/read', { threadId, includeTurns: false }, rpcProcess))
+      const thread = asRecord(idleRead?.thread)
+      if (thread?.id !== threadId || asRecord(thread?.status)?.type !== 'idle' || lastTurnStart() !== turnStartBeforeRead) {
+        throw new Error('Thread mutation requires an idle owned writer; no mutation was sent.')
+      }
+    }
+    assertDirectMutationOwnership()
+    const callerPermissionIntent = readAppServerPermissionIntent(method, params)
+    const stagedPermissionOrder = this.hotPermissionOrderByThreadId.get(threadId)
+    const permissionRequest = ['thread/start', 'thread/resume', 'turn/start', 'thread/settings/update'].includes(method)
+      ? { threadId, intent: readAppServerPermissionIntent(method, permissionParams), generation: rpcProcess, epoch: permissionEpoch, order: permissionOrder, pendingHotPermissions,
+        // Inherited fields keep the order of the original choice, not this turn's dispatch.
+        dimensionOrder: { approvalPolicy: callerPermissionIntent.approvalPolicy ? permissionOrder : stagedPermissionOrder?.approvalPolicy ?? permissionOrder, sandbox: callerPermissionIntent.sandbox ? permissionOrder : stagedPermissionOrder?.sandbox ?? permissionOrder },
+        settings: method === 'thread/settings/update' ? JSON.parse(JSON.stringify(permissionParams)) as AppServerTurnPermissionOverrides : undefined } : undefined
+    const submission = this.activityRecorder?.beforeRpc(method, boundedParams) ?? Promise.resolve(null)
+    let result: unknown
+    try {
+      assertDirectMutationOwnership()
+      assertHotPermissionOwnership()
+      if (threadId && ['turn/start', 'turn/interrupt', 'thread/settings/update', 'thread/rollback'].includes(method)
+        && (this.permissionEpochByThreadId.get(threadId) ?? 0) !== permissionEpoch) {
+        throw new Error('Thread closed during activity recording; no delayed mutation was sent.')
+      }
+      captureHistoryDispatch?.(rpcProcess, permissionEpoch)
+      result = await this.call(method, boundedParams, rpcProcess, goalLease, undefined, permissionRequest)
+      void submission.then(id => this.process === rpcProcess && (this.permissionEpochByThreadId.get(threadId) ?? 0) === permissionEpoch ? this.activityRecorder?.afterRpc(method, boundedParams, result, id) : undefined).catch(() => {})
+    } catch (failure) {
+      void submission.then(id => this.activityRecorder?.rpcFailed(boundedParams, id, failure)).catch(() => {})
+      throw failure
+    }
+    if (this.process !== rpcProcess) throw new Error('codex app-server changed while completing RPC; retry the request')
+    if (permissionRequest?.threadId && (this.permissionEpochByThreadId.get(permissionRequest.threadId) ?? 0) !== permissionRequest.epoch) {
+      throw new Error('Thread closed while completing permission RPC; no permission choice was retained.')
+    }
+    if (method === 'thread/resume' || method === 'thread/start') {
+      const resultThreadId = readNonEmptyString(asRecord(asRecord(result)?.thread)?.id)
+      // handleLine is the only acquisition writer. A same-chunk close/generation change
+      // must not be undone by a second post-await metadata/ownership write.
+      if (resultThreadId && (permissionRequest?.threadId !== resultThreadId || !this.joinedThreads.has(resultThreadId) || !this.writerThreadIds.has(resultThreadId))) {
+        throw new Error('Thread acquisition closed before completion; no writer ownership was retained.')
+      }
+    } else if (method === 'thread/unsubscribe' || method === 'thread/archive') {
+      this.joinedThreads.delete(threadId)
+    }
+    return result
   }
 
   onNotification(listener: (value: { method: string; params: unknown }) => void): () => void {
@@ -6442,8 +7530,34 @@ class AppServerProcess {
     return Array.from(this.pendingServerRequests.values())
   }
 
+  async withThreadQueueMutation<T>(threadIds: string[], mutate: () => Promise<T>): Promise<T> {
+    if (threadIds.some(id => !this.process || !this.joinedThreads.has(id))) throw new Error('Queue changes require proven writer ownership; read-only queues were preserved.')
+    if (this.configChangeDeferred || this.pending.size || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size) throw new Error('Writer ownership is busy or configuration change is deferred; queues were preserved.')
+    for (const id of threadIds) this.fileMutationsByThreadId.add(id)
+    try { return await mutate() } finally { for (const id of threadIds) this.fileMutationsByThreadId.delete(id) }
+  }
+
+  async withThreadFileMutation<T>(threadId: string, mutate: (assertMutationAllowed: (threadReadResult?: unknown) => void) => Promise<T>): Promise<T> {
+    if (!this.process || !this.joinedThreads.has(threadId)) throw new Error('Thread file changes require proven writer ownership; no files were changed.')
+    if (this.pending.size || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size) throw new Error('Writer ownership is busy or uncertain; no files were changed.')
+    const mutationProcess = this.process
+    this.fileMutationsByThreadId.add(threadId)
+    try {
+      const result = asRecord(await this.rpc('thread/read', { threadId, includeTurns: false }))
+      const assertMutationAllowed = (threadReadResult: unknown = result): void => {
+        const status = asRecord(asRecord(asRecord(threadReadResult)?.thread)?.status)
+        if (this.process !== mutationProcess || !this.joinedThreads.has(threadId) || status?.type !== 'idle') throw new Error('Writer ownership is not idle; no files were changed.')
+        if (this.configChangeDeferred) throw new Error('App-server configuration change is deferred until writer shutdown is confirmed; no files were changed.')
+        if (this.pending.size || this.timedOutRpcIds.size || !this.fileMutationsByThreadId.has(threadId) || this.fileMutationsByThreadId.size !== 1) throw new Error('Writer ownership is busy or uncertain; no files were changed.')
+      }
+      assertMutationAllowed()
+      return await mutate(assertMutationAllowed)
+    } finally { this.fileMutationsByThreadId.delete(threadId) }
+  }
+
   dispose(): void {
     if (!this.process) return
+    if (this.writerThreadIds.size || this.joinedThreads.size || this.timedOutRpcIds.size || this.fileMutationsByThreadId.size || [...this.pending.values()].some(request => ['thread/resume', 'thread/start', 'turn/start', 'thread/rollback'].includes(request.method))) return
 
     const proc = this.process
     this.stopping = true
@@ -6459,6 +7573,10 @@ class AppServerProcess {
     }
     this.pending.clear()
     this.pendingServerRequests.clear()
+    this.permissionRequestsById.clear()
+    this.pendingPermissionSettingsById.clear()
+    this.possiblePermissionChangesById.clear()
+    this.effectivePermissionSettingsByThreadId.clear()
 
     try {
       proc.stdin.end()
@@ -6562,7 +7680,10 @@ export class BackendQueueProcessor {
         if (await this.hasQueuedTurns(threadId)) {
           this.scheduleThreadQueueDrain(threadId)
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof TurnProviderMismatchError) {
+          console.warn('[codex] queued turn provider mismatch:', error.message)
+        }
         await this.restoreQueuedTurn(next)
         this.scheduleThreadQueueDrain(threadId)
       }
@@ -6624,44 +7745,7 @@ export class BackendQueueProcessor {
     })
   }
 
-  private async resolveCollaborationModeSettings(mode: CollaborationModeKind): Promise<ResolvedCollaborationModeSettings> {
-    let currentConfig: Record<string, unknown> | null = null
-    try {
-      const configPayload = asRecord(await this.appServer.rpc('config/read', {}))
-      currentConfig = asRecord(configPayload?.config)
-    } catch {
-      currentConfig = null
-    }
-
-    const configuredModel = readNonEmptyString(currentConfig?.model)
-    if (configuredModel) {
-      return {
-        model: configuredModel,
-        reasoningEffort: normalizeCollaborationModeReasoningEffort(normalizeReasoningEffort(currentConfig?.model_reasoning_effort)),
-      }
-    }
-
-    try {
-      const modelsPayload = asRecord(await this.appServer.rpc('model/list', {}))
-      const models = Array.isArray(modelsPayload?.data) ? modelsPayload.data : []
-      for (const row of models) {
-        const record = asRecord(row)
-        const candidate = readNonEmptyString(record?.id) || readNonEmptyString(record?.model)
-        if (candidate) {
-          return {
-            model: candidate,
-            reasoningEffort: normalizeCollaborationModeReasoningEffort(normalizeReasoningEffort(currentConfig?.model_reasoning_effort)),
-          }
-        }
-      }
-    } catch {
-      // Fall through to no collaboration-mode payload.
-    }
-
-    throw new Error(`${mode === 'plan' ? 'Plan' : 'Default'} mode requires an available model.`)
-  }
-
-  private async buildQueuedTurnParams(turn: BackendQueuedTurn): Promise<Record<string, unknown>> {
+  private buildQueuedTurnParams(turn: BackendQueuedTurn, settings: CurrentTurnRoutingSettings): Record<string, unknown> {
     const localImageAttachments: StoredQueuedMessage['fileAttachments'] = []
     for (const imageUrl of turn.message.imageUrls) {
       const localImagePath = extractLocalImagePathFromUrl(imageUrl.trim())
@@ -6700,31 +7784,33 @@ export class BackendQueueProcessor {
     const params: Record<string, unknown> = {
       threadId: turn.threadId,
       input,
-    }
-    if (dedupedFileAttachments.length > 0) {
-      params.attachments = dedupedFileAttachments.map((f) => ({ label: f.label, path: f.path, fsPath: f.fsPath }))
-    }
-
-    try {
-      const settings = await this.resolveCollaborationModeSettings(turn.message.collaborationMode)
-      params.collaborationMode = {
+      model: settings.model,
+      collaborationMode: {
         mode: turn.message.collaborationMode,
         settings: {
           model: settings.model,
           reasoning_effort: settings.reasoningEffort,
           developer_instructions: null,
         },
-      }
-    } catch {
-      // Older app-server versions still accept a plain turn/start without collaborationMode.
+      },
+    }
+    if (dedupedFileAttachments.length > 0) {
+      params.attachments = dedupedFileAttachments.map((f) => ({ label: f.label, path: f.path, fsPath: f.fsPath }))
     }
 
     return params
   }
 
   private async startQueuedTurn(turn: BackendQueuedTurn): Promise<void> {
-    await this.appServer.rpc('thread/resume', { threadId: turn.threadId })
-    await this.appServer.rpc('turn/start', await this.buildQueuedTurnParams(turn))
+    const settings = await resolveCurrentTurnRoutingSettings(this.appServer)
+    const resumed = await this.appServer.rpc('thread/resume', {
+      threadId: turn.threadId,
+      modelProvider: settings.modelProvider,
+      model: settings.model,
+      excludeTurns: true,
+    })
+    assertResumedTurnProvider(resumed, turn.threadId, settings.modelProvider)
+    await this.appServer.rpc('turn/start', this.buildQueuedTurnParams(turn, settings))
   }
 }
 
@@ -6841,8 +7927,12 @@ class MethodCatalog {
   }
 }
 
+export type CodexBridgeOptions = {
+  isOwnerAuthorized?: (req: IncomingMessage) => boolean
+}
+
 type CodexBridgeMiddleware = ((req: IncomingMessage, res: ServerResponse, next: () => void) => Promise<void>) & {
-  dispose: () => void
+  dispose: () => Promise<void>
   subscribeNotifications: (listener: (value: { method: string; params: unknown; atIso: string }) => void) => () => void
 }
 
@@ -6853,6 +7943,8 @@ type SharedBridgeState = {
   methodCatalog: MethodCatalog
   telegramBridge: TelegramThreadBridge
   backendQueueProcessor: BackendQueueProcessor
+  activityStore: ActivityStore
+  activityRecorder: ActivityRecorder
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
@@ -6866,6 +7958,13 @@ function getSharedBridgeState(): SharedBridgeState {
   const existing = globalScope[SHARED_BRIDGE_KEY]
   if (existing) {
     if (existing.version === SHARED_BRIDGE_VERSION && existing.terminalManager) {
+      // Telemetry is additive: preserve the current shared writer and attach only once.
+      if (!existing.activityStore || !existing.activityRecorder) {
+        existing.activityStore = new ActivityStore(join(getCodexHomeDir(), 'web-activity-v1'))
+        existing.activityRecorder = new ActivityRecorder(existing.activityStore)
+        existing.appServer.setActivityRecorder?.(existing.activityRecorder)
+      }
+      recordQueueActivity = (previous, next) => existing.activityRecorder.recordQueue(previous, next)
       return existing
     }
     existing.appServer.dispose()
@@ -6874,11 +7973,17 @@ function getSharedBridgeState(): SharedBridgeState {
   }
 
   const appServer = new AppServerProcess()
+  const activityStore = new ActivityStore(join(getCodexHomeDir(), 'web-activity-v1'))
+  const activityRecorder = new ActivityRecorder(activityStore)
+  appServer.setActivityRecorder(activityRecorder)
+  recordQueueActivity = (previous, next) => activityRecorder.recordQueue(previous, next)
   const terminalManager = new ThreadTerminalManager()
   const backendQueueProcessor = new BackendQueueProcessor(appServer)
   const created: SharedBridgeState = {
     version: SHARED_BRIDGE_VERSION,
     appServer,
+    activityStore,
+    activityRecorder,
     terminalManager,
     methodCatalog: new MethodCatalog(),
     backendQueueProcessor,
@@ -6968,8 +8073,8 @@ async function buildThreadSearchIndex(appServer: AppServerProcess): Promise<Thre
   return { docsById }
 }
 
-export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
-  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor } = getSharedBridgeState()
+export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): CodexBridgeMiddleware {
+  const { appServer, terminalManager, methodCatalog, telegramBridge, backendQueueProcessor, activityStore, activityRecorder } = getSharedBridgeState()
   let threadSearchIndex: ThreadSearchIndex | null = null
   let threadSearchIndexPromise: Promise<ThreadSearchIndex> | null = null
 
@@ -6992,6 +8097,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       if (!config.botToken) return
       telegramBridge.configureToken(config.botToken)
       telegramBridge.configureAllowedUserIds(config.allowedUserIds)
+      telegramBridge.configureNotificationChatIds(config.notificationChatIds)
       telegramBridge.start()
     })
     .catch(() => {})
@@ -7078,6 +8184,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         return
       }
 
+      if (url.pathname === '/codex-api/custom-proxy/v1/models' && req.method === 'GET') {
+        const statePath = join(getCodexHomeDir(), FREE_MODE_STATE_FILE)
+        let bearerToken = ''
+        let baseUrl = ''
+        try {
+          const state = ensureDefaultFreeModeStateForMissingAuthSync(statePath)
+          bearerToken = state?.apiKey ?? ''
+          baseUrl = state?.customBaseUrl ?? ''
+        } catch { /* use empty */ }
+        handleCustomEndpointModelsRequest(req, res, { baseUrl, bearerToken })
+        return
+      }
+
       if (url.pathname === '/codex-api/custom-proxy/v1/responses' && req.method === 'POST') {
         const statePath = join(getCodexHomeDir(), FREE_MODE_STATE_FILE)
         let bearerToken = ''
@@ -7147,6 +8266,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 apiKey: null,
                 model: FREE_MODE_DEFAULT_MODEL,
                 wireApi: prev.wireApi === 'chat' ? 'chat' : 'responses',
+                provider: 'codex',
                 providerKeys: prevKeys,
               }
               await writeFreeModeStateFile(statePath, state)
@@ -7165,10 +8285,18 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             const maskedKey = state.apiKey && state.customKey
               ? state.apiKey.substring(0, 12) + '...' + state.apiKey.substring(state.apiKey.length - 4)
               : null
+            const configuredProvider = readExplicitCodexModelProviderConfigSync()
+            const activeProvider = state.provider === 'codex'
+              ? 'codex'
+              : state.enabled
+                ? (state.provider ?? 'openrouter')
+                : state.provider === NINEROUTER_PROVIDER_ID || configuredProvider === NINEROUTER_PROVIDER_ID
+                  ? NINEROUTER_PROVIDER_ID
+                  : 'codex'
             let models = getCachedFreeModels()
             let currentModel = state.enabled ? state.model : null
             let wireApi = state.wireApi ?? null
-            if (state.provider === OPENCODE_ZEN_PROVIDER_ID) {
+            if (activeProvider === OPENCODE_ZEN_PROVIDER_ID) {
               currentModel = state.enabled ? (state.model?.trim() || OPENCODE_ZEN_DEFAULT_MODEL) : null
               try {
                 const zenModels = sortOpenCodeZenModelIds(await fetchOpenCodeZenModelIds(state.apiKey))
@@ -7191,6 +8319,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 ]
               }
               wireApi = 'responses'
+            } else if (activeProvider === NINEROUTER_PROVIDER_ID) {
+              wireApi = 'responses'
             } else {
               refreshFreeModelsInBackground()
             }
@@ -7202,7 +8332,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               currentModel,
               customKey: Boolean(state.customKey),
               maskedKey,
-              provider: state.provider ?? 'openrouter',
+              provider: activeProvider,
               customBaseUrl: state.customBaseUrl ?? null,
               wireApi,
             })
@@ -7273,11 +8403,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             const baseUrl = typeof body?.baseUrl === 'string' ? body.baseUrl.trim() : ''
             const apiKey = typeof body?.apiKey === 'string' ? body.apiKey.trim() : ''
             const wireApi = body?.wireApi === 'chat' ? 'chat' as const : 'responses' as const
-            const providerType = body?.provider === 'opencode-zen'
-              ? 'opencode-zen' as const
-              : body?.provider === 'openrouter'
-                ? 'openrouter' as const
-                : 'custom' as const
+            const providerType = body?.provider === NINEROUTER_PROVIDER_ID
+              ? 'ninerouter' as const
+              : body?.provider === 'opencode-zen'
+                ? 'opencode-zen' as const
+                : body?.provider === 'openrouter'
+                  ? 'openrouter' as const
+                  : 'custom' as const
             if (providerType === 'custom' && !baseUrl) {
               setJson(res, 400, { error: 'baseUrl is required' })
               return
@@ -7287,26 +8419,39 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             if (current.provider && current.apiKey) {
               prevKeys[current.provider] = current.apiKey
             }
-            const resolvedKey = apiKey || prevKeys[providerType] || ''
+            const resolvedKey = providerType === NINEROUTER_PROVIDER_ID
+              ? ''
+              : apiKey || prevKeys[providerType] || ''
             if (resolvedKey) {
               prevKeys[providerType] = resolvedKey
             }
-            const currentModel = (current.model ?? '').trim()
+            let currentModel = (current.model ?? '').trim()
+            if (!current.provider || current.provider === 'codex') {
+              try {
+                const configPayload = asRecord(await appServer.rpc('config/read', {}))
+                const config = asRecord(configPayload?.config)
+                currentModel = readNonEmptyString(config?.model) || currentModel
+              } catch {
+                // Keep the persisted model when the current app-server is unavailable.
+              }
+            }
             const resolvedModel = providerType === 'openrouter'
               ? (currentModel.includes('/') ? currentModel : FREE_MODE_DEFAULT_MODEL)
               : providerType === 'custom'
                 ? await fetchCustomEndpointDefaultModel(baseUrl, resolvedKey)
-                : OPENCODE_ZEN_DEFAULT_MODEL
+                : providerType === 'opencode-zen'
+                  ? OPENCODE_ZEN_DEFAULT_MODEL
+                  : currentModel
             const state: FreeModeState = {
               enabled: true,
-              apiKey: resolvedKey,
+              apiKey: providerType === NINEROUTER_PROVIDER_ID ? null : resolvedKey,
               model: resolvedModel,
               customKey: providerType === 'openrouter'
                 ? shouldMarkOpenRouterKeyAsCustom(current, apiKey)
-                : true,
+                : providerType === NINEROUTER_PROVIDER_ID ? false : true,
               provider: providerType,
               customBaseUrl: providerType === 'custom' ? baseUrl : undefined,
-              wireApi,
+              wireApi: providerType === NINEROUTER_PROVIDER_ID ? 'responses' : wireApi,
               providerKeys: prevKeys,
             }
             await writeFreeModeStateFile(statePath, state)
@@ -7458,6 +8603,18 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 	          return
 	        }
 
+	        if (body.method === 'thread/goal/set' || body.method === 'thread/goal/clear') {
+	          try {
+	            const result = await appServer.mutateGoal(body.method, body.params, { ownerAuthorized: options.isOwnerAuthorized?.(req) === true })
+	            setJson(res, 200, { result })
+	          } catch (error) {
+	            const status = asRecord(error)?.goalPolicyStatus
+	            if (typeof status !== 'number') throw error
+	            setJson(res, status, { error: getErrorMessage(error, 'Goal mutation failed') })
+	          }
+	          return
+	        }
+
 	        if (body.method === 'generate-thread-title') {
 	          setJson(res, 200, { result: { title: '' } })
 	          return
@@ -7508,7 +8665,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
           : trimmedResult
         const listMergedResult = body.method === 'thread/list'
-          ? mergeImportedThreadsIntoThreadListResult(errorMergedResult)
+          ? await mergeImportedThreadsIntoThreadListResult(errorMergedResult)
           : errorMergedResult
         const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, listMergedResult)
         const result = THREAD_METHODS_WITH_TURNS.has(body.method)
@@ -7531,59 +8688,22 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-turn-page') {
         try {
           const threadId = url.searchParams.get('threadId')?.trim() ?? ''
-          const beforeTurnId = url.searchParams.get('beforeTurnId')?.trim() ?? ''
+          const cursor = url.searchParams.get('cursor') ?? ''
           const limitRaw = url.searchParams.get('limit')?.trim() ?? String(THREAD_RESPONSE_TURN_LIMIT)
           const limit = Math.max(1, Math.min(50, Number.parseInt(limitRaw, 10) || THREAD_RESPONSE_TURN_LIMIT))
-          if (!threadId) {
-            setJson(res, 400, { error: 'Missing threadId' })
+          if (!threadId || !cursor) {
+            setJson(res, 400, { error: 'Missing threadId or cursor' })
             return
           }
-
-          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.readThreadForTurnPage(threadId))
-          const record = asRecord(threadReadResult)
-          const thread = asRecord(record?.thread)
-          if (!record || !thread) {
-            setJson(res, 502, { error: 'thread/read returned an invalid thread response' })
+          const result = await listThreadTurnsPage(appServer, threadId, cursor, limit)
+          const resultRecord = asRecord(result)
+          if (!resultRecord || !Array.isArray(resultRecord.data)) {
+            setJson(res, 502, { error: 'thread/turns/list returned an invalid page' })
             return
           }
-
-          const turns = Array.isArray(thread.turns) ? thread.turns : []
-          const beforeIndex = beforeTurnId
-            ? turns.findIndex((turn) => asRecord(turn)?.id === beforeTurnId)
-            : turns.length
-          if (beforeTurnId && beforeIndex < 0) {
-            setJson(res, 200, {
-              result: {
-                ...record,
-                thread: {
-                  ...thread,
-                  turns: [],
-                },
-              },
-              startTurnIndex: 0,
-              hasMoreOlder: false,
-            })
-            return
-          }
-
-          const endIndex = beforeIndex
-          const startIndex = Math.max(0, endIndex - limit)
-          const pageTurns = turns.slice(startIndex, endIndex)
-          const pagedResult = {
-            ...record,
-            thread: {
-              ...thread,
-              turns: pageTurns,
-            },
-          }
-          const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', pagedResult)
-          const result = await mergeSessionSkillInputsIntoThreadResult(sanitized)
-
-          setJson(res, 200, {
-            result,
-            startTurnIndex: startIndex,
-            hasMoreOlder: startIndex > 0,
-          })
+          const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/turns/list', result)
+          const transformed = await mergeSessionSkillInputsIntoThreadResult(sanitized)
+          setJson(res, 200, { result: transformed })
         } catch (error) {
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to load earlier thread messages') })
         }
@@ -7617,6 +8737,8 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
         return
       }
+
+      if (url.pathname.startsWith('/codex-api/thread-activity') && await handleActivityRoutes(req, res, url, activityStore, activityRecorder, appServer)) return
 
       if (req.method === 'GET' && url.pathname === '/codex-api/thread-stream-events') {
         const threadId = url.searchParams.get('threadId')?.trim() ?? ''
@@ -7754,6 +8876,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             return
           }
 
+          await appServer.withThreadFileMutation(threadId, async (assertMutationAllowed) => {
           const threadReadResult = await appServer.rpc('thread/read', { threadId, includeTurns: true })
           const record = asRecord(threadReadResult)
           const thread = asRecord(record?.thread)
@@ -7798,6 +8921,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             return
           }
 
+          // Callback history/session reads can outlive the original writer check.
+          // Revalidate synchronously after those awaits, immediately before project mutation.
+          assertMutationAllowed(threadReadResult)
           if (action === 'redo') {
             const result = await applyTurnFileChanges(cwd, turnInfos, patchIds)
             setJson(res, 200, { ...result, changed: result.applied, message: `Reapplied ${result.applied} file change(s)` })
@@ -7806,8 +8932,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
           const result = await revertTurnFileChanges(cwd, turnInfos, patchIds)
           setJson(res, 200, { ...result, changed: result.reverted, message: `Reverted ${result.reverted} file change(s)` })
+          })
         } catch (error) {
-          setJson(res, 500, { error: getErrorMessage(error, 'Failed to revert file changes') })
+          setJson(res, 409, { error: getErrorMessage(error, 'Failed to revert file changes') })
         }
         return
       }
@@ -7883,6 +9010,11 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           }
           const fmState = ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
           if (fmState?.enabled) {
+            if (fmState.provider === NINEROUTER_PROVIDER_ID) {
+              const providerModels = await readProviderBackedModelIds(appServer)
+              setJson(res, 200, { ...providerModels, exclusive: true, source: NINEROUTER_PROVIDER_ID })
+              return
+            }
             if (fmState.provider === 'opencode-zen') {
               try {
                 const modelIds = sortOpenCodeZenModelIds(await fetchOpenCodeZenModelIds(fmState.apiKey))
@@ -7911,7 +9043,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                   const orderedIds = currentModel && ids.includes(currentModel)
                     ? [currentModel, ...ids.filter((id) => id !== currentModel)]
                     : ids
-                  setJson(res, 200, { data: orderedIds, exclusive: true, source: 'custom' })
+                  setJson(res, 200, { data: orderedIds, models: await addRuntimeLocalReasoning(appServer, normalizeProviderModelMetadata(json), 'custom_endpoint', fmState.customBaseUrl), exclusive: true, source: 'custom' })
                   return
                 }
               } catch {
@@ -8544,7 +9676,19 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           setJson(res, 400, { error: 'Invalid body: expected object' })
           return
         }
-        await writeThreadQueueState(normalizeThreadQueueState(record))
+        const nextQueue = normalizeThreadQueueState(record)
+        try {
+          await withThreadQueueStateUpdate(
+            () => ({ nextState: nextQueue, result: undefined }),
+            (currentState, commit) => {
+              const changedThreadIds = [...new Set([...Object.keys(currentState), ...Object.keys(nextQueue)])].filter(id => JSON.stringify(currentState[id] ?? []) !== JSON.stringify(nextQueue[id] ?? []))
+              return appServer.withThreadQueueMutation(changedThreadIds, commit)
+            },
+          )
+        } catch (error) {
+          setJson(res, 409, { error: getErrorMessage(error, 'Queue writer ownership could not be verified') })
+          return
+        }
         void backendQueueProcessor.scheduleAllQueuedThreads()
         setJson(res, 200, { ok: true })
         return
@@ -9008,6 +10152,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const payload = asRecord(await readJsonBody(req))
         const botToken = typeof payload?.botToken === 'string' ? payload.botToken.trim() : ''
         const rawAllowedUserIds = Array.isArray(payload?.allowedUserIds) ? payload.allowedUserIds : []
+        const existingConfig = await readTelegramBridgeConfig()
+        const rawNotificationChatIds = Array.isArray(payload?.notificationChatIds)
+          ? payload.notificationChatIds
+          : existingConfig.notificationChatIds
         if (!botToken) {
           setJson(res, 400, { error: 'Missing botToken' })
           return
@@ -9015,6 +10163,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const config = normalizeTelegramBridgeConfig({
           botToken,
           allowedUserIds: rawAllowedUserIds,
+          notificationChatIds: rawNotificationChatIds,
         })
         if (config.allowedUserIds.length === 0) {
           setJson(res, 400, { error: 'At least one allowed Telegram user ID is required' })
@@ -9023,11 +10172,12 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
         telegramBridge.configureToken(config.botToken)
         telegramBridge.configureAllowedUserIds(config.allowedUserIds)
+        telegramBridge.configureNotificationChatIds(config.notificationChatIds)
         telegramBridge.start()
-        const existingConfig = await readTelegramBridgeConfig()
         await writeTelegramBridgeConfig({
           botToken: config.botToken,
           chatIds: existingConfig.chatIds,
+          notificationChatIds: config.notificationChatIds,
           allowedUserIds: config.allowedUserIds,
         })
         setJson(res, 200, { ok: true })
@@ -9038,9 +10188,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         const config = await readTelegramBridgeConfig()
         setJson(res, 200, {
           data: {
-            botToken: config.botToken,
-            allowedUserIds: config.allowedUserIds,
-          },
+          botToken: config.botToken,
+          allowedUserIds: config.allowedUserIds,
+          notificationChatIds: config.notificationChatIds,
+        },
         })
         return
       }
@@ -9087,12 +10238,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
     }
   }
 
-  middleware.dispose = () => {
+  middleware.dispose = async () => {
     threadSearchIndex = null
     telegramBridge.stop()
     terminalManager.dispose()
     backendQueueProcessor.dispose()
     appServer.dispose()
+    await activityRecorder.flush()
   }
   middleware.subscribeNotifications = (
     listener: (value: { method: string; params: unknown; atIso: string }) => void,
@@ -9109,9 +10261,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         atIso: new Date().toISOString(),
       })
     })
+    const unsubscribeActivity = activityStore.subscribe((threadId, entry, coverage) => {
+      listener({ method: 'activity/updated', params: { threadId, entry, coverage }, atIso: new Date().toISOString() })
+    })
     return () => {
       unsubscribeAppServer()
       unsubscribeTerminal()
+      unsubscribeActivity()
     }
   }
 

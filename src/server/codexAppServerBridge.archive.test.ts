@@ -114,8 +114,11 @@ describe('callRpcWithArchiveRecovery', () => {
           }
           return { turn: { id: 'turn-2' } }
         }
+        if (method === 'config/read') {
+          return { config: { model_provider: 'openai', model: 'fixture-native-model' } }
+        }
         if (method === 'thread/resume') {
-          return { thread: { id: 'test-thread', turns: [] } }
+          return { modelProvider: 'openai', thread: { id: 'test-thread', turns: [] } }
         }
         throw new Error(`unexpected method ${method}`)
       },
@@ -130,10 +133,13 @@ describe('callRpcWithArchiveRecovery', () => {
         method: 'turn/start',
         params: { threadId: 'test-thread', input: [{ type: 'text', text: 'hi' }] },
       },
-      { method: 'thread/resume', params: { threadId: 'test-thread' } },
+      { method: 'config/read', params: {} },
+      { method: 'thread/resume', params: {
+        threadId: 'test-thread', modelProvider: 'openai', model: 'fixture-native-model', excludeTurns: true,
+      } },
       {
         method: 'turn/start',
-        params: { threadId: 'test-thread', input: [{ type: 'text', text: 'hi' }] },
+        params: { threadId: 'test-thread', model: 'fixture-native-model', input: [{ type: 'text', text: 'hi' }] },
       },
     ])
   })

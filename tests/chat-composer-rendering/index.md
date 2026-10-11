@@ -13,6 +13,7 @@ Return to the [manual test index](../../tests.md).
 | [Composer expands long drafts to full screen](composer-expands-long-drafts-to-full-screen.md) |
 | [Composer mode scoping and Fast mode support](composer-mode-scoping-and-fast-mode-support.md) |
 | [Goal and plan slash commands](goal-slash-commands.md) |
+| [Thread Activity and live goal usage](thread-activity-and-live-goal-usage.md) |
 | [Composer controls stay editable during responses](composer-controls-stay-editable-during-responses.md) |
 | [Feature: Markdown file links with backticked filename labels render correctly](markdown-file-links-with-backticked-filename-labels-render-correctly.md) |
 | [Feature: Sandbox approval requests recognize newer Codex payloads](sandbox-approval-requests-recognize-newer-codex-payloads.md) |
@@ -42,3 +43,4 @@ Return to the [manual test index](../../tests.md).
 | [First user message is visible immediately in new chats](first-user-message-is-visible-immediately-in-new-chats.md) |
 | [New chat live thinking and stop controls](new-chat-live-thinking-and-stop-controls.md) |
 | [Bold URL trailing punctuation parsing](bold-url-trailing-punctuation-parsing.md) |
+| [RPC telemetry, token usage, and Persian message layout](rpc-telemetry-token-usage-and-persian-layout.md) |
