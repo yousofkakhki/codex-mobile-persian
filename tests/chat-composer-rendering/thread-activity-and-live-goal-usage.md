@@ -21,7 +21,7 @@ Each thread has Chat and Activity tabs, durable action history, and continuously
 10. Restart only the isolated verification server. Confirm activity and detail files persist, elapsed time does not reset, and an incomplete journal tail produces a visible recovery warning.
 11. Archive the disposable thread and verify retained history. Permanently delete it and verify its stored activity is removed. Omission from a paginated thread list must never remove history.
 12. Simulate an unwritable recording directory. Confirm the task continues and the UI warns that activity may have gaps.
-13. Repeat visible flows in light/dark at 1440x1000, 375x812, and 768x1024; inspect the actual Activity tab and expanded details.
+13. Repeat visible flows in light/dark at 1440x1000, 375x812, and 768x1024; inspect the actual Activity tab and expanded details. Measure small timestamp, provenance, duration, turn-label, coverage and default-status text against the actual content background: contrast must be at least 4.5:1. Running and failed statuses must retain their separate readable colors.
 
 #### Expected Results
 - Goal changes synchronize through one shared WebSocket/SSE connection. Only visible stale active goals use the five-second fallback read.

@@ -55,6 +55,13 @@
 :root.dark .thread-view-tabs button[aria-selected="true"] { background: #3f3f46; color: #fafafa; }
 :root.dark .thread-activity { color: #e4e4e7; }
 :root.dark .activity-coverage, :root.dark .activity-entry { border-color: #3f3f46; }
+:root.dark .activity-coverage,
+:root.dark .activity-entry-state,
+:root.dark .activity-entry-time,
+:root.dark .activity-provenance,
+:root.dark .activity-duration,
+:root.dark .activity-turn-label,
+:root.dark .activity-empty { color: #a1a1aa; }
 :root.dark .activity-entry-summary { color: #a1a1aa; }
 :root.dark .activity-entry-detail pre { background: #18181b; color: #e4e4e7; }
 :root.dark .activity-actions button, :root.dark .activity-entry-detail button { border-color: #52525b; color: #d4d4d8; }
