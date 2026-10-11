@@ -2277,17 +2277,33 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
   const payload = await callRpc<ModelListResponse>('model/list', {})
   const ids: string[] = []
   const metadata = [...(providerModels?.models ?? [])]
-  const nativeIds = payload.data.map(row => row.id || row.model)
+  const metadataIndexById = new Map<string, number>()
+  metadata.forEach((model, index) => {
+    if (!metadataIndexById.has(model.id)) metadataIndexById.set(model.id, index)
+  })
+  const nativeIdCounts = new Map<string, number>()
+  const nativeToolRestrictions = new Set<string>()
+  // Restrictive evidence must survive ID deduplication, regardless of row order.
   for (const row of payload.data) {
     const candidate = row.id || row.model
-    if (!candidate || ids.includes(candidate)) continue
+    if (!candidate) continue
+    nativeIdCounts.set(candidate, (nativeIdCounts.get(candidate) ?? 0) + 1)
+    if (asRecord(row)?.supportsTools === false || asRecord(asRecord(row)?.capabilities)?.tools === false) {
+      nativeToolRestrictions.add(candidate)
+    }
+  }
+  const seenIds = new Set<string>()
+  for (const row of payload.data) {
+    const candidate = row.id || row.model
+    if (!candidate || seenIds.has(candidate)) continue
+    seenIds.add(candidate)
     ids.push(candidate)
     // Exact native declarations and provider restrictions constrain each other.
     // cx/ local Ultra still requires the bridge's gated runtime evidence.
-    const metadataIndex = metadata.findIndex(model => model.id === candidate)
+    const metadataIndex = metadataIndexById.get(candidate) ?? -1
     const existing = metadata[metadataIndex]
     const nonreasoning = asRecord(row)?.reasoning === false || asRecord(asRecord(row)?.capabilities)?.reasoning === false
-    const noTools = asRecord(row)?.supportsTools === false || asRecord(asRecord(row)?.capabilities)?.tools === false
+    const noTools = nativeToolRestrictions.has(candidate)
     const hasNativeReasoning = Object.prototype.hasOwnProperty.call(row, 'supportedReasoningEfforts') || nonreasoning
     if (!hasNativeReasoning && !noTools) continue
     const raw = row.supportedReasoningEfforts
@@ -2295,7 +2311,7 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
     const efforts = Array.isArray(raw) ? raw.map(option => asRecord(option)?.reasoningEffort) : []
     const valid = Array.isArray(raw) && efforts.every(effort => typeof effort === 'string' && allowed.includes(effort))
       && (row.model === undefined || row.model === candidate)
-      && nativeIds.filter(id => id === candidate).length === 1
+      && nativeIdCounts.get(candidate) === 1
     const nativeOptions = valid && !nonreasoning
       ? efforts.filter(effort => effort !== 'ultra' || !candidate.startsWith('cx/') || existing?.reasoningSource === 'codex-runtime-catalog') : []
     if (existing) {
@@ -2312,6 +2328,7 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
       }
       continue
     }
+    metadataIndexById.set(candidate, metadata.length)
     metadata.push({
       id: candidate, name: row.displayName || candidate,
       // model/list proves an executor route, not a custom provider wire API.
@@ -2329,7 +2346,10 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
   if (!shouldIncludeProviderModels || !providerModels) return ids
 
   for (const candidate of providerModels.ids) {
-    if (!ids.includes(candidate)) ids.push(candidate)
+    if (!seenIds.has(candidate)) {
+      seenIds.add(candidate)
+      ids.push(candidate)
+    }
   }
   return ids
 }

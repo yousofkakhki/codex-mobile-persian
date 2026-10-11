@@ -5109,6 +5109,7 @@ export function useDesktopState() {
 
     try {
       const routingGeneration = providerRoutingGeneration
+      assertCurrentRouting(routingGeneration)
       const forkedThread = await forkThread(sourceThreadId, sourceCwd || undefined, selectedModel || undefined)
       assertCurrentRouting(routingGeneration)
       const nextThreadId = forkedThread.threadId.trim()
@@ -5133,6 +5134,7 @@ export function useDesktopState() {
   async function forkThreadFromTurn(threadId: string, turnIndex: number): Promise<string> {
     const normalizedThreadId = threadId.trim()
     if (!normalizedThreadId || !Number.isInteger(turnIndex) || turnIndex < 0) return ''
+    const routingGeneration = providerRoutingGeneration
 
     if (inProgressById.value[normalizedThreadId] === true) {
       error.value = 'Finish the current turn before forking from a response.'
@@ -5141,6 +5143,7 @@ export function useDesktopState() {
 
     if (loadedMessagesByThreadId.value[normalizedThreadId] !== true) {
       try {
+        assertCurrentRouting(routingGeneration)
         await loadMessages(normalizedThreadId)
       } catch (unknownError) {
         error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
@@ -5162,7 +5165,7 @@ export function useDesktopState() {
 
     try {
       error.value = ''
-      const routingGeneration = providerRoutingGeneration
+      assertCurrentRouting(routingGeneration)
       const forked = await forkThread(normalizedThreadId)
       assertCurrentRouting(routingGeneration)
       const forkedThreadId = forked.threadId.trim()
