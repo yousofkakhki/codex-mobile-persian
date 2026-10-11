@@ -7064,6 +7064,37 @@ class AppServerProcess {
     return pending
   }
 
+  createActivityRecoveryLease(threadId: string): { rpc: (method: string, params: unknown) => Promise<unknown>; isCurrent: () => boolean } {
+    const initialProcess = this.process
+    let generation = initialProcess
+    let epoch = this.permissionEpochByThreadId.get(threadId) ?? 0
+    let dispatched = false
+    const isCurrent = () => this.process === generation && epoch === (this.permissionEpochByThreadId.get(threadId) ?? 0)
+    const captureDispatch = (proc: ChildProcessWithoutNullStreams, dispatchEpoch: number): void => {
+      // Rebase a cold lease exactly once, against the actual guarded dispatch.
+      // Neither a settled reply nor a fallback may adopt a replacement child.
+      if (((dispatched || initialProcess) && (!isCurrent() || generation !== proc || epoch !== dispatchEpoch))
+        || this.process !== proc || dispatchEpoch !== (this.permissionEpochByThreadId.get(threadId) ?? 0)) {
+        throw new Error('Activity recovery generation or thread ownership changed; no history read was sent.')
+      }
+      generation = proc
+      epoch = dispatchEpoch
+      dispatched = true
+    }
+    return Object.freeze({
+      isCurrent,
+      rpc: (method: string, params: unknown): Promise<unknown> => {
+        if (!threadId || !['thread/items/list', 'thread/turns/list'].includes(method)
+          || asRecord(params)?.threadId !== threadId || !isCurrent()) {
+          return Promise.reject(new Error('Activity recovery requires its current exact read-only thread lease.'))
+        }
+        // These bounded reads use the same preflight, initialization, quarantine
+        // and dispatch guards as public rpc; the lease grants no mutation path.
+        return this.rpcInner(method, params, undefined, captureDispatch)
+      },
+    })
+  }
+
   rpc(method: string, params: unknown): Promise<unknown> {
     const record = params && typeof params === 'object' ? params as Record<string, unknown> : null
     const threadId = typeof record?.threadId === 'string' ? record.threadId : ''
@@ -7291,7 +7322,7 @@ class AppServerProcess {
     }
   }
 
-  private async rpcInner(method: string, params: unknown, goalLease?: object): Promise<unknown> {
+  private async rpcInner(method: string, params: unknown, goalLease?: object, captureHistoryDispatch?: (generation: ChildProcessWithoutNullStreams, epoch: number) => void): Promise<unknown> {
     if (this.process && this.timedOutRpcIds.size) throw new Error('Codex still has an unresolved timed-out operation; no retry was sent and active writers were preserved.')
     const record = params && typeof params === 'object' ? params as Record<string, unknown> : null
     const threadId = typeof record?.threadId === 'string' ? record.threadId.trim() : ''
@@ -7432,6 +7463,7 @@ class AppServerProcess {
         && (this.permissionEpochByThreadId.get(threadId) ?? 0) !== permissionEpoch) {
         throw new Error('Thread closed during activity recording; no delayed mutation was sent.')
       }
+      captureHistoryDispatch?.(rpcProcess, permissionEpoch)
       result = await this.call(method, boundedParams, rpcProcess, goalLease, undefined, permissionRequest)
       void submission.then(id => this.process === rpcProcess && (this.permissionEpochByThreadId.get(threadId) ?? 0) === permissionEpoch ? this.activityRecorder?.afterRpc(method, boundedParams, result, id) : undefined).catch(() => {})
     } catch (failure) {

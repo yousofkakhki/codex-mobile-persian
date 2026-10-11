@@ -2,7 +2,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { ActivityInput, ActivityKind, ActivityStatus } from '../types/activity.js'
 import { ActivityStore, redactActivityText } from './activityStore.js'
 
-type RpcExecutor = { rpc(method: string, params: unknown): Promise<unknown> }
+type RecoveryReadLease = { rpc(method: string, params: unknown): Promise<unknown>; isCurrent(): boolean }
+type RpcExecutor = {
+  rpc(method: string, params: unknown): Promise<unknown>
+  createActivityRecoveryLease?(threadId: string): RecoveryReadLease
+}
 type RecordValue = Record<string, unknown>
 function record(value: unknown): RecordValue { return value && typeof value === 'object' && !Array.isArray(value) ? value as RecordValue : {} }
 function text(value: unknown): string { return typeof value === 'string' ? value : '' }
@@ -317,13 +321,22 @@ export class ActivityRecorder {
     const existing = this.recovering.get(threadId)
     if (existing) return existing
     const epoch = this.recoveryEpochs.get(threadId) ?? 0
-    // The native executor owns this opaque identity; it is observed, never changed.
-    // A cold first acquisition is additionally protected by native RPC generation rejection.
+    // The native lease binds at guarded dispatch, not after a fulfilled read: a
+    // replacement can already exist when this recorder's continuation resumes.
+    const lease = rpc.createActivityRecoveryLease?.(threadId)
     const transport = rpc as RpcExecutor & { readonly process?: unknown }
     const hasNativeGeneration = 'process' in transport
     let nativeGeneration = transport.process
+    const read = (method: string, params: unknown): Promise<unknown> => {
+      if (lease) return lease.rpc(method, params)
+      const pending = rpc.rpc(method, params)
+      // Compatibility for isolated executors that start synchronously. Never
+      // infer a cold generation from a process observed after an awaited result.
+      if (!nativeGeneration) nativeGeneration = transport.process
+      return pending
+    }
     const current = () => !this.deleted.has(threadId) && epoch === (this.recoveryEpochs.get(threadId) ?? 0)
-      && (!hasNativeGeneration || transport.process === nativeGeneration)
+      && (lease ? lease.isCurrent() : !hasNativeGeneration || transport.process === nativeGeneration)
     const promise = (async () => {
       const page = await this.store.page(threadId, { limit: 1 })
       if (!current()) return
@@ -334,19 +347,16 @@ export class ActivityRecorder {
       let source = mode
       let result: RecordValue
       try {
-        result = record(await rpc.rpc(mode === 'items' ? 'thread/items/list' : 'thread/turns/list', {
+        result = record(await read(mode === 'items' ? 'thread/items/list' : 'thread/turns/list', {
           threadId, limit: mode === 'items' ? 100 : 10, sortDirection: 'desc', ...(mode === 'turns' ? { itemsView: 'full' } : {}), ...(cursor ? { cursor } : {}),
         }))
-        if (!nativeGeneration) nativeGeneration = transport.process
       } catch (failure) {
         if (!current()) return
         if (mode !== 'items' || storedCursor || !/unsupported|method not found|unknown method|not supported/i.test(failure instanceof Error ? failure.message : '')) throw failure
         source = 'turns'
-        result = record(await rpc.rpc('thread/turns/list', { threadId, limit: 10, sortDirection: 'desc', itemsView: 'full' }))
-        if (!nativeGeneration) nativeGeneration = transport.process
+        result = record(await read('thread/turns/list', { threadId, limit: 10, sortDirection: 'desc', itemsView: 'full' }))
       }
       if (!current()) return
-      nativeGeneration = transport.process
       const rows = Array.isArray(result.data) ? result.data : []
       const entries = source === 'items'
         ? [...rows].reverse().map(value => ({ turnId: text(record(value).turnId), item: record(record(value).item), startedAt: null as string | null, status: 'completed' }))
