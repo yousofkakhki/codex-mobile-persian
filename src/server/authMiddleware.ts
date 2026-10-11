@@ -239,12 +239,7 @@ export function createAuthSession(password: string): AuthSession {
       tryPersistSessions(validTokens)
     }
 
-    if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)) {
-      next()
-      return
-    }
-
-    // Handle login POST
+    // Explicit password login must issue its cookie even for trusted local clients.
     if (req.method === 'POST' && req.path === '/auth/login') {
       let body = ''
       req.setEncoding('utf8')
@@ -275,6 +270,11 @@ export function createAuthSession(password: string): AuthSession {
           res.status(500).json({ error: 'Failed to create login session' })
         }
       })
+      return
+    }
+
+    if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)) {
+      next()
       return
     }
 

@@ -38,9 +38,11 @@ afterEach(() => {
 describe('Telegram completion notifications', () => {
   it('notifies configured chats once when a turn completes without a mapped Telegram thread', async () => {
     const appServer = createAppServer({
+      id: 'thread-1',
       name: 'MAX reasoning thread',
       model: 'gpt-5.6-luna',
       turns: [{
+        id: 'turn-1',
         items: [{ type: 'agentMessage', text: 'The long-running task is complete.' }],
       }],
     })
@@ -69,7 +71,13 @@ describe('Telegram completion notifications', () => {
       params: {
         threadId: 'thread-1',
         turnId: 'turn-1',
-        turn: { id: 'turn-1', status: 'completed' },
+        // Optional bridge model metadata is bound to this event, not the mutable thread header.
+        model: 'gpt-5.6-luna',
+        turn: {
+          id: 'turn-1', status: 'completed', itemsView: 'full',
+          items: [{ id: 'final-1', type: 'agentMessage', phase: 'final_answer', memoryCitation: null, text: 'The long-running task is complete.' }],
+          error: null, startedAt: null, completedAt: null, durationMs: null,
+        },
       },
     }
     appServer.emit(completion)
@@ -88,7 +96,7 @@ describe('Telegram completion notifications', () => {
   })
 
   it('sends a failure notification when the completed turn has no assistant message', async () => {
-    const appServer = createAppServer({ name: 'Failed thread', turns: [] })
+    const appServer = createAppServer({ id: 'thread-failed', name: 'Failed thread', turns: [] })
     const sendRequests: Array<Record<string, unknown>> = []
     const fetchMock = vi.fn(async (input: unknown, init?: { body?: BodyInit | null }) => {
       const url = String(input)
@@ -110,7 +118,7 @@ describe('Telegram completion notifications', () => {
       params: {
         threadId: 'thread-failed',
         turnId: 'turn-failed',
-        turn: { id: 'turn-failed', status: 'failed', error: { message: 'Provider timed out' } },
+        turn: { id: 'turn-failed', status: 'failed', itemsView: 'full', items: [], error: { message: 'Provider timed out' }, startedAt: null, completedAt: null, durationMs: null },
       },
     })
 

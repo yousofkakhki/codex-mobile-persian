@@ -918,6 +918,10 @@ export class TelegramThreadBridge {
     if (mappedChatIds.size === 0 && this.notificationChatIds.size === 0) return
 
     const turnId = this.extractTurnId(notification)
+    const params = asRecord(notification.params)
+    const eventTurn = asRecord(params?.turn)
+    if (!turnId || (eventTurn?.id !== undefined && eventTurn.id !== turnId)
+      || (eventTurn?.threadId !== undefined && eventTurn.threadId !== threadId)) return
     const lastForwardedTurnId = this.lastForwardedTurnByThreadId.get(threadId)
     if (turnId && lastForwardedTurnId === turnId) return
 
@@ -931,7 +935,7 @@ export class TelegramThreadBridge {
       this.turnStartedAtByKey.delete(`${threadId}:`)
       const status = this.extractTurnStatus(notification)
       const errorMessage = this.extractTurnErrorMessage(notification)
-      const snapshot = await this.readThreadCompletionSnapshot(threadId)
+      const snapshot = await this.readThreadCompletionSnapshot(threadId, turnId, notification)
       const completionInput = {
         threadId,
         turnId,
@@ -940,6 +944,7 @@ export class TelegramThreadBridge {
         title: snapshot.title,
         model: this.extractTurnModel(notification) || snapshot.model,
         assistantReply: snapshot.assistantReply,
+        lookupIncomplete: snapshot.lookupIncomplete,
         errorMessage,
       }
       const notificationRecipients = new Set(this.notificationChatIds)
@@ -1004,6 +1009,7 @@ export class TelegramThreadBridge {
     title: string
     model: string
     assistantReply: string
+    lookupIncomplete?: boolean
     errorMessage: string
     language: TelegramLanguage
   }): string {
@@ -1025,39 +1031,81 @@ export class TelegramThreadBridge {
       input.errorMessage
         ? `${input.language === 'fa' ? '**خطا:**' : '**Error:**'} ${input.errorMessage}`
         : '',
-      input.assistantReply ? `\n${input.assistantReply}` : '',
+      input.assistantReply ? `\n${input.assistantReply}` : input.lookupIncomplete
+        ? (input.language === 'fa' ? 'پاسخ نهایی این نوبت بازیابی نشد؛ بررسی محدود کامل نشد.' : 'Final response for this turn was not retrieved; bounded lookup was incomplete.')
+        : (input.language === 'fa' ? 'این نوبت پاسخ نهایی ندارد.' : 'This turn has no final response.'),
     ].filter(Boolean)
     return rows.join('\n')
   }
 
-  private async readThreadCompletionSnapshot(threadId: string): Promise<{
+  private async readThreadCompletionSnapshot(threadId: string, turnId: string, notification: { method: string; params: unknown }): Promise<{
     title: string
     model: string
     assistantReply: string
+    lookupIncomplete?: boolean
   }> {
-    const response = asRecord(await this.appServer.rpc('thread/read', { threadId, includeTurns: true }))
-    const thread = asRecord(response?.thread)
-    const turns = Array.isArray(thread?.turns) ? thread.turns : []
+    // The deadline covers metadata and every item page; timed-out reads are never retried.
+    const deadline = Date.now() + 8_000
+    const read = async (method: string, params: unknown): Promise<unknown> => {
+      const remainingMs = deadline - Date.now()
+      if (remainingMs <= 0) return null
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        return await Promise.race([
+          Promise.resolve().then(() => this.appServer.rpc(method, params)),
+          new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), remainingMs) }),
+        ])
+      } catch {
+        return null
+      } finally {
+        clearTimeout(timer)
+      }
+    }
+    const response = asRecord(await read('thread/read', { threadId, includeTurns: false }))
+    const candidateThread = asRecord(response?.thread)
+    const thread = candidateThread?.id === threadId ? candidateThread : null
     const title = (
       typeof thread?.name === 'string' ? thread.name.trim() : ''
     ) || (
       typeof thread?.preview === 'string' ? thread.preview.trim() : ''
     ) || threadId
-    let model = typeof thread?.model === 'string' ? thread.model.trim() : ''
-
-    for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
-      const turn = asRecord(turns[turnIndex])
-      if (!model && typeof turn?.model === 'string') model = turn.model.trim()
-      const items = Array.isArray(turn?.items) ? turn.items : []
-      for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
-        const item = asRecord(items[itemIndex])
-        if (item?.type === 'agentMessage') {
+    const eventTurn = asRecord(asRecord(notification.params)?.turn)
+    const turn = eventTurn?.id === turnId ? eventTurn : null
+    const model = typeof turn?.model === 'string' ? turn.model.trim() : ''
+    if (Array.isArray(turn?.items) && (turn.itemsView === 'full' || turn.itemsView == null)) {
+      for (let itemIndex = turn.items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+        const item = asRecord(turn.items[itemIndex])
+        if (item?.type === 'agentMessage' && (item.phase === 'final_answer' || item.phase == null)) {
           const text = typeof item.text === 'string' ? item.text.trim() : ''
           if (text) return { title, model, assistantReply: text }
         }
       }
+      return { title, model, assistantReply: '' }
     }
-    return { title, model, assistantReply: '' }
+    let cursor: string | undefined
+    const seenCursors = new Set<string>()
+    for (let pageIndex = 0; pageIndex < 3; pageIndex += 1) {
+      const page = asRecord(await read('thread/items/list', {
+        threadId, turnId, limit: 100, sortDirection: 'desc',
+        ...(cursor === undefined ? {} : { cursor }),
+      }))
+      if (!Array.isArray(page?.data) || page.data.length > 100) return { title, model, assistantReply: '', lookupIncomplete: true }
+      for (const row of page.data) {
+        const entry = asRecord(row)
+        const item = asRecord(entry?.item)
+        if (entry?.turnId === turnId && item?.type === 'agentMessage' && (item.phase === 'final_answer' || item.phase == null)) {
+          const text = typeof item.text === 'string' ? item.text.trim() : ''
+          if (text) return { title, model, assistantReply: text }
+        }
+      }
+      if (page.nextCursor === null) return { title, model, assistantReply: '' }
+      if (typeof page.nextCursor !== 'string' || !page.nextCursor || seenCursors.has(page.nextCursor)) {
+        return { title, model, assistantReply: '', lookupIncomplete: true }
+      }
+      seenCursors.add(page.nextCursor)
+      cursor = page.nextCursor
+    }
+    return { title, model, assistantReply: '', lookupIncomplete: true }
   }
 
   private async readThreadHistorySummary(threadId: string, language: TelegramLanguage): Promise<string> {
