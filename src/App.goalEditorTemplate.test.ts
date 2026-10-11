@@ -13,7 +13,7 @@ const app = readFileSync(new URL('./App.vue', import.meta.url), 'utf8')
 const sfc = parse(app).descriptor
 const template = sfc.template!.content.match(/<section v-if="isGoalEditorOpen"[\s\S]*?<\/section>/)![0]
 const ast = ts.createSourceFile('App.ts', sfc.scriptSetup!.content, ts.ScriptTarget.Latest, true)
-const names = new Set(['goalStatusOptions', 'threadGoalState', 'selectedThreadGoal', 'isGoalEditorOpen',
+const names = new Set(['isThreadSurfaceHidden', 'goalStatusOptions', 'threadGoalState', 'selectedThreadGoal', 'isGoalEditorOpen',
   'isSavingThreadGoal', 'isLoadingThreadGoal', 'goalEditorContextVersion', 'goalEditorObjective',
   'goalEditorStatus', 'goalEditorTokenBudget', 'goalEditorError', 'goalBudgetOwnerAuthorized',
   'isGoalBudgetEditorOpen', 'goalBudgetAuditStatus', 'isGoalBudgetAdjustment'])
@@ -32,6 +32,7 @@ type Options = { goal?: typeof recoveryGoal | null; owner?: boolean; confirm?: b
 function fixtureSource(options: Options) {
   return `
   const selectedThreadId = ref('owned'), isHomeRoute = ref(false);
+  const route = { name: 'thread' };
   const calls = { save: [], resume: [], confirms: [] };
   let completeAuthorization;
   const authorization = ${options.deferredAuth ? 'new Promise(resolve => { completeAuthorization = resolve })' : JSON.stringify(options.owner ?? true)};

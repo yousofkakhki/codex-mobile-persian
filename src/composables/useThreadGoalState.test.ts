@@ -140,7 +140,7 @@ describe('per-thread Goal reconciliation', () => {
   })
 
   it('applies live usage and clear events without allowing an older read to overwrite them', async () => {
-    const state = useThreadGoalState(ref('a'), ref(false))
+    const { state } = await setup()
     const old = deferred<ThreadGoal | null>()
     api.getThreadGoal.mockReturnValueOnce(old.promise)
     const loading = state.refresh()
@@ -158,7 +158,7 @@ describe('per-thread Goal reconciliation', () => {
     vi.useFakeTimers()
     vi.stubGlobal('window', {})
     vi.stubGlobal('document', { visibilityState: 'visible' })
-    const state = useThreadGoalState(ref('a'), ref(false))
+    const { state } = await setup()
     api.getThreadGoal.mockResolvedValue({ ...goal('a'), status: 'active' })
     await Promise.all([state.refresh(), state.refresh()])
     expect(api.getThreadGoal).toHaveBeenCalledTimes(1)

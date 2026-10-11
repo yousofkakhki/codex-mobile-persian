@@ -1,7 +1,7 @@
 ### Composer mode scoping and Fast mode support
 
 #### Feature/Change Name
-Plan mode, reasoning effort, and Fast mode are scoped to the current chat instead of becoming defaults for every chat. Fast mode is available for supported GPT 5.4, GPT 5.5, GPT 5.6, and GPT-6 model IDs; Ultra reasoning is available for GPT-6 Astra.
+Plan mode, reasoning effort, and Fast mode are scoped to the current chat instead of becoming defaults for every chat. Fast mode is available for supported GPT 5.4, GPT 5.5, GPT 5.6, and GPT-6 model IDs; Ultra reasoning is available for exact native-verified eligible model routes when the current provider/runtime/local multi-agent gates pass.
 
 #### Prerequisites/Setup
 1. Dev server running (`pnpm run dev`)
@@ -16,8 +16,8 @@ Plan mode, reasoning effort, and Fast mode are scoped to the current chat instea
 4. Open Start new thread, enable Plan mode, send a first message, and confirm the created thread starts in Plan mode.
 5. Return to Start new thread again and confirm Plan mode is off for the next new chat.
 6. Select each supported GPT-5.4, GPT-5.5, GPT-5.6, and GPT-6 model family and confirm the Fast mode switch is visible.
-7. Select `gpt-6-astra` and confirm Ultra appears in the reasoning-effort menu.
-8. Select a different model and confirm Ultra is unavailable.
+7. Select each exact reviewed eligible route with a complete native descriptor and current runtime/local-mode proof; confirm literal Ultra appears separately from Max.
+8. Select an unverified route, mismatched provider/generation, or explicitly restrictive reasoning descriptor and confirm Ultra is unavailable. A different eligible model must not lose Ultra merely because it is not Astra.
 9. Select an unsupported model family and confirm the Fast mode switch is hidden.
 10. Switch to dark theme and repeat steps 1-9.
 11. Using synthetic RPC fixtures or disposable threads, enable Fast mode in thread A. Confirm `thread/settings/update` sends A's ID and `serviceTier: "priority"`, without any `config/batchWrite` request.
@@ -35,7 +35,7 @@ Plan mode, reasoning effort, and Fast mode are scoped to the current chat instea
 - Enabling Plan mode in one existing thread does not enable it in other existing threads.
 - A new-chat Plan mode selection applies to the created chat but does not persist as the default for later new chats.
 - Fast mode is visible only for supported GPT 5.4, GPT 5.5, GPT 5.6, and GPT-6 model IDs, including dashed variants.
-- Ultra reasoning is available only for GPT-6 Astra.
+- Ultra is controlled by exact eligible native/provider/runtime evidence, not an Astra-only or name-family rule. Provider choice remains global; reasoning, Fast and Plan remain per-thread.
 - Fast mode remains hidden for unsupported model families.
 - Changing Fast in one thread does not change any other thread or global Codex configuration.
 - Changing reasoning effort in one thread does not change any other thread or the configured global default.

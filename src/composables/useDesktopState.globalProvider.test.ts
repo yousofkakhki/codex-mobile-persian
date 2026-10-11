@@ -228,7 +228,7 @@ it('does not mark read-only history resumed or send to a writer owned elsewhere'
     gatewayMocks.resumeThread.mockImplementation(async (_id, options) => detail(options?.modelProvider, options?.model))
     await state.sendMessageToSelectedThread('safe fixture prompt')
     expect(gatewayMocks.resumeThread).toHaveBeenLastCalledWith('existing-openai', expect.objectContaining({ modelProvider: 'custom-endpoint', model: 'cx/gpt-6.1-sol' }))
-    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith('existing-openai', 'safe fixture prompt', [], 'cx/gpt-6.1-sol', 'medium', undefined, [], 'default')
+    expect(gatewayMocks.startThreadTurn).toHaveBeenCalledWith('existing-openai', 'safe fixture prompt', [], 'cx/gpt-6.1-sol', 'medium', undefined, [], 'default', 'standard')
     expect(gatewayMocks.resumeThread.mock.invocationCallOrder.at(-1)).toBeLessThan(gatewayMocks.startThreadTurn.mock.invocationCallOrder[0])
   })
   it('surfaces failed custom catalog refresh rather than keeping old ChatGPT models', async () => {

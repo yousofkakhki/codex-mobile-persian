@@ -739,6 +739,7 @@ describe('thread-scoped speed mode', () => {
     const stale = detail('speed-a')
     gatewayMocks.resumeThread.mockImplementation(() => new Promise(resolve => { finishLoad = resolve }))
     const loading = state.loadMessages('speed-a')
+    await vi.waitFor(() => expect(finishLoad).toBeTypeOf('function'))
     await state.updateSelectedSpeedMode('fast')
     finishLoad(stale)
     await loading
@@ -805,7 +806,7 @@ describe('goal command routing', () => {
     const state = useDesktopState()
     state.primeSelectedThread('goal-route')
     gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'goal-route', objective: 'Synthetic goal', status: 'active' })
-    gatewayMocks.getThreadGoal.mockResolvedValue(null)
+    gatewayMocks.getThreadGoal.mockResolvedValue({ threadId: 'goal-route', tokenBudget: 100, tokensUsed: 10 })
     gatewayMocks.clearThreadGoal.mockResolvedValue(true)
     await state.sendMessageToSelectedThread('/goal Synthetic goal')
     await state.sendMessageToSelectedThread('/goal pause')
@@ -813,7 +814,7 @@ describe('goal command routing', () => {
     await state.sendMessageToSelectedThread('/goal')
     await state.sendMessageToSelectedThread('/goal clear')
     expect(gatewayMocks.setThreadGoal.mock.calls).toEqual([
-      ['goal-route', { objective: 'Synthetic goal', status: 'active', tokenBudget: null }],
+      ['goal-route', { objective: 'Synthetic goal', status: 'active' }],
       ['goal-route', { status: 'paused' }],
       ['goal-route', { status: 'active' }],
     ])
@@ -827,7 +828,10 @@ describe('goal command routing', () => {
     state.primeSelectedThread('')
     gatewayMocks.startThread.mockResolvedValue({ threadId: 'new-goal', model: 'cx/gpt-6.1-sol', modelProvider: 'ninerouter' })
     gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'new-goal', objective: 'Synthetic objective', status: 'active' })
-    expect(await state.sendMessageToNewThread('/goal Synthetic objective', '/tmp/fixture')).toBe('new-goal')
+    gatewayMocks.getThreadGoal.mockResolvedValue(null)
+    await expect(state.sendMessageToNewThread('/goal Synthetic objective', '/tmp/fixture')).rejects.toThrow(/owner.*finite.*budget/i)
+    expect(state.selectedThreadId.value).toBe('new-goal')
+    expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
     expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
     expect(state.isSelectedThreadInterruptPending.value).toBe(false)
     expect(state.messages.value).toEqual([])
@@ -837,6 +841,7 @@ describe('goal command routing', () => {
     installTestWindow()
     const state = useDesktopState()
     state.primeSelectedThread('goal-files')
+    gatewayMocks.getThreadGoal.mockResolvedValue({ threadId: 'goal-files', tokenBudget: 100, tokensUsed: 10 })
     gatewayMocks.setThreadGoal.mockResolvedValue({ threadId: 'goal-files', objective: 'Fixture', status: 'active' })
     await state.sendMessageToSelectedThread('/goal Inspect the fixture', [], [{ name: 'fixture-skill', path: '/tmp/SKILL.md' }], 'queue', [{ label: 'handoff', path: '/tmp/HANDOFF.md', fsPath: '/tmp/HANDOFF.md' }])
     expect(gatewayMocks.setThreadGoal.mock.calls.at(-1)?.[1].objective).toContain('File handoff: /tmp/HANDOFF.md')
@@ -1713,5 +1718,25 @@ describe('findAdjacentThreadId', () => {
 
   it('returns no fallback when there is no adjacent thread', () => {
     expect(findAdjacentThreadId([thread('selected-thread', '/tmp/project')], 'selected-thread')).toBe('')
+  })
+})
+
+describe('telemetry Goal slash finite-policy reconciliation', () => {
+  it('updates an existing objective without creating or changing its finite budget', async () => {
+    installTestWindow()
+    const state=useDesktopState();state.primeSelectedThread('goal-finite')
+    gatewayMocks.getThreadGoal.mockResolvedValue({threadId:'goal-finite', objective:'Previous', status:'paused', tokenBudget:100, tokensUsed:10})
+    gatewayMocks.setThreadGoal.mockResolvedValue({threadId:'goal-finite', objective:'Edited', status:'active', tokenBudget:100, tokensUsed:10})
+    await state.sendMessageToSelectedThread('/goal Edited')
+    expect(gatewayMocks.setThreadGoal).toHaveBeenCalledExactlyOnceWith('goal-finite',{objective:'Edited',status:'active'})
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+  })
+  it('requires the owner finite-budget editor instead of sending implicit unlimited Goal creation', async () => {
+    installTestWindow()
+    const state=useDesktopState();state.primeSelectedThread('goal-missing')
+    gatewayMocks.getThreadGoal.mockResolvedValue(null)
+    await expect(state.sendMessageToSelectedThread('/goal Create')).rejects.toThrow(/owner.*finite.*budget/i)
+    expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
   })
 })

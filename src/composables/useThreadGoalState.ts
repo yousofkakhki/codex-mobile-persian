@@ -51,19 +51,19 @@ export function useThreadGoalState(selectedThreadId: Ref<string>, isHomeRoute: R
     const version = nextVersion(threadId)
     entry.loading = true
     entry.error = ''
-    const reading = (async () => {
+    let reading!: Promise<void>
+    reading = (async () => {
       try {
         const result = await getThreadGoal(threadId)
         validate(result, threadId)
         if (versions.get(threadId) !== version) return
         entry.goal = result
         entry.loaded = true
-      entry.syncedAt = Date.now()
         entry.syncedAt = Date.now()
       } catch (failure) {
         if (versions.get(threadId) === version) entry.error = failure instanceof Error ? failure.message : 'Failed to load goal'
       } finally {
-        if (versions.get(threadId) === version) {
+        if (reads.get(threadId) === reading) {
           entry.loading = false
           reads.delete(threadId)
         }
@@ -115,7 +115,7 @@ export function useThreadGoalState(selectedThreadId: Ref<string>, isHomeRoute: R
       if (versions.get(threadId) === version) entry.error = failure instanceof Error ? failure.message : 'Failed to update goal'
       return false
     } finally {
-      if (versions.get(threadId) === version) entry.saving = false
+      entry.saving = false
     }
   }
 

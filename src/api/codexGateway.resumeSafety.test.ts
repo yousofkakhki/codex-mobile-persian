@@ -10,8 +10,8 @@ it('keeps active-writer history read-only and preserves actual provider instead 
   return new Response(JSON.stringify({result:{data:[],nextCursor:'older',backwardsCursor:null}}),{status:200})
  }))
  const [a,b]=await Promise.all([resumeThread('owned',{modelProvider:'custom_endpoint',model:'wanted'}),resumeThread('owned',{modelProvider:'custom_endpoint',model:'wanted'})])
- expect(a).toEqual(b);expect(a).toMatchObject({modelProvider:'openai',model:'actual-model',readOnly:true,olderCursor:'older'})
- expect(calls).toEqual(['thread/resume','thread/read','thread/turns/list'])
+ expect(a).toEqual(b);expect(a).toMatchObject({modelProvider:'openai',model:'actual-model',readOnly:true,olderCursor:'item-history:{"items":"older","turns":"older"}'})
+ expect(calls).toEqual(['thread/resume','thread/read','thread/turns/list','thread/items/list'])
 })
 
 it('read-only contract prevents direct rollback, queue, file undo/redo, interrupt and goal mutations',async()=>{
@@ -42,5 +42,5 @@ it('legacy retry writer-conflict recovery stays bounded read-only instead of res
   return new Response(JSON.stringify({result:{data:[],nextCursor:null}}),{status:200})
  }))
  await expect(resumeThread('legacy-owned')).resolves.toMatchObject({readOnly:true,model:'actual',modelProvider:'openai'})
- expect(methods).toEqual(['thread/resume','thread/resume','thread/read','thread/turns/list'])
+ expect(methods).toEqual(['thread/resume','thread/resume','thread/read','thread/turns/list','thread/items/list'])
 })

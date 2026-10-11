@@ -5218,6 +5218,14 @@ export function useDesktopState() {
   async function executeGoalCommand(threadId: string, command: GoalCommand): Promise<void> {
     const version = goalUpdateVersionByThreadId.get(threadId) ?? 0
     try {
+      assertThreadWritable(threadId)
+      if (command.action === 'set' || command.action === 'resume') {
+        const current = await getThreadGoal(threadId)
+        if (!current || current.threadId !== threadId || current.tokenBudget === null
+          || !Number.isSafeInteger(current.tokenBudget) || current.tokenBudget <= current.tokensUsed) {
+          throw new Error('Use the owner Goal editor to enter and confirm a finite total budget before creating or resuming this Goal.')
+        }
+      }
       if (command.action === 'clear') {
         if (!await clearThreadGoal(threadId)) throw new Error('Goal was not cleared')
         if (version === (goalUpdateVersionByThreadId.get(threadId) ?? 0)) publishLocalRpcNotification({ method: 'thread/goal/cleared', params: { threadId }, atIso: new Date().toISOString() })
@@ -5226,7 +5234,7 @@ export function useDesktopState() {
       const goal = command.action === 'show'
         ? await getThreadGoal(threadId)
         : await setThreadGoal(threadId, command.action === 'set'
-          ? { objective: command.objective, status: 'active', tokenBudget: null }
+          ? { objective: command.objective, status: 'active' }
           : { status: command.action === 'pause' ? 'paused' : 'active' })
       if (version !== (goalUpdateVersionByThreadId.get(threadId) ?? 0)) return
       publishLocalRpcNotification({

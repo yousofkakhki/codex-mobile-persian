@@ -20,14 +20,14 @@ test('preserves bundled descriptors and exact cx aliases with advertised per-mod
   assert.deepEqual(output.models[1].model_messages, bundled.models[0].model_messages)
   assert.deepEqual(bundled, original)
   assert.equal(output.models[1].prefer_websockets, false)
-  assert.equal(output.models[1].auto_compact_token_limit, null)
+  assert.equal(output.models[1].auto_compact_token_limit, 244800)
   assert.equal(output.models.length, 3)
 })
 
 test('uses provider reasoning declarations before family defaults and chooses a supported default', () => {
   const bundled = { models: [
-    { slug: 'gpt-5.6-sol', default_reasoning_level: 'medium', supported_reasoning_levels: [{ effort: 'medium' }] },
-    { slug: 'gpt-6-astra', default_reasoning_level: 'medium' },
+    { slug: 'gpt-5.6-sol', context_window: 272000, default_reasoning_level: 'medium', supported_reasoning_levels: [{ effort: 'medium' }] },
+    { slug: 'gpt-6-astra', context_window: 272000, default_reasoning_level: 'medium' },
   ] }
   const output = api.buildCatalog(bundled, { data: [
     { id: 'cx/gpt-6.1-sol[1m]-review', context_length: 1000, supportedReasoningEfforts: [{ reasoningEffort: 'high' }, 'high', 'invalid'] },
@@ -59,7 +59,7 @@ test('CLI uses one offline catalog fetch and atomically writes a private file on
   const binary = join(dir, 'fixture-binary')
   const output = join(dir, 'output.json')
   const preload = join(dir, 'offline-fetch.cjs')
-  const data = { models: [{ slug: 'gpt-5.6-sol', supported_reasoning_levels: [], default_reasoning_level: 'low' }] }
+  const data = { models: [{ slug: 'gpt-5.6-sol', context_window: 272000, supported_reasoning_levels: [], default_reasoning_level: 'low' }] }
   const cli = (...args) => spawnSync(process.execPath, ['--require', preload, require.resolve('./build-ninerouter-catalog.cjs'), ...args], { encoding: 'utf8' })
   try {
     await fs.writeFile(binary, 'prefix' + JSON.stringify(data, null, 2) + 'suffix')
@@ -83,7 +83,7 @@ test('CLI uses one offline catalog fetch and atomically writes a private file on
 })
 
 test('matches metadata precedence when explicit supported efforts coexist with thinkingLevels', () => {
-  const bundled = { models: [{ slug: 'gpt-5.6-sol', default_reasoning_level: 'medium' }] }
+  const bundled = { models: [{ slug: 'gpt-5.6-sol', context_window: 272000, default_reasoning_level: 'medium' }] }
   const output = api.buildCatalog(bundled, { data: [{
     id: 'cx/gpt-6.1-sol', context_length: 1000,
     supportedReasoningEfforts: ['high'], supported_reasoning_efforts: ['medium'], thinkingLevels: ['low'],
@@ -110,8 +110,8 @@ const nativeFixture = () => ({ models: [{
   tool_behavior: { nested: { preserve: true } }, future_native_field: { keep: 'entire descriptor' },
 }] })
 const bundledFixture = () => ({ models: [
-  { slug: 'gpt-5.6-sol', default_reasoning_level: 'medium', model_messages: { instructions: 'family sol' } },
-  { slug: 'gpt-5.6-luna', default_reasoning_level: 'medium', model_messages: { instructions: 'family luna' } },
+  { slug: 'gpt-5.6-sol', context_window: 272000, default_reasoning_level: 'medium', model_messages: { instructions: 'family sol' } },
+  { slug: 'gpt-5.6-luna', context_window: 272000, default_reasoning_level: 'medium', model_messages: { instructions: 'family luna' } },
 ] })
 const exactAdvertisement = (fields = {}) => ({ data: [{ id: 'cx/gpt-6.1-sol', context_length: 1050000, ...fields }] })
 
@@ -123,7 +123,7 @@ test('native exact alias clones the entire true descriptor without mutating any 
   assert.deepEqual(exact, { ...native.models[0],
     slug: 'cx/gpt-6.1-sol', display_name: 'cx/gpt-6.1-sol',
     context_window: 1050000, max_context_window: 1050000,
-    auto_compact_token_limit: null, prefer_websockets: false, visibility: 'list',
+    auto_compact_token_limit: 900000, prefer_websockets: false, visibility: 'list',
   })
   assert.deepEqual(output.models.slice(0, bundled.models.length), bundled.models)
   assert.deepEqual({ bundled, native, advertised }, before)
@@ -258,7 +258,7 @@ test('CLI native option writes the exact native descriptor using a single offlin
     assert.equal(result.stdout.split('FIXTURE_REQUEST_COUNT=1').length - 1, 1)
     assert.equal((await fs.stat(output)).mode & 0o777, 0o600)
     const actual = JSON.parse(await fs.readFile(output, 'utf8')).models.at(-1)
-    assert.deepEqual(actual, { ...native.models[0], slug: 'cx/gpt-6.1-sol', display_name: 'cx/gpt-6.1-sol', context_window: 1050000, max_context_window: 1050000, auto_compact_token_limit: null, prefer_websockets: false, visibility: 'list' })
+    assert.deepEqual(actual, { ...native.models[0], slug: 'cx/gpt-6.1-sol', display_name: 'cx/gpt-6.1-sol', context_window: 1050000, max_context_window: 1050000, auto_compact_token_limit: 900000, prefer_websockets: false, visibility: 'list' })
     assert.deepEqual((await fs.readdir(dir)).sort(), ['fixture-binary', 'native.json', 'offline-fetch.cjs', 'output.json'])
   } finally { await fs.rm(dir, { recursive: true, force: true }) }
 })
@@ -292,14 +292,14 @@ test('Max stays a separate native effort and can never substitute for Ultra or w
   assert.throws(() => api.buildCatalog(bundledFixture(), exactAdvertisement(), native), /Invalid native catalog/)
 })
 
-test('omitting native input preserves the legacy builder byte-for-byte', () => {
+test('omitting native input preserves family routing with conservative compaction', () => {
   const bundled = bundledFixture()
   const advertised = exactAdvertisement()
   const original = JSON.stringify(api.buildCatalog(bundled, advertised))
   assert.equal(JSON.stringify(api.buildCatalog(bundled, advertised, undefined)), original)
   assert.equal(original, JSON.stringify({ models: [...bundled.models, {
     ...bundled.models[0], slug: 'cx/gpt-6.1-sol', display_name: 'cx/gpt-6.1-sol', context_window: 1050000, max_context_window: 1050000,
-    auto_compact_token_limit: null, prefer_websockets: false, visibility: 'list',
+    auto_compact_token_limit: 244800, prefer_websockets: false, visibility: 'list',
     supported_reasoning_levels: ['low', 'medium', 'high', 'xhigh', 'max'].map(effort => ({ effort, description: `Gateway-supported ${effort} reasoning` })),
   }] }))
 })
@@ -348,7 +348,7 @@ test('all exact audited native Ultra bases use their own complete descriptors wi
   native.models[0].base_instructions = 'distinct astra fixture instructions'
   const output = api.buildCatalog(bundledFixture(), { data: [{ id: 'cx/gpt-6-astra', context_length: 1000 }] }, native)
   assert.deepEqual(output.models.at(-1), { ...native.models[0], slug: 'cx/gpt-6-astra', display_name: 'cx/gpt-6-astra',
-    context_window: 1000, max_context_window: 1000, auto_compact_token_limit: null, prefer_websockets: false, visibility: 'list' })
+    context_window: 1000, max_context_window: 1000, auto_compact_token_limit: 900, prefer_websockets: false, visibility: 'list' })
 })
 
 
@@ -366,7 +366,7 @@ test('false update support preserves literal Ultra selection and the original na
 
 test('invalid native defaults fail per model without poisoning other exact eligible descriptors', () => {
   const native = nativeFixture()
-  native.models.push({ ...native.models[0], slug: 'gpt-6-astra', default_reasoning_level: 'not-supported' }, null)
+  native.models.push({ ...native.models[0], slug: 'gpt-6-astra', context_window: 272000, default_reasoning_level: 'not-supported' }, null)
   const output = api.buildCatalog(bundledFixture(), { data: [...exactAdvertisement().data, { id: 'cx/gpt-6-astra', context_length: 1000 }] }, native)
   assert.equal(output.models.some(model => model.slug === 'cx/gpt-6-astra'), false)
   assert.ok(output.models.some(model => model.slug === 'cx/gpt-6.1-sol'))
@@ -426,7 +426,7 @@ test('audited one-million and review bindings clone only exact reviewed native d
     const model = output.models.find(model => model.slug === id)
     assert.ok(model, id)
     assert.deepEqual(model, { ...native.models.find(model => model.slug === slug), slug: id, display_name: id,
-      context_window: 872000, max_context_window: 872000, auto_compact_token_limit: null, prefer_websockets: false, visibility: 'list' })
+      context_window: 872000, max_context_window: 872000, auto_compact_token_limit: 784800, prefer_websockets: false, visibility: 'list' })
   }
 })
 
@@ -441,18 +441,18 @@ test('duplicate advertised audited IDs cannot trust a first permissive row', () 
 })
 test('does not postpone compaction when a gateway advertises a larger context', () => {
  const bundled={models:[{slug:'gpt-5.6-sol',context_window:272000,auto_compact_token_limit:null}]}
- const output=buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000}]})
+ const output=api.buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000}]})
  assert.equal(output.models[1].context_window,1050000)
  assert.equal(output.models[1].auto_compact_token_limit,244800)
  assert.equal(bundled.models[0].auto_compact_token_limit,null)
 })
 test('preserves explicit compaction limits and clamps them to smaller gateway windows', () => {
  const bundled={models:[{slug:'gpt-5.6-sol',context_window:272000,auto_compact_token_limit:180000}]}
- const output=buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000},{id:'cx/gpt-5.6-sol',context_length:100000}]})
+ const output=api.buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000},{id:'cx/gpt-5.6-sol',context_length:100000}]})
  assert.equal(output.models[1].auto_compact_token_limit,180000)
  assert.equal(output.models[2].auto_compact_token_limit,90000)
 })
 test('rejects descriptors without a valid native context for safe compaction', () => {
  const bundled={models:[{slug:'gpt-5.6-sol',context_window:null}]}
- assert.throws(()=>buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000}]}))
+ assert.throws(()=>api.buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000}]}))
 })

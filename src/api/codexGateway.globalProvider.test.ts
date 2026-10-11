@@ -10,7 +10,7 @@ describe('provider catalog failure contract', () => {
     const requests: Array<{ method: string; params: Record<string, unknown> }> = []
     vi.stubGlobal('fetch', vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)))
-      return rpc(resumed())
+      return requests.at(-1)?.method === 'thread/items/list' ? rpc({ data: [], nextCursor: null }) : rpc(resumed())
     }))
     await getThreadDetail('detail-global-custom', { modelProvider: 'custom', model: 'cx/gpt-6.1-sol' })
     expect(requests[0].params).toMatchObject({ modelProvider: 'custom_endpoint', model: 'cx/gpt-6.1-sol', excludeTurns: true, initialTurnsPage: { limit: 10 } })
@@ -29,11 +29,11 @@ describe('provider catalog failure contract', () => {
     vi.stubGlobal('fetch', vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       const request = JSON.parse(String(init?.body))
       requests.push(request)
-      return rpc(resumed(request.params.modelProvider, request.params.model))
+      return request.method === 'thread/items/list' ? rpc({ data: [], nextCursor: null }) : rpc(resumed(request.params.modelProvider, request.params.model))
     }))
     await Promise.all([resumeThread('switched-cache', { modelProvider: 'openai', model: 'old-model' }), resumeThread('switched-cache', { modelProvider: 'codex', model: 'old-model' })])
     const next = await resumeThread('switched-cache', { modelProvider: 'custom_endpoint', model: 'cx/gpt-6.1-sol' })
-    expect(requests).toHaveLength(2)
+    expect(requests.filter(request => request.method === 'thread/resume')).toHaveLength(2)
     expect(next.modelProvider).toBe('custom_endpoint')
     expect(next.model).toBe('cx/gpt-6.1-sol')
   })
@@ -41,13 +41,13 @@ describe('provider catalog failure contract', () => {
     const requests: Array<{ method: string; params: Record<string, unknown> }> = []
     vi.stubGlobal('fetch', vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
       requests.push(JSON.parse(String(init?.body)))
-      return rpc(resumed())
+      return requests.at(-1)?.method === 'thread/items/list' ? rpc({ data: [], nextCursor: null }) : rpc(resumed())
     }))
     await resumeThread('global-custom-thread', { modelProvider: 'custom', model: 'cx/gpt-6.1-sol' })
     expect(requests).toEqual([{ method: 'thread/resume', params: {
       threadId: 'global-custom-thread', modelProvider: 'custom_endpoint', model: 'cx/gpt-6.1-sol',
-      excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'full' },
-    } }])
+      excludeTurns: true, initialTurnsPage: { limit: 10, sortDirection: 'desc', itemsView: 'notLoaded' },
+    } }, { method: 'thread/items/list', params: { threadId: 'global-custom-thread', limit: 100, sortDirection: 'desc' } }])
   })
   it('canonicalizes custom aliases when querying the provider catalog', async () => {
     const urls: string[] = []

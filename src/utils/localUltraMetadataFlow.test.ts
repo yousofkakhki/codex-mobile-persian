@@ -12,18 +12,26 @@ const composer = parse(readFileSync(new URL('../components/content/ThreadCompose
 const statements = ts.createSourceFile('Composer.ts', composer, ts.ScriptTarget.Latest, true).statements
 const declarations = statements.filter(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(d => ['modelMetadataById', 'reasoningOptions'].includes(d.name.getText())))
 const desktop = ts.createSourceFile('Desktop.ts', readFileSync(new URL('../composables/useDesktopState.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
-let handler: ts.Node | undefined
-function visit(node: ts.Node) { if (ts.isFunctionDeclaration(node) && node.name?.text === 'setSelectedReasoningEffort') handler = node; ts.forEachChild(node, visit) }
+const handlers: ts.Node[] = []
+function visit(node: ts.Node) {
+  if (ts.isFunctionDeclaration(node) && ['setSelectedReasoningEffort', 'saveReasoningEffortForContext'].includes(node.name?.text ?? '')) handlers.push(node)
+  ts.forEachChild(node, visit)
+}
 visit(desktop)
 const compile = (text: string) => ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
 function frontend(metadata: Partial<ZenModelMetadata> | undefined) {
   const context = { props: { selectedModel: 'cx/gpt-6.1-sol', modelMetadata: metadata ? [{ id: 'cx/gpt-6.1-sol', ...metadata }] : [] }, computed, getModelReasoningEfforts }
   const options = vm.runInNewContext(compile(declarations.map(d => d.getText()).join('\n')) + '\nreasoningOptions.value', context)
-  const selectedReasoningEffort = ref('high')
-  const select = vm.runInNewContext(compile(handler!.getText(desktop)) + '\nsetSelectedReasoningEffort', {
+  const reasoningEffortByContext = ref<Record<string, string>>({})
+  const selectedReasoningEffort = computed(() => reasoningEffortByContext.value.fixture ?? 'high')
+  const select = vm.runInNewContext(compile(handlers.map(handler => handler.getText(desktop)).join('\n')) + '\nsetSelectedReasoningEffort', {
     REASONING_EFFORT_OPTIONS: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
     selectedThreadId: ref('fixture'), selectedModelId: ref('cx/gpt-6.1-sol'), selectedReasoningEffort,
     readModelIdForThread: () => 'cx/gpt-6.1-sol',
+    toThreadContextId: (id: string) => id,
+    reasoningEffortByContext,
+    cloneStringKeyedRecord: (value: Record<string, string>) => ({ ...value }),
+    saveReasoningEffortMap: vi.fn(),
     isReasoningEffortSupported: (_id: string, effort: any) => isReasoningEffortSupported('cx/gpt-6.1-sol', effort, metadata),
   })
   return { options, select, selectedReasoningEffort }

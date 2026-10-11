@@ -6926,7 +6926,7 @@ class AppServerProcess {
       this.goalWritePermits.delete(goalPermit!)
       permit.assertAllowed()
     }
-    if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
+    if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'thread/items/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
     if (this.timedOutRpcIds.size) throw new Error('Codex still has an unresolved timed-out operation; no retry was sent and active writers were preserved.')
     if (expectedProcess && this.process !== expectedProcess) throw new Error('codex app-server changed before RPC dispatch; retry the request')
     this.start()
@@ -6951,7 +6951,7 @@ class AppServerProcess {
         reject: (error) => { clearTimeout(timer); reject(error) },
       })
       try {
-        const readsWhileDeferred = new Set(['initialize', 'thread/read', 'thread/turns/list', 'thread/list', 'thread/loaded/list', 'config/read', 'turn/interrupt', 'thread/unsubscribe'])
+        const readsWhileDeferred = new Set(['initialize', 'thread/read', 'thread/turns/list', 'thread/items/list', 'thread/list', 'thread/loaded/list', 'config/read', 'turn/interrupt', 'thread/unsubscribe'])
         if (this.configChangeDeferred && !readsWhileDeferred.has(method)) throw new Error('App-server configuration change is deferred until writer shutdown is confirmed; no mutation was sent.')
         if (goalThreadId && ['thread/resume', 'turn/start', 'thread/settings/update', 'turn/settings/update', 'thread/rollback'].includes(method)) {
           const expected = permissionRequest?.settings
@@ -7179,12 +7179,14 @@ class AppServerProcess {
     const permit = Object.freeze({})
     this.goalWritePermits.set(permit, { method, params: nativeParams, generation, lease, assertAllowed })
     let result: unknown
-    const submission = await this.activityRecorder?.beforeRpc(method, nativeParams) ?? null
+    const submission = this.activityRecorder?.beforeRpc(method, nativeParams) ?? Promise.resolve(null)
     try {
+      assertAllowed()
+      if (lastTurnStart() !== turnStartBefore) throw new Error('Thread activity changed during Goal recording; no mutation was sent.')
       result = await this.call(method, nativeParams, generation, lease, permit)
-      if (this.process === generation) await this.activityRecorder?.afterRpc(method, nativeParams, result, submission)
+      void submission.then(id => this.process === generation ? this.activityRecorder?.afterRpc(method, nativeParams, result, id) : undefined).catch(() => {})
     } catch (failure) {
-      await this.activityRecorder?.rpcFailed(nativeParams, submission, failure)
+      void submission.then(id => this.activityRecorder?.rpcFailed(nativeParams, id, failure)).catch(() => {})
       throw failure
     }
     finally { this.goalWritePermits.delete(permit) }
@@ -7292,26 +7294,26 @@ class AppServerProcess {
     this.disposeIfConfigChanged()
     const preparedConfig = this.process ? undefined : this.buildAppServerConfig()
     const inspectedSQLiteHome = this.process ? this.activeSQLiteHome : preparedConfig?.sqliteHome
-    if (threadId && (directMutation || method === 'thread/resume' || method === 'thread/read' || method === 'thread/turns/list' || method === 'turn/start')) {
+    if (threadId && (directMutation || method === 'thread/resume' || method === 'thread/read' || method === 'thread/turns/list' || method === 'thread/items/list' || method === 'turn/start')) {
       await assertThreadProjectionIntegrity(getCodexHomeDir(), threadId, inspectedSQLiteHome)
     }
     assertDirectMutationOwnership()
     assertHotPermissionOwnership()
     if (this.process && this.activeSQLiteHome !== inspectedSQLiteHome) throw new Error('SQLite home changed while verifying history; retry the bounded read. No mutation was sent.')
-    const safeWhileDeferred = new Set(['thread/read', 'thread/turns/list', 'thread/list', 'thread/loaded/list', 'config/read', 'turn/interrupt', 'thread/unsubscribe'])
+    const safeWhileDeferred = new Set(['thread/read', 'thread/turns/list', 'thread/items/list', 'thread/list', 'thread/loaded/list', 'config/read', 'turn/interrupt', 'thread/unsubscribe'])
     if (this.configChangeDeferred && !safeWhileDeferred.has(method) && method !== 'thread/resume') {
       throw new Error('App-server configuration change is deferred until attached writers are explicitly released; no mutation was sent.')
     }
     if (this.configChangeDeferred && method === 'thread/resume' && !this.joinedThreads.has(threadId)) {
       throw new Error('App-server configuration change is deferred until attached writers are explicitly released; no acquisition was sent.')
     }
-    if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
+    if (this.fileMutationsByThreadId.size && !['thread/read', 'thread/turns/list', 'thread/items/list', 'config/read'].includes(method)) throw new Error('Thread file mutation is in progress; no competing mutation was sent.')
     this.start(preparedConfig)
     const rpcProcess = this.process!
     await this.ensureInitialized()
     assertHotPermissionOwnership()
     assertDirectMutationOwnership()
-    if (threadId && (directMutation || ['thread/resume', 'thread/read', 'thread/turns/list', 'turn/start', 'thread/rollback'].includes(method))) {
+    if (threadId && (directMutation || ['thread/resume', 'thread/read', 'thread/turns/list', 'thread/items/list', 'turn/start', 'thread/rollback'].includes(method))) {
       if (this.confirmedSQLiteHome !== this.activeSQLiteHome) {
         if (!this.sqliteHomeVerificationPromise) {
           this.sqliteHomeVerificationPromise = this.call('config/read', { includeLayers: false }, rpcProcess).then(payload => {
@@ -7382,13 +7384,19 @@ class AppServerProcess {
         // Inherited fields keep the order of the original choice, not this turn's dispatch.
         dimensionOrder: { approvalPolicy: callerPermissionIntent.approvalPolicy ? permissionOrder : stagedPermissionOrder?.approvalPolicy ?? permissionOrder, sandbox: callerPermissionIntent.sandbox ? permissionOrder : stagedPermissionOrder?.sandbox ?? permissionOrder },
         settings: method === 'thread/settings/update' ? JSON.parse(JSON.stringify(permissionParams)) as AppServerTurnPermissionOverrides : undefined } : undefined
-    const submission = await this.activityRecorder?.beforeRpc(method, boundedParams) ?? null
+    const submission = this.activityRecorder?.beforeRpc(method, boundedParams) ?? Promise.resolve(null)
     let result: unknown
     try {
+      assertDirectMutationOwnership()
+      assertHotPermissionOwnership()
+      if (threadId && ['turn/start', 'turn/interrupt', 'thread/settings/update', 'thread/rollback'].includes(method)
+        && (this.permissionEpochByThreadId.get(threadId) ?? 0) !== permissionEpoch) {
+        throw new Error('Thread closed during activity recording; no delayed mutation was sent.')
+      }
       result = await this.call(method, boundedParams, rpcProcess, goalLease, undefined, permissionRequest)
-      if (this.process === rpcProcess) await this.activityRecorder?.afterRpc(method, boundedParams, result, submission)
+      void submission.then(id => this.process === rpcProcess && (this.permissionEpochByThreadId.get(threadId) ?? 0) === permissionEpoch ? this.activityRecorder?.afterRpc(method, boundedParams, result, id) : undefined).catch(() => {})
     } catch (failure) {
-      await this.activityRecorder?.rpcFailed(boundedParams, submission, failure)
+      void submission.then(id => this.activityRecorder?.rpcFailed(boundedParams, id, failure)).catch(() => {})
       throw failure
     }
     if (this.process !== rpcProcess) throw new Error('codex app-server changed while completing RPC; retry the request')
@@ -7869,7 +7877,7 @@ type SharedBridgeState = {
 }
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
-const SHARED_BRIDGE_VERSION = 'activity-api-v1'
+const SHARED_BRIDGE_VERSION = 'experimental-api-v2'
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {
@@ -7879,6 +7887,13 @@ function getSharedBridgeState(): SharedBridgeState {
   const existing = globalScope[SHARED_BRIDGE_KEY]
   if (existing) {
     if (existing.version === SHARED_BRIDGE_VERSION && existing.terminalManager) {
+      // Telemetry is additive: preserve the current shared writer and attach only once.
+      if (!existing.activityStore || !existing.activityRecorder) {
+        existing.activityStore = new ActivityStore(join(getCodexHomeDir(), 'web-activity-v1'))
+        existing.activityRecorder = new ActivityRecorder(existing.activityStore)
+        existing.appServer.setActivityRecorder?.(existing.activityRecorder)
+      }
+      recordQueueActivity = (previous, next) => existing.activityRecorder.recordQueue(previous, next)
       return existing
     }
     existing.appServer.dispose()
