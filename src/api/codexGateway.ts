@@ -2283,6 +2283,8 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
   })
   const nativeIdCounts = new Map<string, number>()
   const nativeToolRestrictions = new Set<string>()
+  const nativeReasoningDeclarations = new Set<string>()
+  const nativeNonreasoningRestrictions = new Set<string>()
   // Restrictive evidence must survive ID deduplication, regardless of row order.
   for (const row of payload.data) {
     const candidate = row.id || row.model
@@ -2290,6 +2292,14 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
     nativeIdCounts.set(candidate, (nativeIdCounts.get(candidate) ?? 0) + 1)
     if (asRecord(row)?.supportsTools === false || asRecord(asRecord(row)?.capabilities)?.tools === false) {
       nativeToolRestrictions.add(candidate)
+    }
+    if (Object.prototype.hasOwnProperty.call(row, 'supportedReasoningEfforts')) {
+      // Presence is restrictive even when empty/malformed; duplicates still
+      // cannot affirm native efforts because the unique-count guard remains.
+      nativeReasoningDeclarations.add(candidate)
+    }
+    if (asRecord(row)?.reasoning === false || asRecord(asRecord(row)?.capabilities)?.reasoning === false) {
+      nativeNonreasoningRestrictions.add(candidate)
     }
   }
   const seenIds = new Set<string>()
@@ -2302,9 +2312,9 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
     // cx/ local Ultra still requires the bridge's gated runtime evidence.
     const metadataIndex = metadataIndexById.get(candidate) ?? -1
     const existing = metadata[metadataIndex]
-    const nonreasoning = asRecord(row)?.reasoning === false || asRecord(asRecord(row)?.capabilities)?.reasoning === false
+    const nonreasoning = nativeNonreasoningRestrictions.has(candidate)
     const noTools = nativeToolRestrictions.has(candidate)
-    const hasNativeReasoning = Object.prototype.hasOwnProperty.call(row, 'supportedReasoningEfforts') || nonreasoning
+    const hasNativeReasoning = nativeReasoningDeclarations.has(candidate) || nonreasoning
     if (!hasNativeReasoning && !noTools) continue
     const raw = row.supportedReasoningEfforts
     const allowed = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
