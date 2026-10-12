@@ -16,8 +16,13 @@ describe('NineRouter dictation transcription', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
-    const body = Buffer.from('synthetic audio fixture')
-    const contentType = 'multipart/form-data; boundary=fixture-boundary'
+    const incoming = new FormData()
+    incoming.append('file', new File([new Uint8Array([1, 2, 3])], 'codex.webm', { type: 'audio/webm' }))
+    incoming.append('language', 'fa')
+    incoming.append('model', 'untrusted/model')
+    const encodedRequest = new Request('http://localhost/codex-api/transcribe', { method: 'POST', body: incoming })
+    const body = Buffer.from(await encodedRequest.arrayBuffer())
+    const contentType = encodedRequest.headers.get('content-type')!
 
     await expect(proxyNineRouterDictation(body, contentType, 'fixture-router-key', request)).resolves.toEqual({
       status: 200,
@@ -31,14 +36,40 @@ describe('NineRouter dictation transcription', () => {
       Authorization: 'Bearer fixture-router-key',
       'Content-Type': contentType,
     })
-    expect(Array.from(options?.body as Uint8Array)).toEqual(Array.from(body))
+    const forwardedBody = options?.body as Uint8Array
+    const forwardedRequest = new Request('http://localhost/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Content-Type': contentType },
+      body: Uint8Array.from(forwardedBody).buffer as ArrayBuffer,
+    })
+    const forwarded = await forwardedRequest.formData()
+    expect(forwarded.get('model')).toBe('codex/codex-dictation')
+    expect(forwarded.getAll('model')).toEqual(['codex/codex-dictation', 'untrusted/model'])
+    expect(forwarded.get('language')).toBe('fa')
+    expect((forwarded.get('file') as File).name).toBe('codex.webm')
     expect(options?.redirect).toBe('error')
   })
 
-  it('does not send requests without a configured server credential', async () => {
+  it('rejects malformed multipart without contacting NineRouter', async () => {
     const request = vi.fn<typeof fetch>()
-    await expect(proxyNineRouterDictation(Buffer.alloc(0), 'application/octet-stream', ' ', request))
-      .rejects.toThrow('NineRouter API key is unavailable')
+    const malformed = await proxyNineRouterDictation(Buffer.from('bad'), 'multipart/form-data; boundary=missing', 'fixture-key', request)
+    expect(malformed.status).toBe(400)
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('supports NineRouter instances that do not require an API key', async () => {
+    const request = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ text: 'ok' }), { status: 200 }))
+    const incoming = new FormData()
+    incoming.append('file', new File([new Uint8Array([1])], 'codex.webm', { type: 'audio/webm' }))
+    const encodedRequest = new Request('http://localhost/codex-api/transcribe', { method: 'POST', body: incoming })
+
+    await expect(proxyNineRouterDictation(
+      Buffer.from(await encodedRequest.arrayBuffer()),
+      encodedRequest.headers.get('content-type')!,
+      ' ',
+      request,
+    )).resolves.toMatchObject({ status: 200 })
+    expect(request.mock.calls[0]?.[1]?.headers).toMatchObject({ 'Content-Type': encodedRequest.headers.get('content-type') })
+    expect(request.mock.calls[0]?.[1]?.headers).not.toHaveProperty('Authorization')
   })
 })
