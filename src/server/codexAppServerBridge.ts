@@ -51,6 +51,7 @@ import {
   type FreeModeState,
 } from './freeMode.js'
 import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
+import { proxyNineRouterDictation, usesNineRouterDictation } from './dictationTranscription.js'
 import { getZenModelCatalog } from './zenModelCatalog.js'
 import { normalizeProviderModelMetadata } from './providerModelMetadata.js'
 import { readConfiguredContextWindows, readConfiguredModelCatalog } from './runtimeModelCatalog.js'
@@ -8941,14 +8942,23 @@ export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): C
 
       if (req.method === 'POST' && url.pathname === '/codex-api/transcribe') {
         const auth = await readCodexAuth()
-        if (!auth) {
+        const state = ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
+        const useNineRouter = !auth && usesNineRouterDictation(state, readExplicitCodexModelProviderConfigSync())
+        const nineRouterApiKey = useNineRouter ? process.env.NINEROUTER_API_KEY?.trim() : undefined
+        if (!auth && !useNineRouter) {
           setJson(res, 401, { error: 'No auth token available for transcription' })
+          return
+        }
+        if (!auth && !nineRouterApiKey) {
+          setJson(res, 503, { error: 'NineRouter dictation needs its server API key configured.' })
           return
         }
 
         const rawBody = await readRawBody(req)
         const incomingCt = req.headers['content-type'] ?? 'application/octet-stream'
-        const upstream = await proxyTranscribe(rawBody, incomingCt, auth.accessToken, auth.accountId)
+        const upstream = auth
+          ? await proxyTranscribe(rawBody, incomingCt, auth.accessToken, auth.accountId)
+          : await proxyNineRouterDictation(rawBody, incomingCt, nineRouterApiKey!)
 
         res.statusCode = upstream.status
         res.setHeader('Content-Type', 'application/json; charset=utf-8')
