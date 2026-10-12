@@ -13,15 +13,32 @@ export async function proxyNineRouterDictation(
   request: typeof fetch = fetch,
 ): Promise<{ status: number; body: string }> {
   const token = apiKey.trim()
-  if (!token) throw new Error('NineRouter API key is unavailable')
+
+  if (!/^multipart\/form-data(?:;|$)/iu.test(contentType)) {
+    return { status: 400, body: JSON.stringify({ error: 'Invalid multipart form data' }) }
+  }
+
+  const boundaryMatch = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;\s]+))/iu.exec(contentType)
+  const boundary = boundaryMatch?.[1] ?? boundaryMatch?.[2]
+  if (!boundary || /[\r\n]/u.test(boundary)) {
+    return { status: 400, body: JSON.stringify({ error: 'Invalid multipart form data' }) }
+  }
+
+  const delimiter = Buffer.from(`--${boundary}\r\n`)
+  if (!body.subarray(0, delimiter.length).equals(delimiter)) {
+    return { status: 400, body: JSON.stringify({ error: 'Invalid multipart form data' }) }
+  }
+
+  const modelField = Buffer.from('Content-Disposition: form-data; name="model"\r\n\r\ncodex/codex-dictation\r\n')
+  const forwardedBody = Buffer.concat([delimiter, modelField, delimiter, body.subarray(delimiter.length)])
 
   const response = await request(`${NINEROUTER_BASE_URL}/audio/transcriptions`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       'Content-Type': contentType,
     },
-    body: new Uint8Array(body),
+    body: forwardedBody,
     redirect: 'error',
     signal: AbortSignal.timeout(300_000),
   })

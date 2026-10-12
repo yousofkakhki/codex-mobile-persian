@@ -1,20 +1,22 @@
 ### Feature: Dictation transcription through NineRouter
 
 #### Prerequisites
-- WebUI is using NineRouter and has its server-side `NINEROUTER_API_KEY` configured.
-- NineRouter has at least one speech-to-text provider/model configured and available to that key.
-- Browser microphone permission is granted; no ChatGPT OAuth session is required.
+- WebUI is using NineRouter; configure the server-side `NINEROUTER_API_KEY` only if NineRouter requires it.
+- NineRouter has an active Codex OAuth connection available to its STT handler.
+- Browser microphone permission is granted; Codex Mobile does not need a local ChatGPT OAuth session.
 
 #### Steps
-1. Open a thread and hold the microphone button while speaking a short test phrase.
-2. Release the button and wait for transcription.
-3. Repeat with a preferred language selected in Settings.
-4. Repeat without ChatGPT OAuth and verify the WebUI does not expose or request the NineRouter API key.
+1. Confirm NineRouter's `/v1/models/stt` catalog includes `codex/codex-dictation`.
+2. Open a thread and hold the microphone button while speaking a short test phrase.
+3. Release the button and wait for transcription.
+4. Repeat with a preferred language selected in Settings.
+5. Verify the WebUI does not expose or request the NineRouter API key.
 
 #### Expected Results
-- The server forwards the recorded multipart audio to `http://127.0.0.1:20128/v1/audio/transcriptions` using its server-only NineRouter key.
+- The server adds the fixed `codex/codex-dictation` model and forwards multipart audio to `http://127.0.0.1:20128/v1/audio/transcriptions` using its server-only NineRouter key.
+- NineRouter sends the audio to the Codex transcription endpoint using its active OAuth connection; neither credential is exposed to the browser.
 - A successful transcription appears in the composer and follows the configured auto-send preference.
-- If NineRouter has no accessible STT provider/model, its configuration error is displayed instead of a misleading missing ChatGPT-token error.
+- If NineRouter has no active Codex OAuth connection, its provider error is displayed instead of a misleading missing ChatGPT-token error.
 - Other active providers continue using the existing ChatGPT OAuth transcription path when available.
 
 #### Rollback/Cleanup

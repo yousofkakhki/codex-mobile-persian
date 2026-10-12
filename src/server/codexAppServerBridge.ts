@@ -8949,11 +8949,6 @@ export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): C
           setJson(res, 401, { error: 'No auth token available for transcription' })
           return
         }
-        if (!auth && !nineRouterApiKey) {
-          setJson(res, 503, { error: 'NineRouter dictation needs its server API key configured.' })
-          return
-        }
-
         const rawBody = await readRawBody(req)
         const incomingCt = req.headers['content-type'] ?? 'application/octet-stream'
         const upstream = auth
