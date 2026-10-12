@@ -29,7 +29,7 @@ export async function proxyNineRouterDictation(
     return { status: 400, body: JSON.stringify({ error: 'Invalid multipart form data' }) }
   }
 
-  const modelField = Buffer.from('Content-Disposition: form-data; name="model"\r\n\r\ncodex/codex-dictation\r\n')
+  const modelField = Buffer.from('Content-Disposition: form-data; name="model"\r\n\r\ncx/codex-dictation\r\n')
   const forwardedBody = Buffer.concat([delimiter, modelField, delimiter, body.subarray(delimiter.length)])
 
   const response = await request(`${NINEROUTER_BASE_URL}/audio/transcriptions`, {

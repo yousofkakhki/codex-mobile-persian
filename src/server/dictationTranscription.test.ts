@@ -43,8 +43,8 @@ describe('NineRouter dictation transcription', () => {
       body: Uint8Array.from(forwardedBody).buffer as ArrayBuffer,
     })
     const forwarded = await forwardedRequest.formData()
-    expect(forwarded.get('model')).toBe('codex/codex-dictation')
-    expect(forwarded.getAll('model')).toEqual(['codex/codex-dictation', 'untrusted/model'])
+    expect(forwarded.get('model')).toBe('cx/codex-dictation')
+    expect(forwarded.getAll('model')).toEqual(['cx/codex-dictation', 'untrusted/model'])
     expect(forwarded.get('language')).toBe('fa')
     expect((forwarded.get('file') as File).name).toBe('codex.webm')
     expect(options?.redirect).toBe('error')
