@@ -1175,6 +1175,153 @@ describe('startup refresh coalescing', () => {
 })
 
 describe('provider model selection', () => {
+  it('does not block same-provider thread selection on a model catalog refresh', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'gpt-5.5', providerId: 'openai', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.getAvailableCollaborationModes.mockResolvedValue([{ value: 'default', label: 'Default' }])
+    gatewayMocks.getAccountRateLimits.mockResolvedValue(null)
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+
+    gatewayMocks.getThreadGroupsPage.mockClear()
+    gatewayMocks.getCurrentModelConfig.mockClear()
+    gatewayMocks.getAvailableModelIds.mockClear()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    let releaseCatalog: ((modelIds: string[]) => void) | undefined
+    gatewayMocks.getAvailableModelIds.mockImplementation(() => new Promise(resolve => {
+      releaseCatalog = resolve
+    }))
+
+    let selectionResolved = false
+    const selection = state.selectThread('same-provider-thread').then(result => {
+      selectionResolved = true
+      return result
+    })
+
+    try {
+      await vi.waitFor(() => expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(1))
+      await vi.waitFor(() => expect(selectionResolved).toBe(true))
+      expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledWith({
+        includeProviderModels: false,
+        requireProviderModels: false,
+        providerId: undefined,
+        onMetadata: expect.any(Function),
+      })
+      expect(gatewayMocks.getThreadGroupsPage).not.toHaveBeenCalled()
+    } finally {
+      releaseCatalog?.(['gpt-5.5'])
+    }
+
+    await expect(selection).resolves.toBe('ok')
+  })
+
+  it('waits for the initial provider catalog before loading a thread', async () => {
+    installTestWindow()
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/gpt-6.1-sol', providerId: 'ninerouter', reasoningEffort: 'high', speedMode: 'standard' })
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'cx/gpt-6.1-sol',
+      modelProvider: 'ninerouter',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    let releaseInitialCatalog: ((modelIds: string[]) => void) | undefined
+    let catalogCalls = 0
+    gatewayMocks.getAvailableModelIds.mockImplementation(() => {
+      catalogCalls += 1
+      if (catalogCalls === 1) {
+        return new Promise(resolve => { releaseInitialCatalog = resolve })
+      }
+      return Promise.resolve(['cx/gpt-6.1-sol'])
+    })
+
+    const state = useDesktopState()
+    let selectionResolved = false
+    const selection = state.selectThread('initial-provider-thread').then(result => {
+      selectionResolved = true
+      return result
+    })
+
+    try {
+      await vi.waitFor(() => expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(1))
+      expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledWith({
+        includeProviderModels: true,
+        requireProviderModels: true,
+        providerId: 'ninerouter',
+        onMetadata: expect.any(Function),
+      })
+      expect(selectionResolved).toBe(false)
+      expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+    } finally {
+      releaseInitialCatalog?.(['cx/gpt-6.1-sol'])
+    }
+
+    await expect(selection).resolves.toBe('ok')
+    expect(gatewayMocks.resumeThread).toHaveBeenCalledTimes(1)
+  })
+
+  it('loads latest A after initial deferred A-B-A selection without stale load suppression', async () => {
+    installTestWindow()
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'Ggh', providerId: 'custom_endpoint', reasoningEffort: '', speedMode: 'standard' })
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.resumeThread.mockImplementation(async (_threadId, options) => ({
+      model: options?.model,
+      modelProvider: options?.modelProvider,
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    }))
+    const catalogs: Array<(modelIds: string[]) => void> = []
+    gatewayMocks.getAvailableModelIds.mockImplementation(() => new Promise<string[]>(resolve => { catalogs.push(resolve) }))
+
+    const state = useDesktopState()
+    const first = state.selectThread('aba-latest')
+    await vi.waitFor(() => expect(catalogs).toHaveLength(1))
+    const middle = state.selectThread('aba-middle')
+    await vi.waitFor(() => expect(catalogs).toHaveLength(2))
+    const latest = state.selectThread('aba-latest')
+    await vi.waitFor(() => expect(catalogs).toHaveLength(3))
+
+    try {
+      catalogs[0]!(['cx/gpt-6.1-sol'])
+      await first
+      expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+      catalogs[1]!(['cx/gpt-6.1-sol'])
+      await middle
+      expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+      catalogs[2]!(['cx/gpt-6.1-sol'])
+      expect(await latest).toBe('ok')
+      expect(state.selectedThreadId.value).toBe('aba-latest')
+      expect(gatewayMocks.resumeThread).toHaveBeenCalledTimes(1)
+      expect(gatewayMocks.resumeThread).toHaveBeenLastCalledWith('aba-latest', expect.objectContaining({ modelProvider: 'custom-endpoint', model: 'cx/gpt-6.1-sol' }))
+      expect(await first).toBe('ok')
+      expect(await middle).toBe('ok')
+      expect(state.error.value).toBe('')
+      expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(3)
+      expect(gatewayMocks.getThreadDetail).not.toHaveBeenCalled()
+      expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    } finally {
+      catalogs.forEach(release => release(['cx/gpt-6.1-sol']))
+      await Promise.all([first, middle, latest])
+    }
+  })
+
   it('discards stale provider metadata when an older catalog settles after a newer refresh', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
@@ -1740,4 +1887,128 @@ describe('literal Goal finite-policy separation', () => {
       expect(gatewayMocks.getThreadGoal).not.toHaveBeenCalled()
       expect(gatewayMocks.setThreadGoal).not.toHaveBeenCalled()
     })
+})
+
+
+describe('thread-switch routing readiness', () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>(release => { resolve = release })
+    return { promise, resolve }
+  }
+  function detail(provider = 'codex', model = 'gpt-5.5') {
+    return { model, modelProvider: provider, messages: [], inProgress: false, activeTurnId: '', hasMoreOlder: false, turnIndexByTurnId: {} }
+  }
+  beforeEach(() => {
+    vi.resetAllMocks()
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getWorkspaceRootsState.mockRejectedValue(new Error('fixture roots unavailable'))
+    gatewayMocks.getThreadTitleCache.mockResolvedValue({ titles: {} })
+    gatewayMocks.getThreadQueueState.mockResolvedValue({})
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'gpt-5.5', providerId: 'codex', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.getAvailableCollaborationModes.mockResolvedValue([{ value: 'default', label: 'Default' }])
+    gatewayMocks.getAccountRateLimits.mockResolvedValue(null)
+    gatewayMocks.resumeThread.mockImplementation(async (_id, options) => detail(options?.modelProvider, options?.model))
+    gatewayMocks.getThreadDetail.mockResolvedValue(detail())
+    gatewayMocks.startThreadTurn.mockResolvedValue('fixture-turn')
+  })
+
+  it('blocks writer acquisition until authoritative changed-provider config and catalog complete', async () => {
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    gatewayMocks.getCurrentModelConfig.mockClear()
+    const config = deferred<{ model: string; providerId: string; reasoningEffort: string; speedMode: string }>()
+    const catalog = deferred<string[]>()
+    gatewayMocks.getCurrentModelConfig.mockImplementationOnce(() => config.promise)
+    gatewayMocks.getAvailableModelIds.mockImplementationOnce(() => catalog.promise)
+    let resolved = false
+    const selection = state.selectThread('changed-provider-thread').then(result => { resolved = true; return result })
+    try {
+      await vi.waitFor(() => expect(gatewayMocks.getCurrentModelConfig).toHaveBeenCalledTimes(1))
+      expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+      expect(resolved).toBe(false)
+      const sending = await state.sendMessageToSelectedThread('fixture only').then(() => null, (error: unknown) => error)
+      expect(sending).toBeInstanceOf(Error)
+      expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+      config.resolve({ model: 'cx/current', providerId: 'ninerouter', reasoningEffort: 'high', speedMode: 'standard' })
+      await vi.waitFor(() => expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(2))
+      expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+      expect(resolved).toBe(false)
+      expect(await state.sendMessageToSelectedThread('catalog pending').then(() => null, (error: unknown) => error)).toBeInstanceOf(Error)
+      expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    } finally {
+      config.resolve({ model: 'cx/current', providerId: 'ninerouter', reasoningEffort: 'high', speedMode: 'standard' })
+      catalog.resolve(['cx/current'])
+      await selection
+    }
+    expect(await selection).toBe('ok')
+    expect(gatewayMocks.resumeThread).toHaveBeenCalledWith('changed-provider-thread', expect.objectContaining({ modelProvider: 'ninerouter', model: 'cx/current' }))
+    await state.sendMessageToSelectedThread('ready fixture')
+    expect(gatewayMocks.startThreadTurn.mock.calls.at(-1)?.[3]).toBe('cx/current')
+    expect(gatewayMocks.getThreadGroupsPage).toHaveBeenCalledTimes(1)
+  })
+
+
+  it('awaits the latest initial catalog across rapid navigation instead of acquiring with the abandoned catalog', async () => {
+    const state = useDesktopState()
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/current', providerId: 'ninerouter', reasoningEffort: 'high', speedMode: 'standard' })
+    const catalogs: Array<{ release: (ids: string[]) => void; metadata: (models: unknown[]) => void }> = []
+    let cleaningUp = false
+    gatewayMocks.getAvailableModelIds.mockImplementation(options => {
+      if (cleaningUp) return Promise.resolve(['cx/current'])
+      return new Promise<string[]>(resolve => { catalogs.push({ release: resolve, metadata: options.onMetadata }) })
+    })
+    const first = state.selectThread('rapid-first')
+    await vi.waitFor(() => expect(catalogs).toHaveLength(1))
+    let latestResolved = false
+    const latest = state.selectThread('rapid-latest').then(result => { latestResolved = true; return result })
+    try {
+      await vi.waitFor(() => expect(catalogs).toHaveLength(2))
+      catalogs[0]!.metadata([{ id: 'cx/retired', contextWindow: 999999, reasoningOptions: ['max'] }])
+      catalogs[0]!.release(['cx/retired'])
+      for (let tick = 0; tick < 8; tick += 1) await Promise.resolve()
+      expect(latestResolved).toBe(false)
+      expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+      expect(state.availableModelMetadata.value).toEqual([])
+      expect(await state.sendMessageToSelectedThread('rapid pending fixture').then(() => null, (error: unknown) => error)).toBeInstanceOf(Error)
+      expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    } finally {
+      cleaningUp = true
+      catalogs.forEach(catalog => catalog.release(['cx/current']))
+      catalogs[1]?.metadata([{ id: 'cx/current', contextWindow: 1000, reasoningOptions: ['high'], reasoningSource: 'provider-catalog' }])
+      await Promise.all([first, latest])
+    }
+    expect(await latest).toBe('ok')
+    expect(state.selectedThreadId.value).toBe('rapid-latest')
+    expect(state.availableModelMetadata.value).toMatchObject([{ id: 'cx/current', contextWindow: 1000 }])
+    expect(gatewayMocks.resumeThread).toHaveBeenCalledTimes(1)
+    expect(gatewayMocks.resumeThread).toHaveBeenLastCalledWith('rapid-latest', expect.objectContaining({ model: 'cx/current', modelProvider: 'ninerouter' }))
+    expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(2)
+  })
+
+
+  it.each(['config', 'catalog'] as const)('keeps writer acquisition blocked after a thread-switch %s failure', async (stage) => {
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+    if (stage === 'config') gatewayMocks.getCurrentModelConfig.mockRejectedValueOnce(new Error('fixture config unavailable'))
+    else gatewayMocks.getAvailableModelIds.mockRejectedValueOnce(new Error('fixture catalog unavailable'))
+    expect(await state.selectThread('failure-thread')).toBe('error')
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    if (stage === 'config') expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+    expect(await state.sendMessageToSelectedThread('failed refresh fixture').then(() => null, (error: unknown) => error)).toBeInstanceOf(Error)
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+    expect(state.availableModelIds.value).toEqual([])
+  })
+
+  it('fails closed when an authoritative initial catalog is empty', async () => {
+    const state = useDesktopState()
+    gatewayMocks.getAvailableModelIds.mockResolvedValue([])
+    expect(await state.selectThread('empty-catalog-thread')).toBe('error')
+    expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+    expect(await state.sendMessageToSelectedThread('no catalog fixture').then(() => null, (error: unknown) => error)).toBeInstanceOf(Error)
+    expect(gatewayMocks.startThreadTurn).not.toHaveBeenCalled()
+  })
 })
