@@ -2205,16 +2205,35 @@ export function useDesktopState() {
   let modelRefreshGeneration = 0
   let providerRoutingGeneration = 0
 
-  async function refreshModelPreferences(options?: { providerChanged?: boolean; includeProviderModels?: boolean }): Promise<void> {
+  async function refreshModelPreferences(options?: { providerChanged?: boolean; includeProviderModels?: boolean; onRoutingReady?: (canReuseCatalog: boolean) => void }): Promise<void> {
     const generation = ++modelRefreshGeneration
     const refreshThreadId = selectedThreadId.value
+    const previousCatalogError = modelCatalogError.value
+    if (options?.onRoutingReady) modelCatalogError.value = 'Global provider is refreshing; retry the message after the model catalog loads'
     codexCliMissingError.value = ''
     try {
       const currentConfig = await getCurrentModelConfig()
       if (generation !== modelRefreshGeneration || refreshThreadId !== selectedThreadId.value) return
       const normalizedConfiguredModelId = currentConfig.model.trim()
       const normalizedProviderId = normalizeProviderContextId(currentConfig.providerId)
+      const canReuseCatalog = !previousCatalogError && activeProviderId.value === normalizedProviderId && availableModelIds.value.length > 0
+      if (options?.onRoutingReady) {
+        if (canReuseCatalog) {
+          modelCatalogError.value = ''
+        } else {
+          availableModelIds.value = []
+          availableModelMetadata.value = []
+          selectedModelId.value = ''
+          if (activeProviderId.value !== normalizedProviderId) {
+            providerRoutingGeneration += 1
+            resumedThreadById.value = {}
+            threadModelProviderByThreadId.value = {}
+            invalidateThreadResumeCache()
+          }
+        }
+      }
       activeProviderId.value = normalizedProviderId
+      options?.onRoutingReady?.(canReuseCatalog)
       const targetProviderId = readProviderIdForThread(selectedThreadId.value)
       const isProviderBacked = targetProviderId !== 'codex'
       let metadata: ZenModelMetadata[] = []
@@ -2243,6 +2262,7 @@ export function useDesktopState() {
       ) {
         nextModelIds.push(normalizedConfiguredModelId)
       }
+      if (options?.onRoutingReady && nextModelIds.length === 0) throw new Error('No compatible model is available for the global provider')
       availableModelIds.value = nextModelIds
 
       const currentModelInNewList = normalizedSelectedModelId && modelIds.includes(normalizedSelectedModelId)
@@ -2308,6 +2328,9 @@ export function useDesktopState() {
       availableModelMetadata.value = []
       selectedModelId.value = ''
       error.value = modelCatalogError.value
+    } finally {
+      // Also release selections superseded during config discovery or a failure.
+      options?.onRoutingReady?.(false)
     }
   }
 
@@ -5026,23 +5049,32 @@ export function useDesktopState() {
     }
   }
 
+  let threadSelectionGeneration = 0
+
   async function selectThread(threadId: string): Promise<SelectThreadResult> {
-    const previousProviderId = activeProviderId.value
+    const selectionGeneration = ++threadSelectionGeneration
     setSelectedThreadId(threadId)
     if (!threadId.trim()) return 'ok'
 
     try {
+      let resolveRouting!: (canReuseCatalog: boolean) => void
+      const routingReady = new Promise<boolean>(resolve => { resolveRouting = resolve })
+      const modelRefresh = refreshModelPreferences({
+        // Provider-backed routing always requires its catalog; Codex never needs
+        // the separate provider discovery, even when cached routing was different.
+        includeProviderModels: false,
+        onRoutingReady: resolveRouting,
+      })
+      // Verify authoritative routing before any writer acquisition. An unchanged
+      // ready catalog can still be refreshed off the navigation critical path.
+      if (!await routingReady) await modelRefresh
+      if (selectionGeneration !== threadSelectionGeneration || selectedThreadId.value !== threadId) return 'ok'
       await loadMessages(threadId)
-      const targetProviderId = readProviderIdForThread(threadId)
-      const modelRefresh = refreshModelPreferences({ includeProviderModels: targetProviderId !== 'codex' })
-      if (previousProviderId && targetProviderId === previousProviderId) {
-        void modelRefresh
-      } else {
-        await modelRefresh
-      }
+      if (selectionGeneration !== threadSelectionGeneration || selectedThreadId.value !== threadId) return 'ok'
       void refreshSkills()
       return 'ok'
     } catch (unknownError) {
+      if (selectionGeneration !== threadSelectionGeneration || selectedThreadId.value !== threadId) return 'ok'
       const message = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       error.value = message
       const result = isThreadNotFoundError(unknownError) ? 'not-found' : 'error'
