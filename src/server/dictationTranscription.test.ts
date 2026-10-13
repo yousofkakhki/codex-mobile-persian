@@ -2,6 +2,17 @@ import { describe, expect, it, vi } from 'vitest'
 import { proxyNineRouterDictation, usesNineRouterDictation } from './dictationTranscription'
 
 describe('NineRouter dictation transcription', () => {
+  it.each(['multipart/form-data; boundary="bad\r\nInjected: x"',
+    'multipart/form-data; boundary=' + 'a'.repeat(71),
+    'multipart/form-data; boundary=one; boundary=two',
+    'multipart/form-data; boundary="bad;value"'])('rejects invalid boundary %s', async contentType => {
+    const request = vi.fn<typeof fetch>(async () => new Response('{"text":"wrong"}'))
+    const boundary = contentType.includes('71') ? 'missing' : contentType.match(/boundary="?([^";]+)/)?.[1] ?? ''
+    const result = await proxyNineRouterDictation(Buffer.from(`--${boundary}\r\n`), contentType, 'fixture-marker', request)
+    expect(result.status).toBe(400)
+    expect(request).not.toHaveBeenCalled()
+  })
+
   it('uses NineRouter only when it is the active provider', () => {
     expect(usesNineRouterDictation({ enabled: true, provider: 'ninerouter', apiKey: null, model: '' }, null)).toBe(true)
     expect(usesNineRouterDictation({ enabled: false, provider: 'ninerouter', apiKey: null, model: '' }, null)).toBe(true)
@@ -44,7 +55,8 @@ describe('NineRouter dictation transcription', () => {
     })
     const forwarded = await forwardedRequest.formData()
     expect(forwarded.get('model')).toBe('cx/codex-dictation')
-    expect(forwarded.getAll('model')).toEqual(['cx/codex-dictation', 'untrusted/model'])
+    // Explicit security correction: duplicate caller models can override the fixed STT model.
+    expect(forwarded.getAll('model')).toEqual(['cx/codex-dictation'])
     expect(forwarded.get('language')).toBe('fa')
     expect((forwarded.get('file') as File).name).toBe('codex.webm')
     expect(options?.redirect).toBe('error')
@@ -58,7 +70,8 @@ describe('NineRouter dictation transcription', () => {
   })
 
   it('supports NineRouter instances that do not require an API key', async () => {
-    const request = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ text: 'ok' }), { status: 200 }))
+    // Explicit fixture correction: the safe adapter requires the provider's JSON media type.
+    const request = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ text: 'ok' }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     const incoming = new FormData()
     incoming.append('file', new File([new Uint8Array([1])], 'codex.webm', { type: 'audio/webm' }))
     const encodedRequest = new Request('http://localhost/codex-api/transcribe', { method: 'POST', body: incoming })
