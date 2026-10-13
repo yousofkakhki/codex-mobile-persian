@@ -78,6 +78,10 @@ export const OPENCODE_ZEN_DEFAULT_MODEL = 'muse-spark-1.3-contributor-free'
 export const NINEROUTER_BASE_URL = 'http://127.0.0.1:20128/v1'
 const NINEROUTER_ENV_KEY = 'NINEROUTER_API_KEY'
 
+export function getNinerouterBaseUrl(): string {
+  return process.env.NINEROUTER_BASE_URL?.trim() || NINEROUTER_BASE_URL
+}
+
 export type WireApi = 'responses' | 'chat'
 
 export interface FreeModeState {
@@ -185,7 +189,7 @@ function getNinerouterProviderConfigArgs(): string[] {
   const providerConfigKey = `model_providers.${NINEROUTER_RUNTIME_PROVIDER_ID}`
   return [
     '-c', `${providerConfigKey}.name="9router"`,
-    '-c', `${providerConfigKey}.base_url="${NINEROUTER_BASE_URL}"`,
+    '-c', `${providerConfigKey}.base_url="${getNinerouterBaseUrl()}"`,
     '-c', `${providerConfigKey}.wire_api="responses"`,
     '-c', `${providerConfigKey}.env_key="${NINEROUTER_ENV_KEY}"`,
   ]

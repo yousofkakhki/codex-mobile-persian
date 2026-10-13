@@ -2,6 +2,7 @@
 
 #### Prerequisites
 - The app server has `NINEROUTER_API_KEY` configured outside the repository.
+- The app server uses `NINEROUTER_BASE_URL` for the provider API root when 9Router is not local; for example, `https://router.meetan.me/v1`.
 - App server is running from this repository.
 - A disposable thread and non-sensitive prompt are available.
 
