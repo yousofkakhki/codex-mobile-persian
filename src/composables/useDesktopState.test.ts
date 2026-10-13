@@ -1175,6 +1175,105 @@ describe('startup refresh coalescing', () => {
 })
 
 describe('provider model selection', () => {
+  it('does not block same-provider thread selection on a model catalog refresh', async () => {
+    installTestWindow()
+    gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'gpt-5.5', providerId: 'openai', reasoningEffort: 'medium', speedMode: 'standard' })
+    gatewayMocks.getAvailableModelIds.mockResolvedValue(['gpt-5.5'])
+    gatewayMocks.getSkillsList.mockResolvedValue([])
+    gatewayMocks.getAvailableCollaborationModes.mockResolvedValue([{ value: 'default', label: 'Default' }])
+    gatewayMocks.getAccountRateLimits.mockResolvedValue(null)
+
+    const state = useDesktopState()
+    await state.refreshAll({ includeSelectedThreadMessages: false, awaitAncillaryRefreshes: true })
+
+    gatewayMocks.getThreadGroupsPage.mockClear()
+    gatewayMocks.getCurrentModelConfig.mockClear()
+    gatewayMocks.getAvailableModelIds.mockClear()
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'gpt-5.5',
+      modelProvider: 'openai',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    let releaseCatalog: ((modelIds: string[]) => void) | undefined
+    gatewayMocks.getAvailableModelIds.mockImplementation(() => new Promise(resolve => {
+      releaseCatalog = resolve
+    }))
+
+    let selectionResolved = false
+    const selection = state.selectThread('same-provider-thread').then(result => {
+      selectionResolved = true
+      return result
+    })
+
+    try {
+      await vi.waitFor(() => expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(1))
+      await vi.waitFor(() => expect(selectionResolved).toBe(true))
+      expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledWith({
+        includeProviderModels: false,
+        requireProviderModels: false,
+        providerId: undefined,
+        onMetadata: expect.any(Function),
+      })
+      expect(gatewayMocks.getThreadGroupsPage).not.toHaveBeenCalled()
+    } finally {
+      releaseCatalog?.(['gpt-5.5'])
+    }
+
+    await expect(selection).resolves.toBe('ok')
+  })
+
+  it('waits for the initial provider catalog before loading a thread', async () => {
+    installTestWindow()
+    gatewayMocks.getCurrentModelConfig.mockResolvedValue({ model: 'cx/gpt-6.1-sol', providerId: 'ninerouter', reasoningEffort: 'high', speedMode: 'standard' })
+    gatewayMocks.resumeThread.mockResolvedValue({
+      model: 'cx/gpt-6.1-sol',
+      modelProvider: 'ninerouter',
+      messages: [],
+      inProgress: false,
+      activeTurnId: '',
+      hasMoreOlder: false,
+      turnIndexByTurnId: {},
+    })
+    let releaseInitialCatalog: ((modelIds: string[]) => void) | undefined
+    let catalogCalls = 0
+    gatewayMocks.getAvailableModelIds.mockImplementation(() => {
+      catalogCalls += 1
+      if (catalogCalls === 1) {
+        return new Promise(resolve => { releaseInitialCatalog = resolve })
+      }
+      return Promise.resolve(['cx/gpt-6.1-sol'])
+    })
+
+    const state = useDesktopState()
+    let selectionResolved = false
+    const selection = state.selectThread('initial-provider-thread').then(result => {
+      selectionResolved = true
+      return result
+    })
+
+    try {
+      await vi.waitFor(() => expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledTimes(1))
+      expect(gatewayMocks.getAvailableModelIds).toHaveBeenCalledWith({
+        includeProviderModels: true,
+        requireProviderModels: true,
+        providerId: 'ninerouter',
+        onMetadata: expect.any(Function),
+      })
+      expect(selectionResolved).toBe(false)
+      expect(gatewayMocks.resumeThread).not.toHaveBeenCalled()
+    } finally {
+      releaseInitialCatalog?.(['cx/gpt-6.1-sol'])
+    }
+
+    await expect(selection).resolves.toBe('ok')
+    expect(gatewayMocks.resumeThread).toHaveBeenCalledTimes(1)
+  })
+
   it('discards stale provider metadata when an older catalog settles after a newer refresh', async () => {
     installTestWindow()
     gatewayMocks.getThreadGroupsPage.mockResolvedValue({ groups: [], nextCursor: null })

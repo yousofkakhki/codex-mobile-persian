@@ -5027,12 +5027,19 @@ export function useDesktopState() {
   }
 
   async function selectThread(threadId: string): Promise<SelectThreadResult> {
+    const previousProviderId = activeProviderId.value
     setSelectedThreadId(threadId)
     if (!threadId.trim()) return 'ok'
 
     try {
       await loadMessages(threadId)
-      await refreshModelPreferences({ includeProviderModels: true })
+      const targetProviderId = readProviderIdForThread(threadId)
+      const modelRefresh = refreshModelPreferences({ includeProviderModels: targetProviderId !== 'codex' })
+      if (previousProviderId && targetProviderId === previousProviderId) {
+        void modelRefresh
+      } else {
+        await modelRefresh
+      }
       void refreshSkills()
       return 'ok'
     } catch (unknownError) {
