@@ -7,7 +7,7 @@ import { assertThreadProjectionIntegrity } from './threadProjectionIntegrity'
 import { createCodexProjectionFixture } from './threadProjectionFixture'
 import { STATE_SQLX_MIGRATION_SHA384, HISTORY_SQLX_MIGRATION_SHA384 } from './threadProjectionMigrations'
 
-test('accepts healthy state59/history7 with complete verified official migration checksums', async () => {
+test('accepts healthy state59/history8 with complete verified official migration checksums', async () => {
   const home = createCodexProjectionFixture()
   try { await expect(assertThreadProjectionIntegrity(home, 'fixture')).resolves.toBeUndefined() }
   finally { await rm(home, {recursive: true, force: true}) }
@@ -36,6 +36,21 @@ test('applies the reviewed state59 attachment lookup index', async () => {
         .map((column: {name: string}) => column.name)).toEqual(['attachment_type', 'identity_key', 'thread_id'])
       expect(database.prepare('SELECT MAX(version) AS version FROM _sqlx_migrations').get().version).toBe(59)
     } finally { database.close() }
+  } finally { await rm(home, {recursive: true, force: true}) }
+})
+
+test('applies the reviewed history8 nullable turn root without changing the projection contract', async () => {
+  const home = createCodexProjectionFixture()
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite')
+  try {
+    const database = new DatabaseSync(join(home, 'thread_history_1.sqlite'), {readOnly: true})
+    try {
+      expect(database.prepare('PRAGMA table_info(thread_turns)').all()
+        .find((column: {name: string}) => column.name === 'root_turn_id'))
+        .toMatchObject({type: 'TEXT', notnull: 0, pk: 0})
+      expect(database.prepare('SELECT MAX(version) AS version FROM _sqlx_migrations').get().version).toBe(8)
+    } finally { database.close() }
+    await expect(assertThreadProjectionIntegrity(home, 'fixture')).resolves.toBeUndefined()
   } finally { await rm(home, {recursive: true, force: true}) }
 })
 

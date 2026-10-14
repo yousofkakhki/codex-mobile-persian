@@ -15,7 +15,7 @@ export function createCodexProjectionFixture(options: {stateVersion?: number; hi
   const rollout = join(home, 'fixture.jsonl')
   writeFileSync(rollout, '{}\n')
   for (const kind of ['state', 'history'] as const) {
-    const max = kind === 'state' ? (options.stateVersion ?? 59) : (options.historyVersion ?? 7)
+    const max = kind === 'state' ? (options.stateVersion ?? 59) : (options.historyVersion ?? 8)
     const db = new DatabaseSync(join(home, kind === 'state' ? 'state_5.sqlite' : 'thread_history_1.sqlite'))
     try {
       db.exec('BEGIN')

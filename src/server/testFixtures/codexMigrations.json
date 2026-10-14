@@ -530,6 +530,14 @@
       "path": "codex-rs/state/thread_history_migrations/0007_thread_item_lifecycle_timestamps.sql",
       "sha384": "9334ADB4CDA792116A47B69A19E3840AE3806B08773EF1794043FE0AA72891360ACB1A0A8431084D53C568482C5FDD20",
       "sql": "ALTER TABLE thread_items ADD COLUMN started_at_ms INTEGER;\nALTER TABLE thread_items ADD COLUMN completed_at_ms INTEGER;\n"
+    },
+    {
+      "kind": "history",
+      "version": 8,
+      "description": "thread turn root",
+      "path": "codex-rs/state/thread_history_migrations/0008_thread_turn_root.sql",
+      "sha384": "94635CD58535ADB1679F4AD07A9D14231B69004405FA88A22DB1B6A7E5FEAC8B6B66AD97EA16FCE464B99BFF5B3548D3",
+      "sql": "ALTER TABLE thread_turns ADD COLUMN root_turn_id TEXT;\n"
     }
   ]
 }
