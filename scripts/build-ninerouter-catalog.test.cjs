@@ -60,7 +60,9 @@ test('CLI uses one offline catalog fetch and atomically writes a private file on
   const output = join(dir, 'output.json')
   const preload = join(dir, 'offline-fetch.cjs')
   const data = { models: [{ slug: 'gpt-5.6-sol', context_window: 272000, supported_reasoning_levels: [], default_reasoning_level: 'low' }] }
-  const cli = (...args) => spawnSync(process.execPath, ['--require', preload, require.resolve('./build-ninerouter-catalog.cjs'), ...args], { encoding: 'utf8' })
+  const cli = (...args) => spawnSync(process.execPath, ['--require', preload, require.resolve('./build-ninerouter-catalog.cjs'), ...args], {
+    encoding: 'utf8', env: { ...process.env, NINEROUTER_API_KEY: '', NINEROUTER_BASE_URL: '' },
+  })
   try {
     await fs.writeFile(binary, 'prefix' + JSON.stringify(data, null, 2) + 'suffix')
     await fs.writeFile(preload, `globalThis.fetch = async (url) => { if (url !== 'https://offline.invalid/models') throw new Error('unexpected network target'); console.log('FIXTURE_REQUEST_COUNT=1'); return new Response(JSON.stringify({data:[{id:'cx/gpt-6.1-sol',context_length:1000}]}), {status:200}) }`)
@@ -79,6 +81,40 @@ test('CLI uses one offline catalog fetch and atomically writes a private file on
     result = cli('--binary', binary, '--output')
     assert.equal(result.status, 1)
     assert.match(result.stderr, /Required|Missing/)
+  } finally { await fs.rm(dir, { recursive: true, force: true }) }
+})
+
+test('CLI sends the NineRouter token only to its configured origin', async () => {
+  const fs = require('node:fs/promises')
+  const { join } = require('node:path')
+  const { tmpdir } = require('node:os')
+  const { spawnSync } = require('node:child_process')
+  const dir = await fs.mkdtemp(join(tmpdir(), 'metadata-builder-auth-'))
+  const binary = join(dir, 'fixture-binary')
+  const output = join(dir, 'output.json')
+  const preload = join(dir, 'offline-fetch.cjs')
+  const bundled = { models: [{ slug: 'gpt-5.6-sol', context_window: 272000, default_reasoning_level: 'low', supported_reasoning_levels: [] }] }
+  const run = (url, configuredUrl, expectAuthorization) => spawnSync(process.execPath, [
+    '--require', preload, require.resolve('./build-ninerouter-catalog.cjs'),
+    '--binary', binary, '--output', output, '--models-url', url,
+  ], {
+    encoding: 'utf8', env: {
+      ...process.env, NINEROUTER_API_KEY: 'fixture-catalog-token',
+      NINEROUTER_BASE_URL: configuredUrl, EXPECT_CATALOG_AUTH: expectAuthorization ? '1' : '0',
+    },
+  })
+  try {
+    await fs.writeFile(binary, 'prefix' + JSON.stringify(bundled, null, 2) + 'suffix')
+    await fs.writeFile(preload, `globalThis.fetch = async (url, options = {}) => {
+      if (process.env.EXPECT_CATALOG_AUTH === '1') {
+        if (options.headers?.Authorization !== 'Bearer fixture-catalog-token') throw new Error('expected configured-origin authorization')
+      } else if (options.headers?.Authorization) throw new Error('authorization leaked to a different origin')
+      return new Response(JSON.stringify({data:[{id:'cx/gpt-6.1-sol',context_length:1000}]}), {status:200})
+    }`)
+    const sameOrigin = run('https://router.fixture/v1/models', 'https://router.fixture/v1', true)
+    assert.equal(sameOrigin.status, 0, sameOrigin.stderr)
+    const differentOrigin = run('https://offline.invalid/models', 'https://router.fixture/v1', false)
+    assert.equal(differentOrigin.status, 0, differentOrigin.stderr)
   } finally { await fs.rm(dir, { recursive: true, force: true }) }
 })
 
@@ -123,7 +159,7 @@ test('native exact alias clones the entire true descriptor without mutating any 
   assert.deepEqual(exact, { ...native.models[0],
     slug: 'cx/gpt-6.1-sol', display_name: 'cx/gpt-6.1-sol',
     context_window: 1050000, max_context_window: 1050000,
-    auto_compact_token_limit: 900000, prefer_websockets: false, visibility: 'list',
+    auto_compact_token_limit: 735000, prefer_websockets: false, visibility: 'list',
   })
   assert.deepEqual(output.models.slice(0, bundled.models.length), bundled.models)
   assert.deepEqual({ bundled, native, advertised }, before)
@@ -258,7 +294,7 @@ test('CLI native option writes the exact native descriptor using a single offlin
     assert.equal(result.stdout.split('FIXTURE_REQUEST_COUNT=1').length - 1, 1)
     assert.equal((await fs.stat(output)).mode & 0o777, 0o600)
     const actual = JSON.parse(await fs.readFile(output, 'utf8')).models.at(-1)
-    assert.deepEqual(actual, { ...native.models[0], slug: 'cx/gpt-6.1-sol', display_name: 'cx/gpt-6.1-sol', context_window: 1050000, max_context_window: 1050000, auto_compact_token_limit: 900000, prefer_websockets: false, visibility: 'list' })
+    assert.deepEqual(actual, { ...native.models[0], slug: 'cx/gpt-6.1-sol', display_name: 'cx/gpt-6.1-sol', context_window: 1050000, max_context_window: 1050000, auto_compact_token_limit: 735000, prefer_websockets: false, visibility: 'list' })
     assert.deepEqual((await fs.readdir(dir)).sort(), ['fixture-binary', 'native.json', 'offline-fetch.cjs', 'output.json'])
   } finally { await fs.rm(dir, { recursive: true, force: true }) }
 })
@@ -348,7 +384,7 @@ test('all exact audited native Ultra bases use their own complete descriptors wi
   native.models[0].base_instructions = 'distinct astra fixture instructions'
   const output = api.buildCatalog(bundledFixture(), { data: [{ id: 'cx/gpt-6-astra', context_length: 1000 }] }, native)
   assert.deepEqual(output.models.at(-1), { ...native.models[0], slug: 'cx/gpt-6-astra', display_name: 'cx/gpt-6-astra',
-    context_window: 1000, max_context_window: 1000, auto_compact_token_limit: 900, prefer_websockets: false, visibility: 'list' })
+    context_window: 1000, max_context_window: 1000, auto_compact_token_limit: 700, prefer_websockets: false, visibility: 'list' })
 })
 
 
@@ -426,7 +462,7 @@ test('audited one-million and review bindings clone only exact reviewed native d
     const model = output.models.find(model => model.slug === id)
     assert.ok(model, id)
     assert.deepEqual(model, { ...native.models.find(model => model.slug === slug), slug: id, display_name: id,
-      context_window: 872000, max_context_window: 872000, auto_compact_token_limit: 784800, prefer_websockets: false, visibility: 'list' })
+      context_window: 872000, max_context_window: 872000, auto_compact_token_limit: 610400, prefer_websockets: false, visibility: 'list' })
   }
 })
 
@@ -441,16 +477,17 @@ test('duplicate advertised audited IDs cannot trust a first permissive row', () 
 })
 test('does not postpone compaction when a gateway advertises a larger context', () => {
  const bundled={models:[{slug:'gpt-5.6-sol',context_window:272000,auto_compact_token_limit:null}]}
- const output=api.buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000}]})
+ const output=api.buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000},{id:'cx/gpt-6-sol',context_length:272000}]})
  assert.equal(output.models[1].context_window,1050000)
  assert.equal(output.models[1].auto_compact_token_limit,244800)
+ assert.equal(output.models[2].auto_compact_token_limit,190400)
  assert.equal(bundled.models[0].auto_compact_token_limit,null)
 })
 test('preserves explicit compaction limits and clamps them to smaller gateway windows', () => {
  const bundled={models:[{slug:'gpt-5.6-sol',context_window:272000,auto_compact_token_limit:180000}]}
  const output=api.buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000},{id:'cx/gpt-5.6-sol',context_length:100000}]})
  assert.equal(output.models[1].auto_compact_token_limit,180000)
- assert.equal(output.models[2].auto_compact_token_limit,90000)
+ assert.equal(output.models[2].auto_compact_token_limit,70000)
 })
 test('rejects descriptors without a valid native context for safe compaction', () => {
  const bundled={models:[{slug:'gpt-5.6-sol',context_window:null}]}

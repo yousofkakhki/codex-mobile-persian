@@ -33,9 +33,11 @@
   "files": [
     "dist/",
     "dist-cli/",
+    "scripts/build-ninerouter-catalog.cjs",
     "scripts/dev.cjs",
     "scripts/dev-random-home.cjs",
-    "scripts/fix-pty-native-build.cjs"
+    "scripts/fix-pty-native-build.cjs",
+    "src/server/runtimeLocalUltra.mjs"
   ],
   "pnpm": {
     "onlyBuiltDependencies": [

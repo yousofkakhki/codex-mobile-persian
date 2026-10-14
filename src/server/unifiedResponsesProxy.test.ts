@@ -268,4 +268,45 @@ describe('unified responses proxy reasoning_content translation', () => {
       await close(proxy)
     }
   })
+
+  it('forwards a buffer-limit failure once without retrying the request', async () => {
+    const errorBody = JSON.stringify({ error: { message: '[507]: exceeded request buffer limit while retrying upstream' } })
+    let upstreamRequests = 0
+    const upstream = createServer((req, res) => {
+      upstreamRequests++
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(503, { 'Content-Type': 'application/json' })
+        res.end(errorBody)
+      })
+    })
+    const upstreamPort = await listen(upstream)
+    const proxy = createServer((req, res) => {
+      handleUnifiedResponsesProxyRequest(req, res, {
+        bearerToken: '',
+        requireBearerToken: false,
+        wireApi: 'responses',
+        responsesEndpoint: `http://127.0.0.1:${upstreamPort}/v1/responses`,
+        chatCompletionsEndpoint: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+        missingKeyMessage: 'missing',
+        allowToolFallbackToResponses: false,
+      })
+    })
+    const proxyPort = await listen(proxy)
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${proxyPort}/v1/responses`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'cx/gpt-6-luna', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'fixture' }] }] }),
+      })
+
+      expect(response.status).toBe(503)
+      expect(await response.text()).toBe(errorBody)
+      expect(upstreamRequests).toBe(1)
+    } finally {
+      await close(proxy)
+      await close(upstream)
+    }
+  })
 })
