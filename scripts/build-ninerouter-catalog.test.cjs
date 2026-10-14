@@ -489,6 +489,12 @@ test('preserves explicit compaction limits and clamps them to smaller gateway wi
  assert.equal(output.models[1].auto_compact_token_limit,180000)
  assert.equal(output.models[2].auto_compact_token_limit,70000)
 })
+test('uses the native maximum context when deriving a missing cutoff for gateway aliases', () => {
+ const bundled={models:[{slug:'gpt-6-luna',context_window:272000,max_context_window:872000}]}
+ const output=api.buildCatalog(bundled,{data:[{id:'cx/gpt-6-luna',context_length:272000},{id:'cx/gpt-6-luna[1m]',context_length:872000}]})
+ assert.equal(output.models[1].auto_compact_token_limit,190400)
+ assert.equal(output.models[2].auto_compact_token_limit,610400)
+})
 test('rejects descriptors without a valid native context for safe compaction', () => {
  const bundled={models:[{slug:'gpt-5.6-sol',context_window:null}]}
  assert.throws(()=>api.buildCatalog(bundled,{data:[{id:'cx/gpt-6.1-sol',context_length:1050000}]}))

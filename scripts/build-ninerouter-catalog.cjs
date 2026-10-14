@@ -78,10 +78,12 @@ function buildCatalog(bundled, advertised, nativeCatalog) {
     if (!template) continue
     const nativeContext = template.context_window
     if (!Number.isSafeInteger(nativeContext) || nativeContext <= 0) continue
+    const nativeMaxContext = Number.isSafeInteger(template.max_context_window) && template.max_context_window > 0
+      ? template.max_context_window : nativeContext
     const nativeCompactionLimit = Number.isSafeInteger(template.auto_compact_token_limit)
       && template.auto_compact_token_limit > 0
       ? template.auto_compact_token_limit
-      : Math.floor(nativeContext * 0.9)
+      : Math.floor(nativeMaxContext * 0.9)
     const model = structuredClone(template)
     model.slug = row.id
     model.display_name = row.id

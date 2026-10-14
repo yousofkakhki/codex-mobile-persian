@@ -11,7 +11,7 @@ Gateway model aliases compact earlier instead of postponing compaction to an unv
 
 #### Steps
 1. Run `node --test scripts/build-ninerouter-catalog.test.cjs`.
-2. Inspect standard and extended-context aliases: advertised context remains unchanged, while compaction starts by the lower of the native cutoff and 70% of the gateway context window. If no native cutoff exists, use 90% of the native window as the native cutoff.
+2. Inspect standard and extended-context aliases: advertised context remains unchanged, while compaction starts by the lower of the native cutoff and 70% of the gateway context window. If no native cutoff exists, use 90% of the native maximum context when valid, otherwise 90% of the native context window.
 3. Use the mock provider to produce `contextWindowExceeded` on the disposable thread and wait for the failed turn to finish.
 4. Resume only that thread with `thread/resume`, setting `config.model_auto_compact_token_limit` to its generated cutoff and `excludeTurns: true`.
 5. Call `thread/compact/start` with the same `threadId`. Monitor that thread's stream for `contextCompaction` completion and a completed turn; the immediate empty RPC response alone is not evidence of success.
