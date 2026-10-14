@@ -7,6 +7,7 @@ import {
   createDefaultOpenCodeZenFreeModeState,
   filterOpenCodeZenModelsForAuthState,
   getFreeModeConfigArgs,
+  getNinerouterBaseUrl,
   getProviderCompatibilityConfigArgs,
   shouldMarkOpenRouterKeyAsCustom,
   shouldCreateDefaultFreeModeStateForMissingAuth,
@@ -218,6 +219,28 @@ describe('unauthenticated free mode defaults', () => {
 
   it('routes 9Router directly to the VPS loopback service', () => {
     expect(NINEROUTER_BASE_URL).toBe('http://127.0.0.1:20128/v1')
+  })
+
+  it('allows deployments to override the 9Router base URL', () => {
+    const previousBaseUrl = process.env.NINEROUTER_BASE_URL
+    process.env.NINEROUTER_BASE_URL = 'http://185.53.143.194:20128/v1'
+
+    try {
+      expect(getNinerouterBaseUrl()).toBe('http://185.53.143.194:20128/v1')
+      expect(getFreeModeConfigArgs({
+        enabled: true,
+        apiKey: null,
+        model: 'cx/gpt-6.1-sol',
+        provider: NINEROUTER_PROVIDER_ID,
+        wireApi: 'responses',
+      })).toContain('model_providers.ninerouter.base_url="http://185.53.143.194:20128/v1"')
+    } finally {
+      if (previousBaseUrl === undefined) {
+        delete process.env.NINEROUTER_BASE_URL
+      } else {
+        process.env.NINEROUTER_BASE_URL = previousBaseUrl
+      }
+    }
   })
 
   it('does not replace an intentionally disabled free mode state', () => {
