@@ -62,6 +62,34 @@ describe('NineRouter dictation transcription', () => {
     expect(options?.redirect).toBe('error')
   })
 
+  it('uses the configured NineRouter base URL for dictation', async () => {
+    const previousBaseUrl = process.env.NINEROUTER_BASE_URL
+    process.env.NINEROUTER_BASE_URL = 'http://fixture-router:20128/v1'
+    const request = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ text: 'recognized words' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    const incoming = new FormData()
+    incoming.append('file', new File([new Uint8Array([1])], 'codex.webm', { type: 'audio/webm' }))
+    const encodedRequest = new Request('http://localhost/codex-api/transcribe', { method: 'POST', body: incoming })
+
+    try {
+      await proxyNineRouterDictation(
+        Buffer.from(await encodedRequest.arrayBuffer()),
+        encodedRequest.headers.get('content-type')!,
+        'fixture-router-key',
+        request,
+      )
+      expect(request.mock.calls[0]?.[0]).toBe('http://fixture-router:20128/v1/audio/transcriptions')
+    } finally {
+      if (previousBaseUrl === undefined) {
+        delete process.env.NINEROUTER_BASE_URL
+      } else {
+        process.env.NINEROUTER_BASE_URL = previousBaseUrl
+      }
+    }
+  })
+
   it('rejects malformed multipart without contacting NineRouter', async () => {
     const request = vi.fn<typeof fetch>()
     const malformed = await proxyNineRouterDictation(Buffer.from('bad'), 'multipart/form-data; boundary=missing', 'fixture-key', request)

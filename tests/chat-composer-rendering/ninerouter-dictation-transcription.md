@@ -12,8 +12,10 @@ paid OpenAI model/provider or change the fixed model metadata.
 - If local Codex OAuth is present, the existing ChatGPT transcription transport
   retains precedence and is unchanged. This patch only hardens the imported
   NineRouter fallback when NineRouter is active and local Codex OAuth is absent.
-- The authorized private gateway remains
-  `http://127.0.0.1:20128/v1/audio/transcriptions`; redirects are rejected.
+- Dictation uses `NINEROUTER_BASE_URL` when configured and otherwise falls back
+  to `http://127.0.0.1:20128/v1/audio/transcriptions`; redirects are rejected.
+  The bearer key is sent only by the server. An HTTP deployment endpoint does
+  not encrypt that key in transit and must be used only on a trusted network.
 - Exactly one model field, `cx/codex-dictation`, is emitted. Every caller model
   field is removed. Exactly one nonempty audio `file` and at most one valid
   `language` are permitted; bytes, filename, audio media type, and language are
@@ -56,6 +58,9 @@ errors, redirects, media types, multipart and size limits are tested over socket
 Stalled controls shorten the same deadline to 80 ms; production remains 300 s.
 Original duplicate-model observation was explicitly corrected to require one model;
 the keyless success fixture now explicitly declares the required JSON media type.
+The unit coverage also sets `NINEROUTER_BASE_URL` to a synthetic endpoint and
+asserts that dictation uses its `/audio/transcriptions` route; no live gateway is
+contacted by this override test.
 
 These are transport/security fixtures, **not proof of working speech recognition**.
 No live login, model/provider refresh, OAuth request, or billable transcription was
