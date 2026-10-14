@@ -1,6 +1,7 @@
 {
   "old_commit": "6b9826e3aa83b1a5947db50f4332cb9c65f1b340",
   "new_commit": "d27764b82f7118f674371e6d6e76271d9d606edb",
+  "latest_commit": "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d",
   "migrations": [
     {
       "kind": "state",
@@ -465,6 +466,14 @@
       "path": "codex-rs/state/migrations/0058_threads_archive_sort_indexes.sql",
       "sha384": "68467AF3CE1FF09777C3F7167D522E11D88586FBB80A1588C631CF643A7D4985B221A6C8E8623997B37D44605B7E1091",
       "sql": "-- Archived listings include empty previews and cannot use the visible-only indexes.\nCREATE INDEX idx_threads_archive_created_at_ms\n    ON threads(archived, created_at_ms DESC, id DESC)\n    WHERE archived = 1;\n\nCREATE INDEX idx_threads_archive_updated_at_ms\n    ON threads(archived, updated_at_ms DESC, id DESC)\n    WHERE archived = 1;\n\nCREATE INDEX idx_threads_archive_recency_at_ms\n    ON threads(archived, recency_at_ms DESC, id DESC)\n    WHERE archived = 1;\n"
+    },
+    {
+      "kind": "state",
+      "version": 59,
+      "description": "thread attachment reverse lookup",
+      "path": "codex-rs/state/migrations/0059_thread_attachment_reverse_lookup.sql",
+      "sha384": "4297DFFB4FB308F0C665E4D126B7D2A96DB7BE48EB2E13C7E1245A5D95C4DF4E66D64E79AD00FEC26B0910436703090C",
+      "sql": "CREATE INDEX idx_thread_attachments_identity_thread\n    ON thread_attachments(attachment_type, identity_key, thread_id);\n"
     },
     {
       "kind": "history",

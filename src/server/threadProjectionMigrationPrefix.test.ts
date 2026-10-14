@@ -8,9 +8,10 @@ const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite')
 
 for (const kind of ['state', 'history'] as const) {
   const file = kind === 'state' ? 'state_5.sqlite' : 'thread_history_1.sqlite'
-  const max = kind === 'state' ? 58 : 7
+  const max = kind === 'state' ? 59 : 7
   for (const [reason, sql] of [
     ['changed checksum', 'UPDATE _sqlx_migrations SET checksum=zeroblob(48) WHERE version=1'],
+    ['changed newest checksum', `UPDATE _sqlx_migrations SET checksum=zeroblob(48) WHERE version=${max}`],
     ['missing first migration', 'DELETE FROM _sqlx_migrations WHERE version=1'],
     ['missing interior migration', 'DELETE FROM _sqlx_migrations WHERE version=3'],
     ['failed migration', 'UPDATE _sqlx_migrations SET success=0 WHERE version=1'],

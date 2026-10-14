@@ -1,6 +1,6 @@
 // SQLx SHA384 identities verified against official SQL, not the installed CLI version.
 // state1..54/history1..6: rust-v0.154.0, 6b9826e3aa83b1a5947db50f4332cb9c65f1b340.
-// state55..58/history7: rust-v0.160.1, d27764b82f7118f674371e6d6e76271d9d606edb.
+// state55..58/history7: d27764b82f7118f674371e6d6e76271d9d606edb; state59: rust-v0.162.1, 092d3acd6bec3e3a14bdc7e7a2810ab628ab759d.
 // Reviewed additive changes preserve threads key/path and projection key/offset/ordinal.
 // Additions require source/checksum and invariant-contract review; never raise a MAX cap alone.
 export const STATE_SQLX_MIGRATION_SHA384 = [
@@ -62,6 +62,7 @@ export const STATE_SQLX_MIGRATION_SHA384 = [
   '5DE44FAC5505249BE66FCD640E9AC3D36550854C0DB1272EB52CBB6C3D18B207DB4CB782686D81089E77EBB57F6819B1', // 56 threads creator identity
   '729562C57BFA8B43D5AE3476C99CEF6E81A54709A74283057CE8D2D6F55CF8EAE2594FDB7CFF4238EBE1E481E7C049E6', // 57 cleanup guardian thread metadata
   '68467AF3CE1FF09777C3F7167D522E11D88586FBB80A1588C631CF643A7D4985B221A6C8E8623997B37D44605B7E1091', // 58 threads archive sort indexes
+  '4297DFFB4FB308F0C665E4D126B7D2A96DB7BE48EB2E13C7E1245A5D95C4DF4E66D64E79AD00FEC26B0910436703090C',
 ] as const
 
 export const HISTORY_SQLX_MIGRATION_SHA384 = [
