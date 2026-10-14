@@ -1,6 +1,7 @@
 {
   "old_commit": "6b9826e3aa83b1a5947db50f4332cb9c65f1b340",
   "new_commit": "d27764b82f7118f674371e6d6e76271d9d606edb",
+  "latest_commit": "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d",
   "migrations": [
     {
       "kind": "state",
@@ -467,6 +468,14 @@
       "sql": "-- Archived listings include empty previews and cannot use the visible-only indexes.\nCREATE INDEX idx_threads_archive_created_at_ms\n    ON threads(archived, created_at_ms DESC, id DESC)\n    WHERE archived = 1;\n\nCREATE INDEX idx_threads_archive_updated_at_ms\n    ON threads(archived, updated_at_ms DESC, id DESC)\n    WHERE archived = 1;\n\nCREATE INDEX idx_threads_archive_recency_at_ms\n    ON threads(archived, recency_at_ms DESC, id DESC)\n    WHERE archived = 1;\n"
     },
     {
+      "kind": "state",
+      "version": 59,
+      "description": "thread attachment reverse lookup",
+      "path": "codex-rs/state/migrations/0059_thread_attachment_reverse_lookup.sql",
+      "sha384": "4297DFFB4FB308F0C665E4D126B7D2A96DB7BE48EB2E13C7E1245A5D95C4DF4E66D64E79AD00FEC26B0910436703090C",
+      "sql": "CREATE INDEX idx_thread_attachments_identity_thread\n    ON thread_attachments(attachment_type, identity_key, thread_id);\n"
+    },
+    {
       "kind": "history",
       "version": 1,
       "description": "thread history",
@@ -521,6 +530,14 @@
       "path": "codex-rs/state/thread_history_migrations/0007_thread_item_lifecycle_timestamps.sql",
       "sha384": "9334ADB4CDA792116A47B69A19E3840AE3806B08773EF1794043FE0AA72891360ACB1A0A8431084D53C568482C5FDD20",
       "sql": "ALTER TABLE thread_items ADD COLUMN started_at_ms INTEGER;\nALTER TABLE thread_items ADD COLUMN completed_at_ms INTEGER;\n"
+    },
+    {
+      "kind": "history",
+      "version": 8,
+      "description": "thread turn root",
+      "path": "codex-rs/state/thread_history_migrations/0008_thread_turn_root.sql",
+      "sha384": "94635CD58535ADB1679F4AD07A9D14231B69004405FA88A22DB1B6A7E5FEAC8B6B66AD97EA16FCE464B99BFF5B3548D3",
+      "sql": "ALTER TABLE thread_turns ADD COLUMN root_turn_id TEXT;\n"
     }
   ]
 }

@@ -1,13 +1,57 @@
 import { test, expect } from 'vitest'
-import { rm } from 'node:fs/promises'
+import { rm, readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
+import { join } from 'node:path'
 import { assertThreadProjectionIntegrity } from './threadProjectionIntegrity'
 import { createCodexProjectionFixture } from './threadProjectionFixture'
 import { STATE_SQLX_MIGRATION_SHA384, HISTORY_SQLX_MIGRATION_SHA384 } from './threadProjectionMigrations'
 
-test('accepts healthy state58/history7 with complete verified official migration checksums', async () => {
+test('accepts healthy state59/history8 with complete verified official migration checksums', async () => {
   const home = createCodexProjectionFixture()
   try { await expect(assertThreadProjectionIntegrity(home, 'fixture')).resolves.toBeUndefined() }
   finally { await rm(home, {recursive: true, force: true}) }
+})
+
+test('accepts state59 before history materialization without changing state or rollout', async () => {
+  const home = createCodexProjectionFixture()
+  const digest = async () => Promise.all(['state_5.sqlite', 'fixture.jsonl'].map(async file =>
+    createHash('sha256').update(await readFile(join(home, file))).digest('hex')))
+  try {
+    await rm(join(home, 'thread_history_1.sqlite'))
+    const before = await digest()
+    await expect(assertThreadProjectionIntegrity(home, 'fixture')).resolves.toBeUndefined()
+    await expect(assertThreadProjectionIntegrity(home, 'unprojected')).resolves.toBeUndefined()
+    expect(await digest()).toEqual(before)
+  } finally { await rm(home, {recursive: true, force: true}) }
+})
+
+test('applies the reviewed state59 attachment lookup index', async () => {
+  const home = createCodexProjectionFixture()
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite')
+  try {
+    const database = new DatabaseSync(join(home, 'state_5.sqlite'), {readOnly: true})
+    try {
+      expect(database.prepare('PRAGMA index_info(idx_thread_attachments_identity_thread)').all()
+        .map((column: {name: string}) => column.name)).toEqual(['attachment_type', 'identity_key', 'thread_id'])
+      expect(database.prepare('SELECT MAX(version) AS version FROM _sqlx_migrations').get().version).toBe(59)
+    } finally { database.close() }
+  } finally { await rm(home, {recursive: true, force: true}) }
+})
+
+test('applies the reviewed history8 nullable turn root without changing the projection contract', async () => {
+  const home = createCodexProjectionFixture()
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite')
+  try {
+    const database = new DatabaseSync(join(home, 'thread_history_1.sqlite'), {readOnly: true})
+    try {
+      expect(database.prepare('PRAGMA table_info(thread_turns)').all()
+        .find((column: {name: string}) => column.name === 'root_turn_id'))
+        .toMatchObject({type: 'TEXT', notnull: 0, pk: 0})
+      expect(database.prepare('SELECT MAX(version) AS version FROM _sqlx_migrations').get().version).toBe(8)
+    } finally { database.close() }
+    await expect(assertThreadProjectionIntegrity(home, 'fixture')).resolves.toBeUndefined()
+  } finally { await rm(home, {recursive: true, force: true}) }
 })
 
 for (const kind of ['state', 'history'] as const) {

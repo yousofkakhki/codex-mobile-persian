@@ -1,6 +1,6 @@
 // Exact official SQL inputs; SHA384 is checked before every fixture migration.
 // Baseline: 6b9826e3aa83b1a5947db50f4332cb9c65f1b340; reviewed additions:
-// d27764b82f7118f674371e6d6e76271d9d606edb. No production state is copied.
+// d27764b82f7118f674371e6d6e76271d9d606edb and 092d3acd6bec3e3a14bdc7e7a2810ab628ab759d. No production state is copied.
 import { createRequire } from 'node:module'
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -15,7 +15,7 @@ export function createCodexProjectionFixture(options: {stateVersion?: number; hi
   const rollout = join(home, 'fixture.jsonl')
   writeFileSync(rollout, '{}\n')
   for (const kind of ['state', 'history'] as const) {
-    const max = kind === 'state' ? (options.stateVersion ?? 58) : (options.historyVersion ?? 7)
+    const max = kind === 'state' ? (options.stateVersion ?? 59) : (options.historyVersion ?? 8)
     const db = new DatabaseSync(join(home, kind === 'state' ? 'state_5.sqlite' : 'thread_history_1.sqlite'))
     try {
       db.exec('BEGIN')
