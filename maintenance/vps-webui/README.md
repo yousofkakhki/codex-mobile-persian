@@ -1,7 +1,13 @@
-# Codex Mobile verified-ultra repair
+# Codex Mobile VPS maintenance: staged overlay and applied ACL repair
 
 This maintenance repository preserves the installed 0.1.91 build and applies a
 small, hash-checked release overlay. It is not a rebuild from upstream `main`.
+
+This package is published under `maintenance/vps-webui/` on a branch based on
+this repository's `main`. It does not replace application source, package
+metadata, or the source-level Ultra implementation already on `main`. Its two
+maintenance changes were imported from the separate local maintenance history
+(`9877d78` and `a72b4fa`), without copying private runtime state or built releases.
 
 The separately approved, live filesystem ACL repair is documented in
 [HERMES-ACCESS.md](HERMES-ACCESS.md). The WebUI/Ultra overlay remains staged only.
@@ -55,8 +61,11 @@ service, leaving state and privilege settings untouched.
   evidence, verified non-downgraded gateway routes and idle loaded conversations.
   It never changes a release symlink or restarts a service.
 
-The maintenance code is local to this repository. No upstream push is performed.
-The candidate is recorded in `.work/build-result.json`; `.work/` is not committed.
+The scripts never push Git branches or deploy releases. Publishing this package
+does not apply the overlay, repeat the ACL repair, or change the service/gateway.
+The original VPS candidate is recorded in
+`/srv/projects/codex-mobile-maintenance/.work/build-result.json`. A fresh checkout
+has no candidate until its build step runs; `.work/` is never committed.
 The gateway probe is deliberately separate from builds and tests, and refuses
 to repeat existing authenticated evidence automatically.
 
