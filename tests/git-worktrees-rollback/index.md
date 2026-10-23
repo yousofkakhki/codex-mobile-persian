@@ -8,6 +8,7 @@ Return to the [manual test index](../../tests.md).
 
 | Section |
 | --- |
+| [Reviewed development branch integration](development-branch-integration.md) |
 | [Feature: Start new thread header Git branch dropdown](start-new-thread-header-git-branch-dropdown.md) |
 | [Lazy project Git status checks](lazy-project-git-status-checks.md) |
 | [Header Git branch dropdown with commit reset](header-git-branch-dropdown-with-commit-reset.md) |

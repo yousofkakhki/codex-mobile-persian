@@ -23,7 +23,7 @@ This file is the manual test index. Detailed regression and feature verification
 | [Providers and Models](tests/providers-models/index.md) | 26 | Provider selectors, model menus, OpenRouter, OpenCode Zen, 9Router, custom endpoints, Responses/Completions format, and model refresh behavior. |
 | [Auth and Docker Runtime](tests/auth-docker-runtime/index.md) | 12 | Codex auth, Docker-packaged runtime cases, copied auth behavior, invalid auth errors, and auth-aware provider fallback. |
 | [CLI, Network, and Platform](tests/cli-network-platform/index.md) | 21 | CLI startup, password files, dev scripts, npx, Tailscale, Cloudflare tunnels, Windows, Android, Termux, platform packaging, and staged VPS maintenance. |
-| [Git, Worktrees, and Rollback](tests/git-worktrees-rollback/index.md) | 25 | Branch controls, worktree creation, rollback commits, changed-files panels, file browser links, and rollback debug behavior. |
+| [Git, Worktrees, and Rollback](tests/git-worktrees-rollback/index.md) | 27 | Branch controls, worktree creation, rollback commits, changed-files panels, file browser links, rollback debug behavior, and reviewed branch integration. |
 | [Accounts, Feedback, and Observability](tests/accounts-feedback-observability/index.md) | 14 | Account panels, quota refresh, feedback diagnostics, Sentry, browser profiling, API perf logs, and Qodo diagnostic fixes. |
 | [Theme, Layout, and Terminal](tests/theme-layout-terminal/index.md) | 16 | Light/dark theme regressions, responsive layout, terminal UI, mobile keyboard behavior, dialog sizing, and visual alignment. |
 | [Website, Docs, and Miscellaneous](tests/website-docs-misc/index.md) | 3 | Static website checks and small compatibility checks that do not yet fit a narrower product area. |
