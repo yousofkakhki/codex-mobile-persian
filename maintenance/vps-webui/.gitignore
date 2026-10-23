@@ -1,0 +1,5 @@
+.work/
+node_modules/
+
+# The application root ignores package.json by name; keep this isolated manifest.
+!package.json

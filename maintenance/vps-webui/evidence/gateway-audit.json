@@ -1,0 +1,191 @@
+{
+  "checkedAt": "2026-10-23T06:28:37.489Z",
+  "gatewayRelease": "/opt/ninerouter/releases/replica-20261020-0.5.104",
+  "files": {
+    "5330.js": "42dacdccca98a09b359787a6fa09fdb3a41d8d0bf41a8b6dbbffb38604b9f846",
+    "8499.js": "2fc9003c83d465f42fee8f7e5e1bdccea59395929d61a4df0dd86ebdde8e837d",
+    "6100.js": "c3f7b90e2618ccff002f94fdf4b7aed0c5592abdb066dc2979ecb5069b46875c"
+  },
+  "normalizer": "function z(a,b){let c=(0,k.k)(\"codex\",a);return c?.includes(b)?b:u(a)&&(\"none\"===b||\"minimal\"===b)?\"low\":\"ultra\"===b&&c?.includes(\"max\")?\"max\":\"max\"===b||\"ultra\"===b?\"xhigh\":b}",
+  "executorUsesNormalizer": true,
+  "executorDropsRequestedOutputLimit": true,
+  "conclusion": "The five successful gpt-6 routes downgrade ultra to max. Older Sol/Terra retain ultra in the executor but the one permitted probe per route failed HTTP 400. No route is verified.",
+  "routes": [
+    {
+      "id": "cx/gpt-6.1-sol",
+      "upstreamModel": "gpt-6.1-sol",
+      "advertisedExecutorEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "max",
+      "probeHttpStatus": 200
+    },
+    {
+      "id": "cx/gpt-6-astra",
+      "upstreamModel": "gpt-6-astra",
+      "advertisedExecutorEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "max",
+      "probeHttpStatus": 200
+    },
+    {
+      "id": "cx/gpt-6-astra[1m]",
+      "upstreamModel": "gpt-6-astra",
+      "advertisedExecutorEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "max",
+      "probeHttpStatus": 200
+    },
+    {
+      "id": "cx/gpt-6-sol",
+      "upstreamModel": "gpt-6-sol",
+      "advertisedExecutorEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "max",
+      "probeHttpStatus": 200
+    },
+    {
+      "id": "cx/gpt-6-sol[1m]",
+      "upstreamModel": "gpt-6-sol",
+      "advertisedExecutorEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "max",
+      "probeHttpStatus": 200
+    },
+    {
+      "id": "cx/gpt-5.6-sol",
+      "upstreamModel": "gpt-5.6-sol",
+      "advertisedExecutorEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "ultra",
+      "probeHttpStatus": 400
+    },
+    {
+      "id": "cx/gpt-5.6-sol[1m]",
+      "upstreamModel": "gpt-5.6-sol",
+      "advertisedExecutorEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "ultra",
+      "probeHttpStatus": 400
+    },
+    {
+      "id": "cx/gpt-5.6-sol-review",
+      "upstreamModel": "gpt-5.6-sol",
+      "advertisedExecutorEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "ultra",
+      "probeHttpStatus": 400
+    },
+    {
+      "id": "cx/gpt-5.6-terra",
+      "upstreamModel": "gpt-5.6-terra",
+      "advertisedExecutorEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "ultra",
+      "probeHttpStatus": 400
+    },
+    {
+      "id": "cx/gpt-5.6-terra[1m]",
+      "upstreamModel": "gpt-5.6-terra",
+      "advertisedExecutorEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "ultra",
+      "probeHttpStatus": 400
+    },
+    {
+      "id": "cx/gpt-5.6-terra-review",
+      "upstreamModel": "gpt-5.6-terra",
+      "advertisedExecutorEfforts": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "requestedEffort": "ultra",
+      "forwardedEffort": "ultra",
+      "probeHttpStatus": 400
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-10-23T06:42:32.971Z",
+  "baseRelease": "/opt/codex-mobile/releases/replica-20261020-1f48eec6",
+  "recordedSourceCommit": "4112769f178189567035a1a440c57753c1b66781",
+  "baseline": {
+    "app/dist/index.html": "31e4c258bfee1672a5db93033add5ff88611288031e66f36d813be9ce8e037a5",
+    "app/dist/sw.js": "56279ab8b293c749156fa28ee55c55c00e4917f0cc815b3878502d80df119b70",
+    "app/dist/assets/index-Be40V98R.js": "e839409719f0b36f52789b29208c8f33a7eba805fcf2db1b1c2055d719a23c3f",
+    "app/dist-cli/index.js": "5fb85a83709870da2d00063470a7126c9c356fc9c9cf0ca9fa7db3e84bf41b5e",
+    "ninerouter-models.json": "99ef6d395179a61a715e1b7411c8e2741617974a8ec5ec7f0ca24283a51c0c03",
+    "release-proof.json": "06083bc28ca303670909b5a5e512a754910c48c95b0716a35b5d8a2376657511"
+  },
+  "asset": "index-ultra-18a902b63730.js",
+  "verifiedRoutes": [],
+  "ultraStatus": "blocked-at-gateway",
+  "changes": [
+    {
+      "path": "app/dist-cli/index.js",
+      "before": "5fb85a83709870da2d00063470a7126c9c356fc9c9cf0ca9fa7db3e84bf41b5e",
+      "after": "f7b931be15d80837b1e9871219e297d3d0e79010762544e0a7b17b77ab4015af"
+    },
+    {
+      "path": "app/dist-cli/maintenance-runtime.mjs",
+      "before": null,
+      "after": "fb7294d6195d83d79a260f27acf9cb75ec603998c3265c86c3070bfd1bde0063"
+    },
+    {
+      "path": "app/dist-cli/maintenance-capabilities.mjs",
+      "before": null,
+      "after": "a2a079b42fd11252b5ffe93d5d4875645f52228abeca997c21c65b67a91f957a"
+    },
+    {
+      "path": "app/dist-cli/maintenance-control-plane.mjs",
+      "before": null,
+      "after": "f3ad12f0139fac125f0e8e2f81f79fd91b82ac82f74b7b804eb298da010a2792"
+    },
+    {
+      "path": "ultra-capabilities.json",
+      "before": null,
+      "after": "3604f219a0b2fe6da892c70804a3ba575aa592bc59f81bccc8fa4068029482d0"
+    },
+    {
+      "path": "app/dist/assets/index-ultra-18a902b63730.js",
+      "before": null,
+      "after": "18a902b63730ef1f303f3e1874528c26ecfce195247b813ee410a8e2b9fb11e6"
+    },
+    {
+      "path": "app/dist/index.html",
+      "before": "31e4c258bfee1672a5db93033add5ff88611288031e66f36d813be9ce8e037a5",
+      "after": "8896d6a5912885ed909b1979489b13dd83745d1b3f42aeb3b6e3b3853ee0cc69"
+    },
+    {
+      "path": "app/dist/sw.js",
+      "before": "56279ab8b293c749156fa28ee55c55c00e4917f0cc815b3878502d80df119b70",
+      "after": "5b6d83736f37288cbc4a1bd6ef1635a3f82d845774a356cbf0143c9cf1fa3f2c"
+    }
+  ],
+  "stateMigrated": false,
+  "credentialsModified": false,
+  "serviceSettingsModified": false
+}

@@ -1,0 +1,13 @@
+{
+  "name": "codex-mobile-maintenance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "probe": "node scripts/probe-ultra.mjs",
+    "build": "node scripts/build-release.mjs",
+    "verify": "node scripts/verify-release.mjs",
+    "integration": "sudo -n unshare --net node scripts/integration-test.mjs",
+    "check-rollout": "node scripts/check-rollout.mjs"
+  }
+}

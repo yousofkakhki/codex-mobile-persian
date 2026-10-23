@@ -1,0 +1,22 @@
+{
+  "checkedAt": "2026-10-23T06:43:03.027Z",
+  "base": "/opt/codex-mobile/releases/replica-20261020-1f48eec6",
+  "stage": "/srv/projects/codex-mobile-maintenance/.work/release-7Jx6gW",
+  "passed": true,
+  "entriesCompared": 3218,
+  "checksumsVerified": 2803,
+  "changedFiles": [
+    "app/dist-cli/index.js",
+    "app/dist-cli/maintenance-runtime.mjs",
+    "app/dist-cli/maintenance-capabilities.mjs",
+    "app/dist-cli/maintenance-control-plane.mjs",
+    "ultra-capabilities.json",
+    "app/dist/assets/index-ultra-18a902b63730.js",
+    "app/dist/index.html",
+    "app/dist/sw.js"
+  ],
+  "originalAssetPreserved": true,
+  "runtimeCatalogUnchanged": true,
+  "verifiedCount": 0,
+  "checksumManifestSha256": "429e3447f0fa504e0d5d41b3e681215997d3f3d1c3919e00a3214faa7d13e2a5"
+}
