@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+	<testcase name="ACL permission strings round trip" time="0.000682" classname="test"/>
+	<testcase name="new account gets directory access and default inheritance" time="0.000570" classname="test"/>
+	<testcase name="expanding an existing mask preserves all other effective grants" time="0.000867" classname="test"/>
+	<testcase name="existing default ACL restrictions remain effective after inheritance grant" time="0.000218" classname="test"/>
+	<testcase name="ancestors retain existing readable access without adding write or defaults" time="0.000169" classname="test"/>
+	<testcase name="regular files gain read/write without becoming executable" time="0.000104" classname="test"/>
+	<testcase name="account-owned paths update owner permissions because named user entries do not override the owner" time="0.000131" classname="test"/>
+	<testcase name="explicit named-user permission takes precedence over supplementary groups" time="0.000078" classname="test"/>
+	<testcase name="generated restore input keeps special flags and intentionally omits ownership changes" time="0.000512" classname="test"/>
+	<!-- tests 9 -->
+	<!-- suites 0 -->
+	<!-- pass 9 -->
+	<!-- fail 0 -->
+	<!-- cancelled 0 -->
+	<!-- skipped 0 -->
+	<!-- todo 0 -->
+	<!-- duration_ms 48.942461 -->
+</testsuites>

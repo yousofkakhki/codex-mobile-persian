@@ -1,0 +1,46 @@
+{
+  "checkedAt": "2026-10-23T07:21:09.925Z",
+  "passed": true,
+  "uid": 999,
+  "checked": [
+    "/home/hermes",
+    "/home/hermes/Rust-MEV-Builder-consolidated-20260921",
+    "/home/hermes/liquidation-v2-work",
+    "/home/hermes/robinhood-bot",
+    "/home/hermes/robinhood-interim95-20261013.13qOom",
+    "/home/hermes/robinhood-phase103-20261014",
+    "/home/hermes/robinhood-phase104-20261014",
+    "/home/hermes/robinhood-phase104-20261015",
+    "/home/hermes/robinhood-phase104-runv2-20261015",
+    "/home/hermes/robinhood-prompt101-20261014",
+    "/home/hermes/robinhood-prompt75-20261009.wT1OBT",
+    "/home/hermes/robinhood-prompt76-20261009.0FnwuV",
+    "/home/hermes/robinhood-prompt77-20261010.AYhmff",
+    "/home/hermes/robinhood-prompt78-20261010.rbyrRy",
+    "/home/hermes/robinhood-prompt98-20261013.njhFCz",
+    "/home/hermes/robinhood-prompt99-20261013",
+    "/home/hermes/robinhood-research",
+    "/home/hermes/robinhood-review102-20261014"
+  ],
+  "projectAndFolderWritesPassed": true,
+  "inheritedReadWriteFromDifferentOwnerPassed": true,
+  "liveBrowserChecks": [
+    {
+      "path": "/home/hermes",
+      "httpStatus": 200,
+      "directoryCount": 1
+    },
+    {
+      "path": "/home/hermes/robinhood-research",
+      "httpStatus": 200,
+      "directoryCount": 8
+    },
+    {
+      "path": "/home/hermes/Rust-MEV-Builder-consolidated-20260921",
+      "httpStatus": 200,
+      "directoryCount": 6
+    }
+  ],
+  "applicationStateModified": false,
+  "realInferenceCalls": 0
+}

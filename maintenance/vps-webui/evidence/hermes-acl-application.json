@@ -1,0 +1,15 @@
+{
+  "appliedAt": "2026-10-23T07:19:35.810Z",
+  "verified": true,
+  "files": 53046,
+  "directories": 5115,
+  "symlinksNotModified": 34,
+  "ownershipPreserved": true,
+  "otherEffectivePermissionsPreserved": true,
+  "hiddenConfigurationAndToolchainsUnchanged": true,
+  "serviceChanged": false,
+  "beforeSha256": "6207ce8d05f66fd795214fb612f327de2efab12f6383bcc50ce180bb53d4362a",
+  "afterSha256": "3f0cbec518ed37393400958f2d07d4a4aac56e70ba2226d6739b62d0ae9dfaca",
+  "backupDirectory": "/var/backups/codex-mobile-hermes-acl-WEXrDX",
+  "rollback": "sudo -n /usr/bin/setfacl --restore=/var/backups/codex-mobile-hermes-acl-WEXrDX/before.acl"
+}

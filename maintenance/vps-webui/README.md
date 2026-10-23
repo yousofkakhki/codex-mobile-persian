@@ -3,6 +3,9 @@
 This maintenance repository preserves the installed 0.1.91 build and applies a
 small, hash-checked release overlay. It is not a rebuild from upstream `main`.
 
+The separately approved, live filesystem ACL repair is documented in
+[HERMES-ACCESS.md](HERMES-ACCESS.md). The WebUI/Ultra overlay remains staged only.
+
 No credentials, chat contents, private keys, or raw model reasoning are stored.
 Gateway probes use one fixed harmless prompt per exact candidate route, no tools,
 no response storage, a requested 512-output-token limit, and a 60-second deadline. A route
