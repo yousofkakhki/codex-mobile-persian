@@ -1,0 +1,345 @@
+{
+  "schemaVersion": 1,
+  "providerId": "ninerouter",
+  "baseUrl": "http://127.0.0.1:20128/v1",
+  "codexVersion": "0.155.1",
+  "baseRelease": "/opt/codex-mobile/releases/replica-20261020-1f48eec6",
+  "startedAt": "2026-10-23T06:17:03.700Z",
+  "requestLimits": {
+    "maxOutputTokens": 512,
+    "timeoutMs": 60000,
+    "requestsPerRoute": 1,
+    "tools": false,
+    "store": false
+  },
+  "routes": [
+    {
+      "id": "cx/gpt-6.1-sol",
+      "template": "gpt-5.6-sol",
+      "advertisedFingerprint": "a281c2359f0f11ef02abdf52294f13a46f27e60140277777bf39178af3a35d99",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.710Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 7,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "cx/gpt-6-astra",
+      "template": "gpt-6-astra",
+      "advertisedFingerprint": "c79d1a393c77ff274ff54a133cae767016957491cd827947d2abb1ae1daf5ab0",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.717Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 7,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    {
+      "id": "cx/gpt-6-astra[1m]",
+      "template": "gpt-6-astra",
+      "advertisedFingerprint": "a84baa1c95e136845b9c3afcdea7b13e5c69ec8c54d22877a1cc8abdb6efe5dc",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.725Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 4,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    {
+      "id": "cx/gpt-6-sol",
+      "template": "gpt-5.6-sol",
+      "advertisedFingerprint": "53adcd98527f02aded3135f082f1d8c5c8069355ea4af334c99501ebc56129eb",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.729Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 4,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "cx/gpt-6-sol[1m]",
+      "template": "gpt-5.6-sol",
+      "advertisedFingerprint": "d7ea4c6808e7c4a5415f62b32b55b18dd2840375a9c2fdbfc945fcc9527396e2",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.733Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 4,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "cx/gpt-5.6-sol",
+      "template": "gpt-5.6-sol",
+      "advertisedFingerprint": "e0c6eeec92193cc89d1779c815207af5128856e2c9a6c6d9749b94206d68094e",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.737Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 4,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "cx/gpt-5.6-sol[1m]",
+      "template": "gpt-5.6-sol",
+      "advertisedFingerprint": "e4fe3778a47c27ad0c36560e5d20f6e6ac80bd559527f26e0fc5bf4e84fb806f",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.741Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 3,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "cx/gpt-5.6-sol-review",
+      "template": "gpt-5.6-sol",
+      "advertisedFingerprint": "fe0d38ea6f97f5e2db3d315b6d8fb4bd257d1c8777a8afb1202f8cd8aa99cd00",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.745Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 4,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "cx/gpt-5.6-terra",
+      "template": "gpt-5.6-terra",
+      "advertisedFingerprint": "b2adf46635a05ee87015206b9790bffd3caa4c6ebda4f325251a36c290c5d628",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.749Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 4,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "cx/gpt-5.6-terra[1m]",
+      "template": "gpt-5.6-terra",
+      "advertisedFingerprint": "223e299ffa5515786d5ea657d9efaed3e5fbce12efea130dadc83a2de181303e",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.753Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 3,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "id": "cx/gpt-5.6-terra-review",
+      "template": "gpt-5.6-terra",
+      "advertisedFingerprint": "0ab8b731040ad94b8249d1d4fd21882c6b75c00ae40d71cc8ae6f6bc11398e11",
+      "baselineEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "checkedAt": "2026-10-23T06:17:03.757Z",
+      "verified": false,
+      "httpStatus": 401,
+      "responseStatus": null,
+      "returnedEffort": null,
+      "resolvedModel": null,
+      "usage": null,
+      "outputMatched": false,
+      "failure": "http-401",
+      "errorCode": "invalid_api_key",
+      "durationMs": 3,
+      "reasoningOptions": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    }
+  ],
+  "completedAt": "2026-10-23T06:17:03.760Z",
+  "verifiedCount": 0
+}

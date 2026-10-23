@@ -1,0 +1,55 @@
+{
+  "testedAt": "2026-10-23T06:47:05.818Z",
+  "isolatedNetworkNamespace": true,
+  "realInferenceCalls": 0,
+  "realCredentialsUsed": false,
+  "stage": "/srv/projects/codex-mobile-maintenance/.work/release-7Jx6gW",
+  "serverSha256": "f7b931be15d80837b1e9871219e297d3d0e79010762544e0a7b17b77ab4015af",
+  "checksumManifestSha256": "429e3447f0fa504e0d5d41b3e681215997d3f3d1c3919e00a3214faa7d13e2a5",
+  "passed": true,
+  "checks": [
+    {
+      "name": "staged HTML references the new content-addressed asset",
+      "passed": true
+    },
+    {
+      "name": "actual HTTP response serves the staged frontend bytes",
+      "passed": true
+    },
+    {
+      "name": "service-worker cache version changed",
+      "passed": true
+    },
+    {
+      "name": "provider route remains usable and does not promote unverified ultra",
+      "passed": true
+    },
+    {
+      "name": "model/list traverses the patched RPC bridge",
+      "passed": true
+    },
+    {
+      "name": "model/list timeout surfaces cleanly at eight seconds",
+      "passed": true,
+      "ms": 8004
+    },
+    {
+      "name": "config/read timeout is bounded",
+      "passed": true,
+      "ms": 8004
+    },
+    {
+      "name": "late cancelled reply does not corrupt later RPC results",
+      "passed": true
+    },
+    {
+      "name": "HTML 502 retains last-successful catalog with stale indicator",
+      "passed": true
+    },
+    {
+      "name": "changed configuration cannot reuse stale data and cold stall returns 503",
+      "passed": true,
+      "ms": 8004
+    }
+  ]
+}

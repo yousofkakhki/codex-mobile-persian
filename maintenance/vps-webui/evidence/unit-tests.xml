@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+	<testcase name="fingerprint is deterministic across property ordering" time="0.002076" classname="test"/>
+	<testcase name="fingerprint ignores unrelated discovery timestamps" time="0.000334" classname="test"/>
+	<testcase name="explicit effort shapes normalize and deduplicate" time="0.000803" classname="test"/>
+	<testcase name="explicit empty capability lists remain explicit" time="0.000252" classname="test"/>
+	<testcase name="malformed or missing manifests fail closed" time="0.000632" classname="test"/>
+	<testcase name="route is not verified when downgraded" time="0.000368" classname="test"/>
+	<testcase name="route is not verified when noEcho" time="0.000491" classname="test"/>
+	<testcase name="route is not verified when incomplete" time="0.000235" classname="test"/>
+	<testcase name="route is not verified when unsuccessful" time="0.000577" classname="test"/>
+	<testcase name="route is not verified when unverified" time="0.001625" classname="test"/>
+	<testcase name="route is not verified when wrongOutput" time="0.000321" classname="test"/>
+	<testcase name="matching exact route gains ultra and truthful provenance" time="0.000786" classname="test"/>
+	<testcase name="different endpoint cannot reuse verification" time="0.000212" classname="test"/>
+	<testcase name="different provider cannot reuse verification" time="0.000163" classname="test"/>
+	<testcase name="alias verification does not generalize to extended context" time="0.000304" classname="test"/>
+	<testcase name="provider fingerprint drift does not promote ultra" time="0.000305" classname="test"/>
+	<testcase name="non-reasoning models stay disabled" time="0.000215" classname="test"/>
+	<testcase name="explicit provider restriction wins over local proof" time="0.000236" classname="test"/>
+	<testcase name="unverified advertised ultra is not silently enabled" time="0.000210" classname="test"/>
+	<testcase name="candidate enumeration requires exact installed alias and ultra-capable template" time="0.000661" classname="test"/>
+	<testcase name="read-only RPC timeout removes pending entry" time="0.011610" classname="test"/>
+	<testcase name="model/list also has a bounded deadline" time="0.010550" classname="test"/>
+	<testcase name="late RPC response after cancellation cannot resolve a different request" time="0.005551" classname="test"/>
+	<testcase name="normal RPC response resolves and cleans pending state" time="0.000615" classname="test"/>
+	<testcase name="write failure rejects without leaking pending state" time="0.000139" classname="test"/>
+	<testcase name="already cancelled reads do not start app-server" time="0.000148" classname="test"/>
+	<testcase name="long-running turn/start is not assigned a control timeout" time="0.020043" classname="test"/>
+	<testcase name="timeout before initialization cannot send a later read" time="0.030873" classname="test"/>
+	<testcase name="cold discovery stall returns a clear 503 body" time="0.015486" classname="test"/>
+	<testcase name="warm discovery failure retains last successful metadata" time="0.000625" classname="test"/>
+	<testcase name="configuration changes invalidate warm fallback" time="0.000222" classname="test"/>
+	<testcase name="concurrent discovery calls share one refresh" time="0.004891" classname="test"/>
+	<testcase name="HTML/invalid discovery fallback does not replace valid metadata" time="0.000246" classname="test"/>
+	<testcase name="changed configuration during refresh never returns old-provider data" time="0.000119" classname="test"/>
+	<testcase name="cold-start transition to initialized does not invalidate unchanged configuration" time="0.000991" classname="test"/>
+	<testcase name="all target artifact baseline hashes still match" time="0.003659" classname="test"/>
+	<testcase name="nonunique or missing patch anchors abort instead of guessing" time="0.000196" classname="test"/>
+	<testcase name="backend overlay adds bounded RPCs and HTTP status handling" time="0.007173" classname="test"/>
+	<testcase name="frontend renders ultra from effective capabilities rather than the Astra gate" time="0.004121" classname="test"/>
+	<testcase name="verified Sol selection survives absent metadata during refresh/resume" time="0.003622" classname="test"/>
+	<testcase name="authoritative metadata can revoke the embedded verified fallback" time="0.003704" classname="test"/>
+	<testcase name="unverified Astra aliases do not gain ultra while metadata loads" time="0.003725" classname="test"/>
+	<testcase name="unrelated native Astra fallback is preserved" time="0.003620" classname="test"/>
+	<testcase name="non-reasoning models and explicit empty lists remain disabled" time="0.003691" classname="test"/>
+	<testcase name="normal and collaboration-mode allowlists retain ultra" time="0.008383" classname="test"/>
+	<testcase name="catalog patch changes only verified alias effort lists" time="0.008695" classname="test"/>
+	<testcase name="live failed verification never changes runtime catalog" time="0.006871" classname="test"/>
+	<testcase name="release comparison accepts declared edits while preserving original assets" time="0.000849" classname="test"/>
+	<testcase name="unrelated modifications or missing files fail verification" time="0.001783" classname="test"/>
+	<testcase name="undeclared new files fail verification" time="0.000254" classname="test"/>
+	<testcase name="incorrect hashes and duplicate declarations fail verification" time="0.000438" classname="test"/>
+	<testcase name="permission changes and symlink substitution fail verification" time="0.000275" classname="test"/>
+	<!-- tests 52 -->
+	<!-- suites 0 -->
+	<!-- pass 52 -->
+	<!-- fail 0 -->
+	<!-- cancelled 0 -->
+	<!-- skipped 0 -->
+	<!-- todo 0 -->
+	<!-- duration_ms 148.658555 -->
+</testsuites>
