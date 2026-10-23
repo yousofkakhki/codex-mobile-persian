@@ -81,6 +81,50 @@ describe('configured runtime model windows', () => {
     expect(close).toHaveBeenCalledTimes(1)
   })
 
+  it('binds capability snapshots to fresh bytes even when all stat fields collide', async () => {
+    const api = await import('./runtimeModelCatalog')
+    vi.stubEnv('CODEXUI_MODEL_CATALOG_JSON', '/synthetic/same-stat-provenance.json')
+    let body = JSON.stringify({ models: [{ slug: 'exact', multi_agent_version: 'v2' }] })
+    const size = body.length
+    vi.spyOn(fs, 'stat').mockResolvedValue({ mtimeMs: 10, ctimeMs: 10, size, ino: 1, dev: 1 } as never)
+    const close = vi.fn(async () => undefined)
+    const open = vi.spyOn(fs, 'open').mockImplementation(async () => ({
+      read: async (buffer: Buffer, _offset: number, _length: number, position: number) => {
+        if (position) return { bytesRead: 0 }
+        buffer.write(body)
+        return { bytesRead: body.length }
+      }, close,
+    }) as never)
+    await api.readConfiguredModelCatalog() // Warm the separate context-window cache.
+    const before = await api.readConfiguredModelCatalogSnapshot()
+    body = body.replace('v2', 'v1')
+    expect(body.length).toBe(size)
+    const after = await api.readConfiguredModelCatalogSnapshot()
+    expect(before?.catalog).toMatchObject({ models: [{ multi_agent_version: 'v2' }] })
+    expect(after?.catalog).toMatchObject({ models: [{ multi_agent_version: 'v1' }] })
+    expect(after?.identity).not.toBe(before?.identity)
+    expect(open).toHaveBeenCalledTimes(3)
+    expect(close).toHaveBeenCalledTimes(3)
+  })
+
+  it('rejects shortened capability snapshots and closes failed reads without caching them', async () => {
+    const { readConfiguredModelCatalogSnapshot } = await import('./runtimeModelCatalog')
+    vi.stubEnv('CODEXUI_MODEL_CATALOG_JSON', '/synthetic/short-provenance.json')
+    vi.spyOn(fs, 'stat').mockResolvedValue({ mtimeMs: 1, ctimeMs: 1, size: 3, ino: 1, dev: 1 } as never)
+    const close = vi.fn(async () => undefined)
+    const open = vi.spyOn(fs, 'open').mockResolvedValue({
+      read: async (buffer: Buffer, _offset: number, _length: number, position: number) => {
+        if (position) return { bytesRead: 0 }
+        buffer.write('{}')
+        return { bytesRead: 2 }
+      }, close,
+    } as never)
+    expect(await readConfiguredModelCatalogSnapshot()).toBeNull()
+    expect(await readConfiguredModelCatalogSnapshot()).toBeNull()
+    expect(open).toHaveBeenCalledTimes(2)
+    expect(close).toHaveBeenCalledTimes(2)
+  })
+
   it('ignores invalid limits and supports literal prototype-like catalog tokens safely', async () => {
     const { getConfiguredContextWindows } = await import('./runtimeModelCatalog')
     expect(getConfiguredContextWindows({ models: [

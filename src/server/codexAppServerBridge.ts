@@ -54,7 +54,7 @@ import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
 import { handleNineRouterDictation, usesNineRouterDictation } from './dictationTranscription.js'
 import { getZenModelCatalog } from './zenModelCatalog.js'
 import { normalizeProviderModelMetadata } from './providerModelMetadata.js'
-import { readConfiguredContextWindows, readConfiguredModelCatalog } from './runtimeModelCatalog.js'
+import { readConfiguredContextWindows, readConfiguredModelCatalogSnapshot } from './runtimeModelCatalog.js'
 import { nativeSlugForRoute, indexDescriptors, nativeUltraWireEffort, providerWireEfforts } from './runtimeLocalUltra.mjs'
 import type { ZenModelMetadata } from '../types/zenModels.js'
 import { handleZenProxyRequest } from './zenProxy.js'
@@ -2287,9 +2287,9 @@ async function addRuntimeLocalReasoning(
   const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
   if (!path || !appServer.readModelCatalogSnapshot) return models
   try {
-    const identity = (info: Awaited<ReturnType<typeof stat>>) => JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs])
-    const descriptorIdentity = identity(await stat(path))
-    const catalog = asRecord(await readConfiguredModelCatalog())
+    const descriptor = await readConfiguredModelCatalogSnapshot()
+    if (!descriptor || descriptor.path !== path) return models
+    const catalog = asRecord(descriptor.catalog)
     const descriptors = indexDescriptors(catalog?.models)
     const eligible = new Map<string, string>()
     for (const model of models) {
@@ -2299,9 +2299,11 @@ async function addRuntimeLocalReasoning(
     }
     if (!eligible.size) return models
     const snapshot = await appServer.readModelCatalogSnapshot()
+    const currentDescriptor = await readConfiguredModelCatalogSnapshot()
     if (!snapshot || snapshot.config.model_catalog_json !== path
       || asRecord(snapshot.config.features)?.multi_agent_v2 !== true
-      || descriptorIdentity !== identity(await stat(path)) || !snapshot.isCurrent()) return models
+      || currentDescriptor?.path !== path || currentDescriptor.identity !== descriptor.identity
+      || !snapshot.isCurrent()) return models
     const normalizeProvider = (id: string) => ['custom', 'custom_endpoint', 'custom-endpoint'].includes(id.trim().toLowerCase())
       ? 'custom-endpoint' : id
     const effectiveProvider = readNonEmptyString(snapshot.config.model_provider)

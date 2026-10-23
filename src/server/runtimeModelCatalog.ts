@@ -1,4 +1,5 @@
 import { open, stat } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 
 export function getConfiguredContextWindows(catalog: unknown, contextOverride?: unknown): Record<string, number> {
   const rows = (catalog as { models?: unknown[] } | null)?.models
@@ -24,6 +25,32 @@ export function getConfiguredContextWindows(catalog: unknown, contextOverride?: 
 
 const MAX_CATALOG_BYTES = 4 * 1024 * 1024
 let cached: { key: string; pending: Promise<unknown> } | undefined
+
+// Capability admission cannot trust a stat-only cache: same-size in-place
+// writes can retain identical timestamps on coarse-resolution filesystems.
+export async function readConfiguredModelCatalogSnapshot(): Promise<{ path: string; identity: string; catalog: unknown } | null> {
+  const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
+  if (!path) return null
+  try {
+    const info = await stat(path)
+    if (!Number.isSafeInteger(info.size) || info.size <= 0 || info.size > MAX_CATALOG_BYTES) return null
+    const identity = (value: typeof info) => JSON.stringify([value.dev, value.ino, value.size, value.mtimeMs, value.ctimeMs])
+    const file = await open(path, 'r')
+    try {
+      const buffer = Buffer.alloc(info.size + 1)
+      let total = 0
+      while (total < buffer.length) {
+        const { bytesRead } = await file.read(buffer, total, buffer.length - total, total)
+        if (!bytesRead) break
+        total += bytesRead
+      }
+      if (total !== info.size || identity(info) !== identity(await stat(path))) return null
+      const bytes = buffer.subarray(0, total)
+      return { path, identity: `${identity(info)}:${createHash('sha256').update(bytes).digest('hex')}`,
+        catalog: JSON.parse(bytes.toString('utf8')) as unknown }
+    } finally { await file.close() }
+  } catch { return null }
+}
 
 export async function readConfiguredModelCatalog(): Promise<unknown> {
   const path = process.env.CODEXUI_MODEL_CATALOG_JSON?.trim()
