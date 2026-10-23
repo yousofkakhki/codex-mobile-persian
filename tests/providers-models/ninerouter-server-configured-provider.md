@@ -6,6 +6,18 @@
 - App server is running from this repository.
 - A disposable thread and non-sensitive prompt are available.
 
+#### Secret-backed entrypoint verification
+
+- `scripts/codex-mobile-ninerouter-entrypoint.sh` reads only the mounted
+  `/run/secrets/ninerouter-api-key`, exports it server-side, and preserves CLI
+  arguments through `exec`. Missing, empty or whitespace-only secrets must fail
+  before starting the app; no key value may be logged.
+- Run `node --test scripts/codex-mobile-ninerouter-entrypoint.test.cjs`. All four
+  cases use temporary fake readers/apps and synthetic markers; they never read
+  the host's secret file or start the real app. Temporary fixtures are removed.
+- This optional operations helper adds no request-handling work and makes one
+  secret-file read per launch. Do not run it against production as part of tests.
+
 #### Steps
 1. Open Settings and select `9Router` in the Provider menu.
 2. Confirm the UI says credentials stay on the server and does not show a browser-side key field.
