@@ -2,7 +2,7 @@
 
 #### Prerequisites
 - The app server has `NINEROUTER_API_KEY` configured outside the repository.
-- The app server uses `NINEROUTER_BASE_URL` for the provider API root when 9Router is not local; for example, `http://185.53.143.194:20128/v1`.
+- The app server uses `NINEROUTER_BASE_URL` for the provider API root when 9Router is not local; for example, `https://router.example.test/v1`. Both HTTP and HTTPS overrides are supported; use HTTPS outside trusted loopback/private transport.
 - App server is running from this repository.
 - A disposable thread and non-sensitive prompt are available.
 

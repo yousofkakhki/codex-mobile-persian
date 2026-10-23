@@ -221,19 +221,19 @@ describe('unauthenticated free mode defaults', () => {
     expect(NINEROUTER_BASE_URL).toBe('http://127.0.0.1:20128/v1')
   })
 
-  it('allows deployments to override the 9Router base URL', () => {
+  it.each(['http://router.fixture:20128/v1', 'https://router.fixture/v1'])('allows deployments to override the 9Router base URL with %s', (baseUrl) => {
     const previousBaseUrl = process.env.NINEROUTER_BASE_URL
-    process.env.NINEROUTER_BASE_URL = 'http://185.53.143.194:20128/v1'
+    process.env.NINEROUTER_BASE_URL = baseUrl
 
     try {
-      expect(getNinerouterBaseUrl()).toBe('http://185.53.143.194:20128/v1')
+      expect(getNinerouterBaseUrl()).toBe(baseUrl)
       expect(getFreeModeConfigArgs({
         enabled: true,
         apiKey: null,
         model: 'cx/gpt-6.1-sol',
         provider: NINEROUTER_PROVIDER_ID,
         wireApi: 'responses',
-      })).toContain('model_providers.ninerouter.base_url="http://185.53.143.194:20128/v1"')
+      })).toContain(`model_providers.ninerouter.base_url="${baseUrl}"`)
     } finally {
       if (previousBaseUrl === undefined) {
         delete process.env.NINEROUTER_BASE_URL
