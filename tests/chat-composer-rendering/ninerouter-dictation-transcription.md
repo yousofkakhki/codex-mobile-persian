@@ -42,16 +42,20 @@ paid OpenAI model/provider or change the fixed model metadata.
 From the isolated clone, with existing compatible dependencies and Node >=22.16:
 
 ```sh
-python3 ../isolated-verify.py --label dictation-fixture-UNIQUE --cwd "$PWD" \
-  --timeout 120 --fixtures -- node node_modules/vitest/vitest.mjs run \
+node node_modules/vitest/vitest.mjs run \
   src/server/dictationTranscription.test.ts \
   src/server/dictationTranscription.http.test.ts --no-cache --configLoader runner
 ```
 
-The runner assigns private HOME/CODEX_HOME before middleware import, starts a
-separate loopback-only network namespace, and mounts live shared homes read-only.
-The HTTP fixture binds its synthetic gateway to port 20128 only within that
-namespace. It exercises the actual middleware on a real HTTP listener and the
+The HTTP fixture creates and removes its own `mkdtemp` Codex home before
+middleware import, restores inherited environment variables, and binds its
+synthetic gateway to an OS-assigned loopback port via `NINEROUTER_BASE_URL`.
+It must never write to an inherited `CODEX_HOME` or bind the live gateway's
+port 20128. Its isolation regression verifies the fixture owns a different
+home; a failed setup still closes any listeners that were created. Run the
+whole application suite in a separate loopback-only network namespace as an
+additional guard against unrelated fixture traffic.
+It exercises the actual middleware on a real HTTP listener and the
 real native-fetch gateway transport. Synthetic controls cover thrown exceptions,
 false length and streams whose fetch/read/cancel ignores abort; ordinary provider
 errors, redirects, media types, multipart and size limits are tested over sockets.
@@ -61,6 +65,11 @@ the keyless success fixture now explicitly declares the required JSON media type
 The unit coverage also sets `NINEROUTER_BASE_URL` to a synthetic endpoint and
 asserts that dictation uses its `/audio/transcriptions` route; no live gateway is
 contacted by this override test.
+
+As an extra runner-safety check, supply a disposable inherited Codex home with
+sentinel provider/auth files, run the HTTP fixture, then compare both sentinel
+hashes. Both files must be byte-for-byte unchanged, and the fixture-owned home
+must have been removed. Never use live credentials for this check.
 
 These are transport/security fixtures, **not proof of working speech recognition**.
 No live login, model/provider refresh, OAuth request, or billable transcription was

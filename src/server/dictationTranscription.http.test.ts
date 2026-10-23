@@ -1,10 +1,12 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createServer, request as httpRequest, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdir, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, writeFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 
-// Runner sets private HOME/CODEX_HOME before any import. Only sealed loopback endpoints exist.
-const home = process.env.CODEX_HOME!
+// Never borrow the runner's Codex home: it may belong to a running installation.
+const inheritedHome = process.env.CODEX_HOME
+let home = ''
 const serverMarker = 'fixture-server-marker'
 const clientMarker = 'fixture-client-marker'
 let bridge: Awaited<ReturnType<typeof import('./codexAppServerBridge')['createCodexBridgeMiddleware']>>
@@ -53,11 +55,10 @@ async function assertSafe(response: Response, status = 502) {
   expect(JSON.parse(text)).toEqual({ error: expect.any(String) })
 }
 beforeAll(async () => {
-  expect(home).toBeTruthy()
-  expect(home).not.toBe('/root/.codex')
-  await mkdir(home, { recursive: true })
+  home = await mkdtemp(join(tmpdir(), 'codexui-dictation-http-'))
+  vi.stubEnv('CODEX_HOME', home)
   await writeFile(join(home, 'webui-custom-providers.json'), JSON.stringify({ enabled: true, provider: 'ninerouter', apiKey: null, model: '' }))
-  process.env.NINEROUTER_API_KEY = serverMarker
+  vi.stubEnv('NINEROUTER_API_KEY', serverMarker)
   // No process spawning, queue polling, activity writing or Telegram configuration.
   vi.stubGlobal('__codexRemoteSharedBridge__', { version: 'experimental-api-v2', appServer: {},
     terminalManager: {}, methodCatalog: {}, telegramBridge: {}, backendQueueProcessor: {},
@@ -75,7 +76,7 @@ beforeAll(async () => {
     if (req.headers['x-fixture-redirect']) res.setHeader('Location', targetUrl)
     reply(req, res)
   })().catch(() => { res.statusCode = 500; res.end('{}') }) })
-  await listen(upstream, 20128)
+  vi.stubEnv('NINEROUTER_BASE_URL', `${await listen(upstream)}/v1`)
   origin = await listen(app = createServer((req, res) => { void bridge(req, res, () => { res.statusCode = 404; res.end() }) }))
   ;(globalThis as typeof globalThis & { fixtureRedirectUrl?: string }).fixtureRedirectUrl = targetUrl
 })
@@ -90,11 +91,20 @@ beforeEach(() => {
 afterAll(async () => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
-  delete process.env.NINEROUTER_API_KEY
-  await Promise.all([close(app), close(upstream), close(target)])
-  await rm(join(home, 'auth.json'), { force: true })
+  try {
+    await Promise.all([app, upstream, target].filter(Boolean).map(close))
+  } finally {
+    vi.unstubAllEnvs()
+    if (home) await rm(home, { recursive: true, force: true })
+  }
 })
 describe('NineRouter real HTTP dictation boundary', () => {
+  it('owns a disposable Codex home instead of writing inherited application state', () => {
+    expect(home).not.toBe(inheritedHome)
+    expect(home).toMatch(/codexui-dictation-http-/u)
+    expect(process.env.CODEX_HOME).toBe(home)
+    expect(new URL(process.env.NINEROUTER_BASE_URL!).port).not.toBe('20128')
+  })
   it('reports unsupported STT as fixed unavailable JSON without forwarding the provider error', async () => {
     reply = (_req, res) => { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: serverMarker })) }
     const response = await send()
