@@ -1020,6 +1020,18 @@ function setJson(res: ServerResponse, statusCode: number, payload: unknown): voi
   res.end(JSON.stringify(payload))
 }
 
+async function createProjectDirectoryOrRespond(res: ServerResponse, path: string): Promise<boolean> {
+  try {
+    await mkdir(path, { recursive: true })
+    return true
+  } catch (error) {
+    const code = asRecord(error)?.code
+    if (code !== 'EACCES' && code !== 'EPERM') throw error
+    setJson(res, 403, { error: 'The app cannot create a project in this folder. Choose a folder the app user can write to.' })
+    return false
+  }
+}
+
 const PROJECT_ZIP_SKIPPED_NAMES = new Set([
   '.build',
   '.cache',
@@ -9796,7 +9808,7 @@ export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): C
         }
 
         if (!pathExists && createIfMissing) {
-          await mkdir(normalizedPath, { recursive: true })
+          if (!await createProjectDirectoryOrRespond(res, normalizedPath)) return
         } else if (!pathExists) {
           setJson(res, 404, { error: 'Directory does not exist' })
           return
@@ -9823,7 +9835,7 @@ export function createCodexBridgeMiddleware(options: CodexBridgeOptions = {}): C
             return
           }
         } catch {
-          await mkdir(normalizedPath, { recursive: true })
+          if (!await createProjectDirectoryOrRespond(res, normalizedPath)) return
         }
 
         setJson(res, 200, { data: { path: normalizedPath } })

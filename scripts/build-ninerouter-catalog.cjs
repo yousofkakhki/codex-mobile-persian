@@ -1,6 +1,19 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { nativeSlugForRoute, indexDescriptors, nativeUltraWireEffort, providerWireEfforts } = require('../src/server/runtimeLocalUltra.mjs')
+const GATEWAY_COMPACTION_LIMIT_PERCENT = 70
+
+function modelCatalogRequestHeaders(url) {
+  const apiKey = process.env.NINEROUTER_API_KEY?.trim()
+  const baseUrl = process.env.NINEROUTER_BASE_URL?.trim()
+  if (!apiKey || !baseUrl) return undefined
+  try {
+    if (new URL(url).origin !== new URL(baseUrl).origin) return undefined
+  } catch {
+    return undefined
+  }
+  return { Authorization: `Bearer ${apiKey}` }
+}
 
 function extractBundledCatalog(binary) {
   const marker = binary.indexOf(Buffer.from('"supported_reasoning_levels"'))
@@ -65,16 +78,18 @@ function buildCatalog(bundled, advertised, nativeCatalog) {
     if (!template) continue
     const nativeContext = template.context_window
     if (!Number.isSafeInteger(nativeContext) || nativeContext <= 0) continue
+    const nativeMaxContext = Number.isSafeInteger(template.max_context_window) && template.max_context_window > 0
+      ? template.max_context_window : nativeContext
     const nativeCompactionLimit = Number.isSafeInteger(template.auto_compact_token_limit)
       && template.auto_compact_token_limit > 0
       ? template.auto_compact_token_limit
-      : Math.floor(nativeContext * 0.9)
+      : Math.floor(nativeMaxContext * 0.9)
     const model = structuredClone(template)
     model.slug = row.id
     model.display_name = row.id
     model.context_window = context
     model.max_context_window = context
-    model.auto_compact_token_limit = Math.min(nativeCompactionLimit, Math.floor(context * 0.9))
+    model.auto_compact_token_limit = Math.min(nativeCompactionLimit, Math.floor(context * GATEWAY_COMPACTION_LIMIT_PERCENT / 100))
     model.prefer_websockets = false // The local gateway accepts streamed HTTP Responses.
     model.visibility = 'list'
     const explicit = row.supportedReasoningEfforts ?? row.supported_reasoning_efforts ?? row.thinkingLevels
@@ -113,7 +128,8 @@ async function main() {
   const url = args.includes('--models-url') ? option('--models-url') : 'http://127.0.0.1:20128/v1/models'
   const nativeCatalog = args.includes('--native-catalog') ? JSON.parse(fs.readFileSync(option('--native-catalog'), 'utf8')) : undefined
   if (nativeCatalog !== undefined) validateNativeCatalog(nativeCatalog)
-  const response = await fetch(url, { signal: AbortSignal.timeout(10000) })
+  const headers = modelCatalogRequestHeaders(url)
+  const response = await fetch(url, { ...(headers ? { headers } : {}), signal: AbortSignal.timeout(10000) })
   if (!response.ok) throw new Error(`Gateway catalog HTTP ${response.status}`)
   const catalog = buildCatalog(extractBundledCatalog(fs.readFileSync(binaryPath)), await response.json(), nativeCatalog)
   fs.mkdirSync(path.dirname(output), { recursive: true })

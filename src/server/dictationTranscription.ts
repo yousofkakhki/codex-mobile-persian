@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { NINEROUTER_BASE_URL, NINEROUTER_PROVIDER_ID, type FreeModeState } from './freeMode.js'
+import { getNinerouterBaseUrl, NINEROUTER_PROVIDER_ID, type FreeModeState } from './freeMode.js'
 
 export function usesNineRouterDictation(state: FreeModeState | null, configuredProvider: string | null): boolean {
   if (state?.provider === 'codex') return false
@@ -177,7 +177,7 @@ export async function proxyNineRouterDictation(
   }
   try {
     const token = apiKey?.trim() ?? ''
-    const operation = request(`${NINEROUTER_BASE_URL}/audio/transcriptions`, {
+    const operation = request(`${getNinerouterBaseUrl()}/audio/transcriptions`, {
       method: 'POST',
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), 'Content-Type': contentType },
       body: new Uint8Array(forwardedBody),

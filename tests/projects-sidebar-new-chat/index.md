@@ -25,3 +25,4 @@ Return to the [manual test index](../../tests.md).
 | [Projects survive stale workspace-root order](sidebar-projects-survive-stale-workspace-order.md) |
 | [Sidebar scroll position survives collapse](sidebar-scroll-position-survives-collapse.md) |
 | [Toolbar new thread keeps active project](toolbar-new-thread-keeps-active-project.md) |
+| [Project creation reports permission errors clearly](project-directory-permission-errors.md) |

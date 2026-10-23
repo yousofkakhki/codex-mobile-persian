@@ -11,7 +11,7 @@ Gateway model aliases compact earlier instead of postponing compaction to an unv
 
 #### Steps
 1. Run `node --test scripts/build-ninerouter-catalog.test.cjs`.
-2. Inspect an extended-context alias: its advertised context remains unchanged, while its compaction cutoff is no later than the bundled model's native cutoff or 90% of its native window when that cutoff is unspecified.
+2. Inspect standard and extended-context aliases: advertised context remains unchanged, while compaction starts by the lower of the native cutoff and 70% of the gateway context window. If no native cutoff exists, use 90% of the native maximum context when valid, otherwise 90% of the native context window.
 3. Use the mock provider to produce `contextWindowExceeded` on the disposable thread and wait for the failed turn to finish.
 4. Resume only that thread with `thread/resume`, setting `config.model_auto_compact_token_limit` to its generated cutoff and `excludeTurns: true`.
 5. Call `thread/compact/start` with the same `threadId`. Monitor that thread's stream for `contextCompaction` completion and a completed turn; the immediate empty RPC response alone is not evidence of success.
@@ -19,7 +19,7 @@ Gateway model aliases compact earlier instead of postponing compaction to an unv
 7. Reload the thread and confirm its saved transcript, thread ID, project folder, and selected model remain intact. Confirm other threads and their active turns were not interrupted.
 
 #### Expected Results
-- Larger advertised windows do not increase the generated per-model compaction cutoff.
+- Larger advertised windows do not increase the generated per-model compaction cutoff; the gateway cap is 70% of the model's advertised context.
 - Explicit bundled cutoffs are retained, smaller gateway windows lower them, and invalid native descriptors fail closed.
 - A successful compaction summarizes model-visible history while retaining the saved transcript.
 - The next verification turn succeeds without repeating the failed project task or calling tools.
